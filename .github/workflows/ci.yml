@@ -1,0 +1,61 @@
+name: 'Linux AppImage'
+
+# Builds a Linux AppImage of Hyper-Zero-UI and attaches it to each GitHub Release.
+# Also runnable on demand (Actions tab -> Run workflow) to test without a release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the Linux build image
+        uses: docker/build-push-action@v5
+        with:
+          push: false
+          context: docker
+          tags: hzui-build:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build the AppImage in Docker
+        run: docker run --rm --privileged -v "$(pwd)":/project hzui-build:latest /project/build_linux.sh
+
+      - name: Name the AppImage
+        id: name
+        run: |
+          VER="${{ github.event.release.tag_name }}"
+          if [ -z "$VER" ]; then
+            VER="$(git describe --tags --always)"
+          fi
+          mkdir -p dist
+          cp build/qFlipper-x86_64.AppImage "dist/Hyper-Zero-UI-${VER}-x86_64.AppImage"
+          ls -lh dist
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hyper-Zero-UI-linux-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.AppImage

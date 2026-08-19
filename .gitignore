@@ -1,0 +1,34 @@
+# build output
+/build
+/build_mac
+/build_linux
+/dist
+.qmake.stash
+.DS_Store
+
+# distributables
+*.dmg
+*.zip
+*.AppImage
+
+# IDE / OS
+.directory
+*.user
+.vs
+x64
+Win32
+.DS_Store
+
+# misc
+*.orig
+*.log
+__pycache__/
+
+# Claude Code: settings.local.json is per-machine (personal permission/tool
+# overrides), not project config -- a checked-in settings.json, if one ever
+# exists, is the one meant to be shared.
+.claude/settings.local.json
+
+# Pre-edit file backups from an agent session -- see .claude-backups/ itself
+# for what they are. Not project history, just a local undo net.
+.claude-backups/
