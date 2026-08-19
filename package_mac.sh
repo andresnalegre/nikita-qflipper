@@ -252,11 +252,11 @@ cd "$BUILD_DIR" || die "cannot cd to $BUILD_DIR"
 
 command -v dmgbuild > /dev/null 2>&1 || die "dmgbuild not installed (pip3 install --break-system-packages dmgbuild)"
 
-VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
+VOLNAME="nikita-qflipper2.zero"
 rm -f "$PROJECT.dmg"
 dmgbuild -s "../installer-assets/macos/dmgbuild-config.py" \
     -D "app=$STAGE/$PROJECT.app" \
-    "$PROJECT-$VERSION" "$PROJECT.dmg" || die "dmgbuild failed"
+    "$VOLNAME" "$PROJECT.dmg" || die "dmgbuild failed"
 
 if [ "$NO_NOTARY" -eq 0 ]; then
     # The DMG is a new file carrying none of the app's signature. Left unsigned

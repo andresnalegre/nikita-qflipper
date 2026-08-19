@@ -148,7 +148,7 @@ if command -v dmgbuild >/dev/null 2>&1; then
     dmgbuild \
         -s "../installer-assets/macos/dmgbuild-config.py" \
         -D "app=$DMG_SRC" \
-        "$PROJECT-$(git describe --tags --abbrev=0 2>/dev/null || echo dev)" \
+        "nikita-qflipper2.zero" \
         "$PROJECT.dmg";
 
     # The DMG is a new file and carries none of the .app's signature. Left
