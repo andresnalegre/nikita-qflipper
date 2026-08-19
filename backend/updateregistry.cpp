@@ -182,6 +182,11 @@ void UpdateRegistry::check()
     m_checkTimer->start(std::chrono::minutes(10));
 }
 
+bool UpdateRegistry::hasChannels() const
+{
+    return !m_channels.isEmpty();
+}
+
 void UpdateRegistry::setState(State newState)
 {
     if(m_state == newState) {

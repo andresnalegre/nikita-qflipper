@@ -225,20 +225,12 @@ Item {
 
         Action {
             id: selfUpdateAction
-            // Off for now. There is no release feed, and
-            // DISABLE_APPLICATION_UPDATES in qflipper_common.pri forces
-            // Preferences.checkAppUpdates to false anyway. To turn it on: drop
-            // that define, point applicationupdateregistry at the releases, then
-            // restore the two bindings below.
-            text: qsTr("Check app updates")
-            enabled: false
-            // text: App.updateStatus === App.Checking ? qsTr("Checking...") :
-            //       App.updateStatus === App.NoUpdates && checkTimer.running ? qsTr("No updates") : qsTr("Check app updates")
-            // enabled: Preferences.checkAppUpdates && App.updateStatus !== App.Checking && !checkTimer.running
+            text: App.updateStatus === App.Checking ? qsTr("Checking...") :
+                  App.updateStatus === App.NoUpdates && checkTimer.running ? qsTr("No updates") : qsTr("Check app updates")
+            enabled: Preferences.checkAppUpdates && App.updateStatus !== App.Checking && !checkTimer.running
             onTriggered: App.checkForUpdates()
         }
 
-        // Only used by the commented bindings above.
         Timer {
             id: checkTimer
             interval: 1000

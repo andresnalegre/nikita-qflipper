@@ -49,11 +49,14 @@ signals:
     void latestVersionChanged();
 
 public slots:
-    void check();
+    virtual void check();
+
+protected:
+    void setState(State newState);
+    bool hasChannels() const;
 
 private:
     virtual const QString updateChannel() const = 0;
-    void setState(State newState);
 
     QString m_directoryUrl;
     QTimer *m_checkTimer;
