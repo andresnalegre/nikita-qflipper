@@ -32,9 +32,8 @@ class NikitaBackend : public QObject
     Q_OBJECT
     Q_PROPERTY(bool thinking READ thinking NOTIFY thinkingChanged)
     Q_PROPERTY(bool configured READ configured CONSTANT)
-    Q_PROPERTY(bool hasBle READ hasBle CONSTANT)   // false on macOS: hides the BLE panel
+    Q_PROPERTY(bool hasBle READ hasBle CONSTANT)   // true wherever HZUI_BLE is compiled in
     Q_PROPERTY(QString modelName READ modelName NOTIFY modelChanged)
-    Q_PROPERTY(bool setupComplete READ setupComplete NOTIFY setupCompleteChanged)
     Q_PROPERTY(bool ollamaOnline READ ollamaOnline NOTIFY modelChanged)
     Q_PROPERTY(bool agentEnabled READ agentEnabled WRITE setAgentEnabled NOTIFY agentChanged)
     Q_PROPERTY(QString agentDir READ agentDir WRITE setAgentDir NOTIFY agentChanged)
@@ -50,7 +49,6 @@ public:
     bool configured() const;
     bool hasBle() const;   // true only where Qt Bluetooth is compiled in
     QString modelName() const;
-    bool setupComplete() const;
     bool ollamaOnline() const;
     bool agentEnabled() const;                       // host-workspace (self-edit) tools on?
     QString agentDir() const;                        // workspace root Nikita may touch
@@ -106,6 +104,11 @@ public:
     // see dispatchToClaude() in the .cpp. Ollama stays the default.
     Q_PROPERTY(bool claudeAvailable READ claudeAvailable NOTIFY claudeAvailableChanged)
     bool claudeAvailable() const;
+    // True once the `claude` binary itself is found on PATH, regardless of
+    // login state -- distinct from claudeAvailable (installed AND logged
+    // in), so the UI can tell "click sign in" apart from "install it first".
+    Q_PROPERTY(bool claudeInstalled READ claudeInstalled NOTIFY claudeAvailableChanged)
+    bool claudeInstalled() const;
     // "user@example.com (pro)" -- parsed from `claude auth status`'s own JSON.
     // Empty whenever claudeAvailable is false.
     Q_PROPERTY(QString claudeAccountLabel READ claudeAccountLabel NOTIFY claudeAvailableChanged)
@@ -130,9 +133,6 @@ public:
     QString modelOpStatus() const   { return m_modelOpStatus; }
     double  modelOpProgress() const { return m_modelOpProgress; }
 
-    // First-run setup wizard
-    Q_INVOKABLE void completeSetup();                    // mark the wizard done
-    Q_INVOKABLE void resetSetup();                       // re-trigger the wizard (testing)
     Q_INVOKABLE void recheckOllama();                    // re-query /api/tags (AI step)
     Q_INVOKABLE QStringList personalityPresets() const;  // preset persona names
     Q_INVOKABLE void applyPreset(const QString &name);   // set persona to a preset
@@ -194,7 +194,6 @@ signals:
     void errorOccurred(const QString &text);
     void thinkingChanged();
     void modelChanged();
-    void setupCompleteChanged();
     void agentChanged();
     void ollamaInstalledChanged();
     void claudeAvailableChanged();
@@ -261,6 +260,11 @@ private:
     void onStreamFinished(QNetworkReply *reply);
     void finalizeStream();                        // a full response arrived
     void runToolCalls(const QJsonArray &toolCalls, int index); // execute tools sequentially
+    // Every exit point that ends a turn with a user-visible reply calls this
+    // instead of `emit replyReceived` directly, so the tool trail (m_turnProgress)
+    // rides along with the text it produced rather than vanishing once the
+    // streaming bubble in QML is overwritten by the model's own words.
+    void emitReply(const QString &text);
 
     // Picks dispatchToOllama() or dispatchToClaude() by m_model. Every generic
     // continuation point in finalizeStream()/runToolCalls() calls THIS, not
@@ -411,7 +415,6 @@ private:
     QString     m_model;    // selected Ollama model (persisted)
     QStringList m_models;   // models discovered via /api/tags
     QStringList m_noToolModels;  // models Ollama rejects tools for (e.g. Gemma) -> chat-only
-    bool        m_setupComplete = false;
     bool        m_ollamaOnline = false;
     bool        m_agentEnabled = true;   // computer tools; on unless explicitly turned off
     QString     m_agentRoot;             // absolute workspace folder Nikita may edit
@@ -485,6 +488,11 @@ private:
     QByteArray  m_modelOpBuf;              // partial line buffer (pull output uses \r a lot)
     QByteArray  m_modelOpLine;             // bytes since the last line break, carried between reads
     bool        m_modelOpCancelled = false;  // user hit cancel, so report "cancelled", not exit code noise
+    // Dedupe state for the LOGS-panel progress line in appendModelOpOutput():
+    // logs once per phase change, then once per 10% within a phase, instead
+    // of once per '\r' redraw.
+    QString     m_modelOpLastLoggedTopic;
+    int         m_modelOpLastLoggedBucket = -1;
 };
 
 // Tracks community Flipper firmwares (Official, Momentum, Unleashed, RogueMaster),

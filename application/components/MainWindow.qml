@@ -212,13 +212,15 @@ Item {
             anchors.top: portToggle.top
             anchors.left: portToggle.right
             anchors.leftMargin: 20
+            // Deliberately state-blind, unlike portToggle/cliButton above --
+            // this stays "BLE" in the same neutral color connected or not.
             visible: mainWindow.homeVisible && Nikita.hasBle
-            color: (Ble.sessionActive || Ble.connected) ? Theme.color.lightgreen : Theme.color.lightorange2
-            opacity: (bleMouse.containsMouse || Ble.sessionActive) ? 1.0 : 0.5
+            color: Theme.color.lightorange2
+            opacity: bleMouse.containsMouse ? 1.0 : 0.5
 
             font.family: "ProggySquareTT"
             font.pixelSize: 16
-            text: Ble.sessionActive ? "BLE ●" : "BLE"
+            text: "BLE"
 
             MouseArea {
                 id: bleMouse
@@ -262,16 +264,18 @@ Item {
 
             // Ready parks it on the right, beside the install button. The
             // WaitingForDevices screen wants it left of centre to make room for
-            // the "connect your Flipper" text. Everything in between, the
-            // update run and the finish screen, is a full-width overlay with
-            // the title, progress bar and status all centred, so the device has
-            // to be centred too; the -100 was leaving it visibly off-axis.
+            // the "connect your Flipper" text and, now, the USB-or-Bluetooth
+            // row beside the cable -- -150 rather than the old -100, so that
+            // wider row still lands inside the window. Everything in between,
+            // the update run and the finish screen, is a full-width overlay
+            // with the title, progress bar and status all centred, so the
+            // device has to be centred too.
             x: {
                 if(Backend.backendState === ApplicationBackend.Ready && !Nikita.transferActive) {
                     return Math.round(mainContent.width / 2);
                 }
                 const centred = Math.round((mainContent.width - width) / 2);
-                return Backend.backendState === ApplicationBackend.WaitingForDevices ? centred - 100 : centred;
+                return Backend.backendState === ApplicationBackend.WaitingForDevices ? centred - 150 : centred;
             }
             // Ready parks it at the top of the home layout. The other screens
             // are centred full-width overlays, so it moves down with the rest of
@@ -284,6 +288,13 @@ Item {
                 if(Nikita.transferActive)                                 { return 94 + 26; }
                 if(Backend.backendState === ApplicationBackend.Ready)    { return 94; }
                 if(Backend.backendState === ApplicationBackend.Finished) { return 94 + 42; }
+                // WaitingForDevices has its own title plus the USB/Bluetooth
+                // row beneath the device now, so it needs its own vertical
+                // centering rather than the shared 94+26 fallback -- that
+                // whole group (device down through the title text, see
+                // NoDeviceOverlay.qml) is ~270px tall, so 84 centers it in
+                // mainContent's 430+2*border height.
+                if(Backend.backendState === ApplicationBackend.WaitingForDevices) { return 84; }
                 return 94 + 26;
             }
 
@@ -294,6 +305,7 @@ Item {
             id: noDeviceOverlay
             anchors.fill: parent
             opacity: Backend.backendState === ApplicationBackend.WaitingForDevices ? 1 : 0
+            onBleRequested: bleOverlay.open = true
         }
 
         HomeOverlay {
@@ -457,22 +469,25 @@ Item {
 
 
     // ---- BLE connection spike (Phase 1): scan / connect / prove a byte pipe ----
+    // Same shape as cliOverlay below: fills mainContent edge to edge rather
+    // than floating as a smaller centered box, so the two read as one
+    // family of panel instead of two different UI languages.
     Item {
         id: bleOverlay
         property bool open: false
-        anchors.fill: parent
+        anchors.left: mainContent.left
+        anchors.right: mainContent.right
+        anchors.top: mainContent.top
+        anchors.bottom: mainContent.bottom
         visible: open && Nikita.hasBle
+        focus: open
         z: 9995
 
-        Rectangle {
-            anchors.fill: parent; color: "#000000"; opacity: 0.72
-            MouseArea { anchors.fill: parent; onClicked: bleOverlay.open = false }
-        }
+        Keys.onEscapePressed: bleOverlay.open = false
 
         Rectangle {
-            anchors.centerIn: parent
-            width: 580; height: 490
-            color: "#0b0410"; radius: 12; border.width: 2; border.color: Theme.color.mediumorange2
+            anchors.fill: parent
+            color: "#0b0410"; radius: 8; border.width: 2; border.color: Theme.color.mediumorange2
             MouseArea {
                 anchors.fill: parent
                 hoverEnabled: true
@@ -481,11 +496,11 @@ Item {
             }
 
             ColumnLayout {
-                anchors.fill: parent; anchors.margins: 20; spacing: 12
+                anchors.fill: parent; anchors.margins: 18; spacing: 10
 
                 RowLayout {
                     Layout.fillWidth: true
-                    Text { text: "📶  BLE CONNECT"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 20; font.bold: true }
+                    Text { text: "BLE CONNECT"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 20; font.bold: true }
                     Item { Layout.fillWidth: true }
                     Text {
                         text: "✕"; color: closeBleMouse.containsMouse ? Theme.color.lightorange2 : Theme.color.mediumorange4
@@ -521,22 +536,26 @@ Item {
                     }
                     Item { Layout.fillWidth: true }
                     Text {
-                        text: Ble.sessionActive ? "● RPC session live" : (Ble.connected ? "● spike link" : "○ not connected")
+                        text: Ble.sessionActive ? "● RPC Connected" : (Ble.connected ? "● spike link" : "○ not connected")
                         color: Ble.sessionActive ? Theme.color.lightgreen : (Ble.connected ? Theme.color.lightorange2 : Theme.color.mediumorange1)
                         font.family: "Share Tech Mono"; font.pixelSize: 12
                     }
                 }
 
-                Text { text: "devices (click one → connects it as your ACTIVE device over BLE — device card, screen & Nikita, all wireless):"; color: Theme.color.mediumorange4; font.family: "Share Tech Mono"; font.pixelSize: 11; Layout.fillWidth: true; wrapMode: Text.WordWrap }
                 Flow {
-                    Layout.fillWidth: true; spacing: 6
+                    Layout.fillWidth: true; spacing: 8
                     Repeater {
                         model: Ble.devices
+                        // Every entry here already passed the Flipper filter
+                        // in onDeviceDiscovered (name or service UUID) -- so
+                        // this reads as "found it", not just "here's a
+                        // button": the same green the rest of the app uses
+                        // for active/connected, not the neutral chrome pink.
                         delegate: Rectangle {
-                            radius: 5; height: 26; width: dtxt.width + 18
-                            border.width: 1; border.color: Theme.color.mediumorange2
-                            color: dMouse.containsMouse ? Theme.color.mediumorange2 : "transparent"
-                            Text { id: dtxt; anchors.centerIn: parent; text: modelData.name; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 11 }
+                            radius: 6; height: 30; width: dtxt.width + 24
+                            border.width: 2; border.color: Theme.color.lightgreen
+                            color: dMouse.containsMouse ? Qt.rgba(Theme.color.lightgreen.r, Theme.color.lightgreen.g, Theme.color.lightgreen.b, 0.18) : "#0f2a14"
+                            Text { id: dtxt; anchors.centerIn: parent; text: modelData.name; color: Theme.color.lightgreen; font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true }
                             MouseArea { id: dMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { Ble.connectDevice(index); bleOverlay.open = false } }
                         }
                     }
@@ -560,11 +579,6 @@ Item {
                     }
                 }
 
-                Text {
-                    Layout.fillWidth: true; wrapMode: Text.WordWrap
-                    text: "⚠ if connect fails: pair the Flipper in Windows Bluetooth settings first (enter the PIN it shows), then SCAN again."
-                    color: Theme.color.mediumorange1; font.family: "Share Tech Mono"; font.pixelSize: 10
-                }
             }
         }
     }
@@ -601,15 +615,6 @@ Item {
                         font.family: "Share Tech Mono"; font.pixelSize: 18
                         MouseArea { id: closeCliMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: Cli.open = false }
                     }
-                }
-
-                Text {
-                    visible: false
-                    Layout.fillWidth: true; wrapMode: Text.WordWrap
-                    text: Cli.status.length > 0 ? Cli.status
-                        : "Flipper text CLI over USB. qFlipper's session pauses while this is open, and resumes when you close it."
-                    color: Cli.active ? Theme.color.lightgreen : Theme.color.mediumorange4
-                    font.family: "Share Tech Mono"; font.pixelSize: 11
                 }
 
                 Rectangle {
@@ -780,6 +785,22 @@ Item {
                         // text swap, no deselect: the content is stable now, so
                         // there's nothing to tear.
                         if (v) { Qt.callLater(cliTerm.toBottom); }
+                    }
+
+                    // Cli.status carries "CLI is USB only." / "Connect a
+                    // Flipper over USB first." from connectCli()
+                    // (nikitabackend.cpp) whenever the session can't open --
+                    // shown right in the terminal rather than as a separate
+                    // label above it, and gone the moment real output exists.
+                    Text {
+                        anchors.left: parent.left; anchors.top: parent.top
+                        anchors.margins: 8
+                        anchors.right: parent.right
+                        visible: Cli.output.length === 0 && Cli.status.length > 0
+                        text: Cli.status
+                        color: "#ffffff"
+                        font.family: "Share Tech Mono"; font.pixelSize: 12
+                        wrapMode: Text.WordWrap
                     }
 
                     Flickable {
@@ -1555,180 +1576,6 @@ Item {
                             color: "#ffffff"
                             font.family: "Share Tech Mono"; font.pixelSize: 10
                             anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- first-run setup wizard (shown only until Nikita.setupComplete) ----
-    Item {
-        id: setupWizard
-        anchors.fill: parent
-        visible: !Nikita.setupComplete
-        z: 10000
-        property int step: 0
-
-        Rectangle { anchors.fill: parent; color: "#000000"; opacity: 0.72 }
-        MouseArea {   // block anything behind
-            anchors.fill: parent
-            hoverEnabled: true
-            acceptedButtons: Qt.AllButtons
-            onWheel: function(wheel) { wheel.accepted = true }
-        }
-
-        Rectangle {
-            anchors.centerIn: parent
-            width: 560
-            height: 440
-            color: "#0b0410"
-            radius: 12
-            border.width: 2
-            border.color: Theme.color.mediumorange2
-
-            ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 22
-                spacing: 14
-
-                Text {
-                    text: "🐬  SET UP Nikita"
-                    color: Theme.color.lightorange2
-                    font.family: "Share Tech Mono"; font.pixelSize: 20; font.bold: true
-                }
-
-                StackLayout {
-                    currentIndex: setupWizard.step
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-
-                    // 0 · welcome
-                    ColumnLayout {
-                        spacing: 12
-                        Text { text: "Meet Nikita"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 16; font.bold: true }
-                        Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 13
-                            text: "A snarky, 100% local AI dolphin lives inside your Flipper app. Let's get him set up — about 30 seconds." }
-                        Item { Layout.fillHeight: true }
-                    }
-
-                    // 1 · AI brain
-                    ColumnLayout {
-                        spacing: 10
-                        Text { text: "1 · Nikita's brain (local AI)"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true }
-                        Text {
-                            Layout.fillWidth: true; wrapMode: Text.WordWrap
-                            font.family: "Share Tech Mono"; font.pixelSize: 13; color: Theme.color.lightorange2
-                            text: !Nikita.ollamaOnline
-                                  ? "Ollama isn't running. Install it from ollama.com, then run:  ollama pull phi3.5  — then hit re-check. (You can skip and set this up later.)"
-                                  : (Nikita.availableModels().length === 0
-                                     ? "Ollama's running, but no models yet. Run:  ollama pull phi3.5  — then re-check."
-                                     : "Found Ollama. Pick Nikita's model:")
-                        }
-                        Flow {
-                            Layout.fillWidth: true; spacing: 8
-                            Repeater {
-                                model: Nikita.ollamaOnline ? Nikita.availableModels() : []
-                                delegate: Rectangle {
-                                    radius: 5; height: 26; width: mtxt.width + 18
-                                    color: modelData === Nikita.modelName ? Theme.color.mediumorange2 : "transparent"
-                                    border.width: 1; border.color: Theme.color.mediumorange2
-                                    Text { id: mtxt; anchors.centerIn: parent; text: modelData; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 12 }
-                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: Nikita.setModel(modelData) }
-                                }
-                            }
-                        }
-                        Text {
-                            text: "↻ re-check"
-                            color: recheckMouse.containsMouse ? Theme.color.lightorange2 : Theme.color.mediumorange1
-                            font.family: "Share Tech Mono"; font.pixelSize: 12
-                            MouseArea { id: recheckMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: Nikita.recheckOllama() }
-                        }
-                        Item { Layout.fillHeight: true }
-                    }
-
-                    // 2 · personality
-                    ColumnLayout {
-                        spacing: 10
-                        Text { text: "2 · Give Nikita a personality"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true }
-                        Button {
-                            text: "🎭 Build one from his name"
-                            onClicked: { Nikita.applyNamePersonality(); personaLabel.text = "→ personality built from the name" }
-                        }
-                        Text { text: "…or pick a preset:"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 13 }
-                        Flow {
-                            Layout.fillWidth: true; spacing: 8
-                            Repeater {
-                                model: Nikita.personalityPresets()
-                                delegate: Rectangle {
-                                    radius: 5; height: 26; width: ptxt.width + 18
-                                    color: "transparent"; border.width: 1; border.color: Theme.color.mediumorange2
-                                    Text { id: ptxt; anchors.centerIn: parent; text: modelData; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 12 }
-                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { Nikita.applyPreset(modelData); personaLabel.text = "→ " + modelData } }
-                                }
-                            }
-                        }
-                        Text { id: personaLabel; text: ""; color: Theme.color.lightgreen; font.family: "Share Tech Mono"; font.pixelSize: 12 }
-
-                        Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.color.mediumorange2; opacity: 0.4 }
-                        CheckBox {
-                            id: agentToggle
-                            text: "🤖 Agent mode — let Nikita edit & test his own code"
-                            checked: Nikita.agentEnabled
-                            onToggled: Nikita.agentEnabled = checked
-                            contentItem: Text {
-                                text: agentToggle.text; leftPadding: agentToggle.indicator.width + 6
-                                color: Theme.color.lightorange2; font.family: "Share Tech Mono"
-                                font.pixelSize: 12; verticalAlignment: Text.AlignVCenter
-                            }
-                        }
-                        Button {
-                            visible: Nikita.agentEnabled
-                            text: Nikita.agentDir.length ? "📁 " + Nikita.agentDir : "📁 Pick workspace folder (your qFlipper source)"
-                            onClicked: agentFolderDialog.open()
-                        }
-                        Text {
-                            visible: Nikita.agentEnabled
-                            Layout.fillWidth: true; wrapMode: Text.WordWrap
-                            text: "⚠️ Lets a local model run shell commands and read or overwrite files anywhere you can. The folder is where it starts, not a fence. Keep it under git."
-                            color: Theme.color.lightorange3; font.family: "Share Tech Mono"; font.pixelSize: 11
-                        }
-                        Pf.FolderDialog { id: agentFolderDialog; onAccepted: Nikita.agentDir = folder }
-
-                        Item { Layout.fillHeight: true }
-                    }
-
-                    // 3 · done
-                    ColumnLayout {
-                        spacing: 12
-                        Text { text: "🎉  All set!"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 16; font.bold: true }
-                        Text { Layout.fillWidth: true; wrapMode: Text.WordWrap; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 13
-                            text: "Nikita's ready. You can change his model any time -- click it in the header." }
-                        Item { Layout.fillHeight: true }
-                    }
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 12
-                    Text {
-                        text: "skip"
-                        color: skipMouse.containsMouse ? Theme.color.lightorange2 : Theme.color.mediumorange1
-                        font.family: "Share Tech Mono"; font.pixelSize: 12
-                        MouseArea { id: skipMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: Nikita.completeSetup() }
-                    }
-                    Item { Layout.fillWidth: true }
-                    Button {
-                        text: "Back"
-                        visible: setupWizard.step > 0
-                        onClicked: setupWizard.step = setupWizard.step - 1
-                    }
-                    Button {
-                        text: setupWizard.step >= 3 ? "Finish" : "Next"
-                        onClicked: {
-                            if (setupWizard.step >= 3) { Nikita.completeSetup(); return; }
-                            setupWizard.step = setupWizard.step + 1;
-                            if (setupWizard.step === 1) Nikita.recheckOllama();
                         }
                     }
                 }

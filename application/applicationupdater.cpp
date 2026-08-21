@@ -48,13 +48,21 @@ bool ApplicationUpdater::canUpdate(const Flipper::Updates::VersionInfo &versionI
 
     if(!globalPrefs->checkApplicationUpdates()) {
         return false;
-    } else if(versionInfo.date() > appDate) {
-        return true;
     } else if(globalPrefs->applicationUpdateChannel() == QStringLiteral("development")) {
-        return (versionInfo.date() == appDate) && (versionInfo.number() != appCommit);
-    } else if(globalPrefs->applicationUpdateChannel() == QStringLiteral("release-candidate")) {
-        return VersionInfo::compare(versionInfo.number(), appVersion) > 0;
-    } else if(globalPrefs->applicationUpdateChannel() == QStringLiteral("release")) {
+        // No meaningful version number on this channel, only a build date
+        // and a commit hash -- the date comparison belongs here, and only
+        // here.
+        return (versionInfo.date() > appDate)
+            || (versionInfo.date() == appDate && versionInfo.number() != appCommit);
+    } else if(globalPrefs->applicationUpdateChannel() == QStringLiteral("release-candidate")
+           || globalPrefs->applicationUpdateChannel() == QStringLiteral("release")) {
+        // A real semantic version exists on these channels -- the number IS
+        // the answer. The release's publish date says nothing about
+        // whether this build is behind: publishing always happens after
+        // building, so "published after this binary was compiled" is true
+        // of every release ever, including the one this binary already IS.
+        // Comparing dates here is what made the app claim v2.0.1 needed to
+        // update to v2.0.1.
         return VersionInfo::compare(versionInfo.number(), appVersion) > 0;
     } else {
         return false;

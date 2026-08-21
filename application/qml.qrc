@@ -9,6 +9,7 @@
         <file>components/MainButton.qml</file>
         <file>components/GridBackground.qml</file>
         <file>assets/gfx/images/typec.svg</file>
+        <file>assets/gfx/images/bluetooth.svg</file>
         <file>assets/gfx/symbolic/arrow-up.svg</file>
         <file>assets/gfx/symbolic/arrow-down.svg</file>
         <file>components/HomeOverlay.qml</file>

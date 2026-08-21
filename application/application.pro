@@ -1,11 +1,15 @@
 QT += quick serialport widgets quickcontrols2 svg network
 
-# BLE connection -- Windows + Linux. Qt Bluetooth uses the WinRT backend on
-# Windows and the BlueZ/D-Bus backend on Linux (the Linux CI Qt now includes
-# qtconnectivity; see docker/Dockerfile). Gated behind HZUI_BLE.
+# BLE connection -- Windows, Linux, macOS. Qt Bluetooth uses the WinRT
+# backend on Windows, BlueZ/D-Bus on Linux (the Linux CI Qt now includes
+# qtconnectivity; see docker/Dockerfile), and CoreBluetooth on macOS via
+# Homebrew's qtconnectivity formula. Gated behind HZUI_BLE.
 #   blespike     -- scan/connect test panel (Phase 1 proof + Phase 3 device connect)
 #   bletransport -- the FlipperTransport impl the real session runs over
-win32|linux {
+# macOS additionally needs NSBluetoothAlwaysUsageDescription in the bundle's
+# Info.plist (see application/Info.plist.app) -- CoreBluetooth silently
+# refuses to scan/connect without it, with no error dialog to explain why.
+win32|linux|macx {
     QT += bluetooth
     DEFINES += HZUI_BLE
     SOURCES += blespike.cpp bletransport.cpp
@@ -95,6 +99,10 @@ win32 {
 
 macx: ICON = assets/icons/$${NAME}.icns
 else:win32: RC_ICONS = assets/icons/$${NAME}.ico
+
+# Qt's own template plus NSBluetoothAlwaysUsageDescription (see the file for
+# why) -- needed once BLE is enabled on macOS below.
+macx: QMAKE_INFO_PLIST = Info.plist.app
 
 INCLUDEPATH += \
     $$PWD/../dfu \

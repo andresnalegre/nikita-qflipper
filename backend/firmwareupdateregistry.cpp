@@ -8,6 +8,7 @@ FirmwareUpdateRegistry::FirmwareUpdateRegistry(const QString &directoryUrl, QObj
     UpdateRegistry(directoryUrl, parent)
 {
     connect(globalPrefs, &Preferences::firmwareUpdateChannelChanged, this, &UpdateRegistry::latestVersionChanged);
+    check();
 }
 
 const QString FirmwareUpdateRegistry::updateChannel() const

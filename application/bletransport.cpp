@@ -38,6 +38,14 @@ bool BleTransport::open()
     m_closing = false;
     m_handshakeStep = 0;
 
+    m_connectTimeout = new QTimer(this);
+    m_connectTimeout->setSingleShot(true);
+    connect(m_connectTimeout, &QTimer::timeout, this, [this]() {
+        fail(QStringLiteral("Connection timed out. If this keeps happening, open macOS "
+                            "Bluetooth Settings and \"Forget This Device\", then try again."));
+    });
+    m_connectTimeout->start(20000);
+
     m_ctrl = QLowEnergyController::createCentral(m_device, this);
 
     connect(m_ctrl, &QLowEnergyController::connected, this, [this]() {
@@ -47,9 +55,12 @@ bool BleTransport::open()
         fail(QStringLiteral("Bluetooth link disconnected."));
     });
     connect(m_ctrl, &QLowEnergyController::errorOccurred, this, [this](QLowEnergyController::Error) {
-        fail(QStringLiteral("Bluetooth controller error: %1  "
-                            "(on Windows, pair the Flipper in Bluetooth settings first)")
-             .arg(m_ctrl->errorString()));
+#ifdef Q_OS_WIN
+        const auto hint = QStringLiteral("(on Windows, pair the Flipper in Bluetooth settings first)");
+#else
+        const auto hint = QStringLiteral("(check the Flipper's own Settings > Bluetooth is ON)");
+#endif
+        fail(QStringLiteral("Bluetooth controller error: %1  %2").arg(m_ctrl->errorString(), hint));
     });
     connect(m_ctrl, &QLowEnergyController::discoveryFinished, this, &BleTransport::onDiscoveryFinished);
     connect(m_ctrl, &QLowEnergyController::mtuChanged, this, [this](int mtu) {
@@ -161,6 +172,7 @@ void BleTransport::finishOpen()
     if(m_opened) {
         return;
     }
+    if(m_connectTimeout) { m_connectTimeout->stop(); }
     m_opened = true;
     m_handshakeStep = 4;
     emit opened();
@@ -263,6 +275,7 @@ void BleTransport::fail(const QString &why)
     if(m_closing || m_failed) {
         return;
     }
+    if(m_connectTimeout) { m_connectTimeout->stop(); }
     m_failed = true;
     m_error = why;
 

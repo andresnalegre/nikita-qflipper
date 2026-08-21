@@ -186,9 +186,15 @@ AbstractOverlay {
             id: connectionLabel
             Layout.preferredHeight: 14
 
-            icon.source: "qrc:/assets/gfx/symbolic/usb-connected.svg"
-            icon.width: 18
-            icon.height: 10
+            // The USB glyph next to "Connected" was showing even over BLE,
+            // which reads as "plugged in" when it very much isn't -- swap
+            // in the Bluetooth glyph instead of just hiding it. IconImage
+            // recolors whatever it's given from `color` above, same as the
+            // USB glyph, so it always matches the connected/recovery state.
+            readonly property bool overBle: Nikita.hasBle && Ble.sessionActive
+            icon.source: overBle ? "qrc:/assets/gfx/images/bluetooth.svg" : "qrc:/assets/gfx/symbolic/usb-connected.svg"
+            icon.width: overBle ? 11 : 18
+            icon.height: overBle ? 15 : 10
 
             color: (!deviceState || !deviceState.isOnline) ? Theme.color.lightred1 : deviceState.isRecoveryMode ?
                                            Theme.color.lightblue : Theme.color.lightgreen
@@ -200,7 +206,9 @@ AbstractOverlay {
             id: systemPathLabel
             Layout.preferredHeight: connectionLabel.height
             color: connectionLabel.color
-            text: deviceInfo ? deviceInfo.systemLocation : text
+            // systemLocation is a serial port path -- meaningless (and
+            // empty) for a device that isn't reached over USB at all.
+            text: connectionLabel.overBle ? qsTr("via Bluetooth") : (deviceInfo ? deviceInfo.systemLocation : text)
             capitalized: false
 
             TextEdit {

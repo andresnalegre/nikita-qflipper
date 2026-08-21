@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonDocument>
+#include <QLoggingCategory>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QNetworkAccessManager>
@@ -12,6 +13,10 @@
 #include "preferences.h"
 
 using namespace Flipper;
+
+// Same category name ("UPD") as backend/updateregistry.cpp's CATEGORY_UPDATES;
+// Qt groups Q_LOGGING_CATEGORY instances by that string, not by C++ identifier.
+Q_LOGGING_CATEGORY(CATEGORY_APP_UPDATES, "UPD")
 
 namespace {
 
@@ -58,6 +63,7 @@ ApplicationUpdateRegistry::ApplicationUpdateRegistry(const QString &directoryUrl
     m_net(new QNetworkAccessManager(this))
 {
     connect(globalPrefs, &Preferences::applicationUpdateChannelChanged, this, &UpdateRegistry::latestVersionChanged);
+    check();
 }
 
 const QString ApplicationUpdateRegistry::updateChannel() const
@@ -85,6 +91,7 @@ void ApplicationUpdateRegistry::check()
         reply->deleteLater();
 
         if(reply->error() != QNetworkReply::NoError) {
+            qCWarning(CATEGORY_APP_UPDATES).noquote() << "Failed to fetch the latest release from" << m_releasesUrl << ":" << reply->errorString();
             setState(State::ErrorOccured);
             return;
         }
@@ -93,6 +100,7 @@ void ApplicationUpdateRegistry::check()
         const auto version = cleanVersionTag(release.value(QStringLiteral("tag_name")).toString());
 
         if(version.isEmpty()) {
+            qCWarning(CATEGORY_APP_UPDATES) << "Latest release has no usable tag_name";
             setState(State::ErrorOccured);
             return;
         }
@@ -127,6 +135,7 @@ void ApplicationUpdateRegistry::check()
         }
 
         if(files.isEmpty()) {
+            qCWarning(CATEGORY_APP_UPDATES).noquote() << "Latest release" << version << "has no recognized installer assets";
             setState(State::ErrorOccured);
             return;
         }
@@ -168,6 +177,12 @@ void ApplicationUpdateRegistry::check()
         };
 
         fillFromJson(QJsonDocument(QJsonObject{{ QStringLiteral("channels"), channels }}).toJson());
-        setState(hasChannels() ? State::Ready : State::ErrorOccured);
+
+        if(hasChannels()) {
+            qCDebug(CATEGORY_APP_UPDATES).noquote() << "Latest release on GitHub is" << version;
+            setState(State::Ready);
+        } else {
+            setState(State::ErrorOccured);
+        }
     });
 }

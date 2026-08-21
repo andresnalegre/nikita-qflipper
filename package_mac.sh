@@ -22,7 +22,7 @@ SIGN_ID="${MAC_OS_SIGNING_KEY_ID:-Developer ID Application: Andres Nicolas Alegr
 NOTARY_PROFILE="${NOTARY_PROFILE:-nikita}"
 
 # Homebrew formulae that ship the Qt frameworks this app links against.
-QT_PREFIXES="qtbase qtdeclarative qtsvg qtserialport qt5compat qtshadertools"
+QT_PREFIXES="qtbase qtdeclarative qtsvg qtserialport qt5compat qtshadertools qtconnectivity"
 
 # Non-Qt libraries Qt itself pulls in.
 LIB_PREFIXES="icu4c@78 pcre2 zstd brotli glib double-conversion libb2 openssl@3 gettext"

@@ -26,7 +26,10 @@ UpdateRegistry::UpdateRegistry(const QString &directoryUrl, QObject *parent):
     connect(this, &UpdateRegistry::stateChanged, this, &UpdateRegistry::latestVersionChanged);
     connect(m_checkTimer, &QTimer::timeout, this, &UpdateRegistry::check);
 
-    check();
+    // Not called here: this constructor runs before a subclass's own members
+    // exist, so a call to the (virtual) check() would always resolve to this
+    // base implementation, never an override's. Each subclass calls check()
+    // itself, once its own constructor body runs.
 }
 
 void UpdateRegistry::setDirectoryUrl(const QString &directoryUrl)

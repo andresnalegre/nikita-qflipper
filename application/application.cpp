@@ -175,6 +175,18 @@ void Application::initConnections()
         QProcess::startDetached(QStringLiteral("taskkill"),
                                 {QStringLiteral("/IM"), QStringLiteral("ollama.exe"), QStringLiteral("/F")});
     });
+
+    // An `ollama pull`/`rm` (or the no-Homebrew installer script) left
+    // running when the window closes doesn't die with it -- it's a detached
+    // child process that keeps writing to the same blob files in the
+    // background. Reopening the app and clicking install again then starts
+    // a SECOND one over the same files, and the pull that finishes first
+    // corrupts the other: a real bug hit this session, "worked the second
+    // time" only because nothing was still running from the first. Treating
+    // a quit-while-installing exactly like hitting cancel -- kill the child,
+    // and let purgePartialBlobs() clear the half-written blobs -- means the
+    // next attempt always starts from a clean, single-writer state.
+    connect(this, &QCoreApplication::aboutToQuit, &m_nikita, &NikitaBackend::cancelModelOp);
 }
 
 void Application::initCommandOptions()

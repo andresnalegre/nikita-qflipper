@@ -90,13 +90,19 @@ void BleSpike::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
     for (const QBluetoothDeviceInfo &d : m_found) {
         if (d.deviceUuid() == info.deviceUuid() && d.address() == info.address()) { return; }
     }
-    m_found.append(info);
+    // A raw LE scan picks up everything nearby (headphones, phones, a TV) --
+    // list them all here and the panel reads as a neighborhood scan, not a
+    // Flipper connect screen. Name is a heuristic only: a Flipper renamed
+    // away from the default (this one is "Ut4me") won't contain "Flipper",
+    // so the service UUID -- always the same, from the firmware, name
+    // notwithstanding -- is what actually decides it.
     const bool looksFlipper = info.name().contains(QStringLiteral("Flipper"), Qt::CaseInsensitive)
                            || info.serviceUuids().contains(kSerialService);
-    log(QStringLiteral("  found: %1  %2%3").arg(
+    if (!looksFlipper) { return; }
+    m_found.append(info);
+    log(QStringLiteral("  found: %1  %2   <-- Flipper?").arg(
             info.name().isEmpty() ? QStringLiteral("(unnamed)") : info.name(),
-            info.address().toString(),
-            looksFlipper ? QStringLiteral("   <-- Flipper?") : QString()));
+            info.address().toString()));
     emit devicesChanged();
 }
 
@@ -117,8 +123,12 @@ void BleSpike::connectToDevice(int index)
         setConnected(false);
     });
     connect(m_ctrl, &QLowEnergyController::errorOccurred, this, [this](QLowEnergyController::Error) {
-        log(QStringLiteral("controller error: ") + m_ctrl->errorString()
-            + QStringLiteral("  (on Windows, pair the Flipper in Bluetooth settings first)"));
+#ifdef Q_OS_WIN
+        const auto hint = QStringLiteral("  (on Windows, pair the Flipper in Bluetooth settings first)");
+#else
+        const auto hint = QStringLiteral("  (check the Flipper's own Settings > Bluetooth is ON)");
+#endif
+        log(QStringLiteral("controller error: ") + m_ctrl->errorString() + hint);
     });
     connect(m_ctrl, &QLowEnergyController::serviceDiscovered, this, [this](const QBluetoothUuid &u) {
         if (u == kSerialService) { log(QStringLiteral("  found the Flipper Serial service!")); }

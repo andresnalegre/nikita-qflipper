@@ -1029,14 +1029,35 @@ Rectangle {
         QtObject {
             id: modelOpTracker
             property string kind: ""
+            // What the result line at the bottom shows. A plain binding to
+            // Nikita.modelOpStatus left "Ollama installed." (or any other
+            // finished-op message) sitting there indefinitely -- nothing
+            // ever set it back to empty, since the backend property is only
+            // ever overwritten by the NEXT operation, which might be
+            // minutes or never. Fading it out on a timer instead means it
+            // read as a toast, not a stuck label.
+            property string fadingStatus: ""
+        }
+
+        Timer {
+            id: fadingStatusTimer
+            interval: 4000
+            onTriggered: modelOpTracker.fadingStatus = ""
         }
 
         Connections {
             target: Nikita
             function onModelOpChanged() {
                 if (Nikita.modelOpKind !== modelOpTracker.kind) {
+                    const wasRunning = modelOpTracker.kind !== "";
                     modelOpTracker.kind = Nikita.modelOpKind;
                     catalogModel.refresh();
+                    // Just finished (kind went back to ""): show the result,
+                    // then fade it.
+                    if (wasRunning && Nikita.modelOpKind === "" && Nikita.modelOpStatus.length > 0) {
+                        modelOpTracker.fadingStatus = Nikita.modelOpStatus;
+                        fadingStatusTimer.restart();
+                    }
                 }
             }
             function onModelInstallFinished()     { catalogModel.refresh(); }
@@ -1101,57 +1122,11 @@ Rectangle {
                     spacing: 6
 
                     Text {
-                        text: "Ollama isn't installed on this machine. Nikita needs it to run any model."
+                        text: "Ollama isn't installed on this machine."
                         color: "#ffb3b3"
                         wrapMode: Text.WordWrap
                         Layout.fillWidth: true
                         font.family: "Share Tech Mono"; font.pixelSize: 11
-                    }
-                    RowLayout {
-                        spacing: 8
-                        Button {
-                            text: (Nikita.modelOpKind === "ollama") ? "Installing…" : "Install Ollama"
-                            enabled: Nikita.modelOpKind !== "ollama"
-                            onClicked: Nikita.installOllama()
-                        }
-                        Text {
-                            visible: Nikita.modelOpKind === "ollama"
-                            text: Nikita.modelOpStatus
-                            color: "#ffb3b3"
-                            elide: Text.ElideRight
-                            Layout.fillWidth: true
-                            font.family: "Share Tech Mono"; font.pixelSize: 10
-                        }
-                        // Manual re-probe, for the macOS path where the install
-                        // happens outside the app (download page / Ollama.app).
-                        Text {
-                            visible: Nikita.modelOpKind !== "ollama"
-                            text: "recheck"
-                            color: recheckMouse.containsMouse ? "#ff6a6a" : "#ffb3b3"
-                            font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
-                            MouseArea {
-                                id: recheckMouse
-                                anchors.fill: parent
-                                anchors.margins: -4
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: Nikita.detectOllama()
-                            }
-                        }
-                        Text {
-                            visible: Nikita.modelOpKind === "ollama"
-                            text: "cancel"
-                            color: cancelOllamaMouse.containsMouse ? "#ff6a6a" : "#ffb3b3"
-                            font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
-                            MouseArea {
-                                id: cancelOllamaMouse
-                                anchors.fill: parent
-                                anchors.margins: -4
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: Nikita.cancelModelOp()
-                            }
-                        }
                     }
                 }
             }
@@ -1269,7 +1244,12 @@ Rectangle {
                         Item { Layout.fillWidth: true }
                         Text {
                             visible: !Nikita.claudeAvailable
-                            text: "sign in"
+                            // Two different clicks behind one label would be
+                            // fine if they both did something -- but "sign
+                            // in" on a machine with no `claude` CLI used to
+                            // just do nothing, which read as broken rather
+                            // than as "go install it first".
+                            text: Nikita.claudeInstalled ? "sign in" : "install"
                             color: claudeSignInMouse.containsMouse ? Theme.color.lightgreen : Theme.color.lightorange2
                             font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
                             MouseArea {
@@ -1299,15 +1279,78 @@ Rectangle {
                 }
             }
 
+            // ---- Ollama missing: one big themed button instead of a list of
+            // models that can't be installed anyway. Laypeople land here with
+            // no idea what Ollama even is, so this has to be the one obvious
+            // thing to click, not a link that assumes they know to look for it.
+            Item {
+                visible: !Nikita.ollamaInstalled
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+
+                ColumnLayout {
+                    anchors.centerIn: parent
+                    spacing: 12
+
+                    // The same big pill button "UP TO DATE"/"Install"/"Update"
+                    // use elsewhere (HomeOverlay's updateButton) -- this is the
+                    // one call-to-action on the whole screen, so it reads as
+                    // one of THIS app's buttons, not a generic Qt one dropped in.
+                    MainButton {
+                        Layout.alignment: Qt.AlignHCenter
+                        // Wider than the 280 default, at the same full-size
+                        // font ("UP TO DATE" uses) -- "Install Ollama" is a
+                        // longer string, not a reason to shrink the text.
+                        width: 440
+                        height: 72
+                        enabled: Nikita.modelOpKind !== "ollama"
+                        text: Nikita.modelOpKind === "ollama" ? qsTr("Installing…") : qsTr("Install Ollama")
+                        onClicked: Nikita.installOllama()
+                    }
+
+                    Text {
+                        visible: Nikita.modelOpKind === "ollama"
+                        Layout.alignment: Qt.AlignHCenter
+                        Layout.maximumWidth: 320
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.WordWrap
+                        text: Nikita.modelOpStatus
+                        color: Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 11
+                    }
+
+                    // Same "cancel" link/behavior as a model row mid-download --
+                    // the button turning into "Installing..." shouldn't also
+                    // mean committed-to-waiting; kill()ing partway through a
+                    // curl/hdiutil/cp sequence leaves nothing worse behind than
+                    // a partial temp download, which cleanup() already removes.
+                    Text {
+                        visible: Nikita.modelOpKind === "ollama"
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "cancel"
+                        color: cancelOllamaInstallMouse.containsMouse ? "#ff6a6a" : Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                        MouseArea {
+                            id: cancelOllamaInstallMouse
+                            anchors.fill: parent
+                            anchors.margins: -6
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Nikita.cancelModelOp()
+                        }
+                    }
+                }
+            }
+
             // ---- catalog list ----
             ListView {
                 id: catalogView
+                visible: Nikita.ollamaInstalled
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
                 model: catalogModel
                 spacing: 6
-                enabled: Nikita.ollamaInstalled
 
                 delegate: Rectangle {
                     width: catalogView.width
@@ -1540,8 +1583,8 @@ Rectangle {
             // fast failure (start, fail, finish, kind back to "") left no
             // trace anywhere in the UI and read as "the button does nothing".
             Text {
-                visible: Nikita.modelOpKind === "" && Nikita.modelOpStatus.length > 0
-                text: Nikita.modelOpStatus
+                visible: modelOpTracker.fadingStatus.length > 0
+                text: modelOpTracker.fadingStatus
                 color: Theme.color.mediumorange1
                 font.family: "Share Tech Mono"; font.pixelSize: 10
                 wrapMode: Text.WordWrap

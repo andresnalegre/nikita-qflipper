@@ -74,4 +74,13 @@ private:
     bool m_failed = false;
     bool m_closing = false;
     QString m_error;
+    // A stale CoreBluetooth-side connection record for this peripheral (left
+    // over from an earlier session macOS didn't fully let go of) can leave
+    // createCentral()/connectToDevice() sitting with no callback ever firing
+    // -- no error, no timeout of its own, just silence. Without this, that
+    // reads as the whole app hanging, and the only way out a person found
+    // was macOS Bluetooth Settings -> Forget This Device. This turns that
+    // silent hang into an actual failure so the UI can say so and let a
+    // retry happen instead of sitting on a spinner forever.
+    class QTimer *m_connectTimeout = nullptr;
 };
