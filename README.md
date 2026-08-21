@@ -1,8 +1,12 @@
+<p align="center">
+  <img src="assets/flipper2zero.png" alt="Flipper 2.Zero" width="560">
+</p>
+
 # nikita-qflipper
 
 An unofficial fork of [qFlipper](https://github.com/flipperdevices/qFlipper) — the desktop companion app for the [Flipper Zero](https://flipperzero.one) — that turns it into an agentic workstation for the device.
 
-On top of everything upstream qFlipper does (firmware updates over DFU, screen streaming, device recovery), this fork adds five things that share the same USB link:
+On top of everything upstream qFlipper does (firmware updates over DFU, screen streaming, device recovery), this fork adds five things that share the same link to the device:
 
 | | What it is |
 |---|---|
@@ -10,11 +14,28 @@ On top of everything upstream qFlipper does (firmware updates over DFU, screen s
 | **File manager** | Upstream lets you move files on and off the card. Here you also **edit them in place** — double-click opens an editor that saves straight back over RPC — **create** new files on the device, and select many at once for batch operations. |
 | **CLI panel** | A unified shell where the same command name reaches either the Flipper or your computer, chosen by the path you give it. Transfers between the two are MD5-verified. |
 | **Firmware store** | Six firmware sources (official and community) with release/dev channels, side by side, installed through qFlipper's existing update path. |
-| **BLE panel** | Experimental Bluetooth Low Energy scan/connect, behind a compile flag. |
+| **Bluetooth (BLE)** | Cable-free connect — scan, pair and run the same RPC session over Bluetooth Low Energy as an alternative to USB. |
 
 Everything runs on your machine. The agent talks to [Ollama](https://ollama.com) on `localhost`; there is no API key, no account, and no request leaves the computer except firmware downloads and whatever you explicitly ask the agent to fetch.
 
 > **Not affiliated with Flipper Devices.** "Flipper Zero" and "qFlipper" are their trademarks. This is an independent fork, licensed GPLv3 like the original.
+
+---
+
+## Screenshots
+
+<table>
+<tr>
+<td width="50%" align="center">
+<img src="assets/connect.png" alt="Connect screen: USB or Bluetooth" width="100%"><br>
+<sub><b>Two ways in.</b> No Flipper connected yet — plug in over USB, or hit the Bluetooth icon next to the cable to scan and connect wirelessly instead.</sub>
+</td>
+<td width="50%" align="center">
+<img src="assets/main.png" alt="Main window: connected over Bluetooth, device info, live screen, Nikita chat" width="100%"><br>
+<sub><b>Connected — over Bluetooth.</b> Live device info, the Flipper's own screen mirrored in real time, firmware status, and Nikita ready to help, no cable involved.</sub>
+</td>
+</tr>
+</table>
 
 ---
 
@@ -27,6 +48,7 @@ Everything runs on your machine. The agent talks to [Ollama](https://ollama.com)
 | **Creating a file** | Folders only | **New File**, created directly on the card |
 | **Selecting files** | One at a time | Multi-select — modifier-click, rubber-band drag, select-all — with batch delete that names the count in the confirmation |
 | **Backup / restore** | The internal storage (`/int`): settings and pairing data | The whole SD card, with live progress and `.tgz` packing. Upstream's `/int` tarball could never bring back a capture or a script |
+| **Connecting to the device** | USB only | USB, or scan-and-connect over Bluetooth Low Energy — same RPC session either way |
 | **Shell access** | None | A CLI panel that reaches the Flipper *and* your computer, with MD5-verified transfers between them |
 | **AI assistant** | None | Nikita: local, tool-calling, six switchable models, installable from inside the app |
 | **Work on your own computer** | None | Opt-in agent mode — read/write files, run builds and shell commands, with the results fed back into the conversation |
@@ -279,9 +301,17 @@ The chat panel also carries a **live mirror of the Flipper's 128×64 screen**, d
 
 ---
 
-## Bluetooth (experimental)
+## Bluetooth
 
-A scan/connect panel and a `FlipperTransport` implementation exist behind the `HZUI_BLE` compile flag, enabled on Windows and Linux (Qt Bluetooth uses the WinRT backend on one and BlueZ/D-Bus on the other). It is a working proof of connection, not a finished replacement for the USB link. macOS is not wired up.
+Connect without the cable: a `BleTransport` implements the same `FlipperTransport` interface the USB link uses, so the RPC session on top — storage, device info, the live screen mirror — doesn't know or care which one it's running over. It's behind the `HZUI_BLE` compile flag, enabled on **Windows, Linux, and macOS**, each on Qt Bluetooth's native backend for that platform (WinRT, BlueZ/D-Bus, CoreBluetooth via Homebrew's `qtconnectivity`).
+
+**Getting there:** the "no device" screen shows the USB cable and, right beside it, a Bluetooth icon (see the [screenshots](#screenshots) above) — click it to open the scan/connect panel. A found Flipper is identified by its GATT serial service UUID, not by name, so a device renamed away from the factory default still shows up correctly.
+
+A few things worth knowing:
+
+- **The CLI panel is still USB-only.** It talks to the device's raw USB serial port directly, which has no BLE equivalent — opening it over a Bluetooth session shows *"CLI is USB only."* instead of a blank terminal. Everything else (storage, file editing, device info, the screen mirror, firmware operations) works the same over either transport.
+- **A stuck connection times out and fails cleanly**, rather than hanging forever. macOS in particular can hold onto a stale CoreBluetooth-side connection record from an earlier session, which otherwise leaves `connectToDevice()` with no callback ever firing — no error, no spinner giving up on its own. If a connection attempt does time out repeatedly, macOS's Bluetooth Settings → *Forget This Device* clears it.
+- On macOS, the app's `Info.plist` carries `NSBluetoothAlwaysUsageDescription` — required for CoreBluetooth to scan or connect at all; without it the OS silently denies access with no dialog explaining why.
 
 ---
 
@@ -299,7 +329,7 @@ The base project structure is otherwise unchanged from [upstream](https://github
 
 **Runtime**
 
-- A Flipper Zero, and a USB cable that carries data.
+- A Flipper Zero — a USB cable that carries data, or Bluetooth on a build with `HZUI_BLE` enabled (the CLI panel still needs the cable; see [Bluetooth](#bluetooth)).
 - [Ollama](https://ollama.com) running (`ollama serve`) with at least one model from the catalog above.
 - ~6 GB of VRAM is comfortable for a 7B model. CPU-only works and is slower.
 - Nikita is optional: without Ollama the app is still a working qFlipper with the CLI panel and firmware store.
