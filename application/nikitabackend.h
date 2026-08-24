@@ -30,7 +30,38 @@ class FlipperCli;   // defined below; NikitaBackend holds a pointer for run_cli
 class NikitaBackend : public QObject
 {
     Q_OBJECT
+    // ---- Master switch ------------------------------------------------------
+    // Off hides the whole assistant behind a single ENABLE NIKITA control. It
+    // is a UI state, not a kill switch: nothing is unloaded and no setting is
+    // lost, so turning it back on restores the conversation as it was.
+    // Persisted, because a master switch that forgets itself on restart is not
+    // one the user can rely on.
+    Q_PROPERTY(bool assistantEnabled READ assistantEnabled WRITE setAssistantEnabled
+               NOTIFY assistantEnabledChanged)
+    bool assistantEnabled() const;
+    void setAssistantEnabled(bool on);
+
     Q_PROPERTY(bool thinking READ thinking NOTIFY thinkingChanged)
+    // ---- Live turn status --------------------------------------------------
+    // What is happening RIGHT NOW, in the user's words: "thinking", "writing
+    // the file", "running the command", "wrapping up". A turn on a local 4B
+    // takes a minute or more and the reply cannot stream while tools are
+    // attached (see dispatchToOllama), so without this the window sits dead
+    // and a working assistant is indistinguishable from a hung one.
+    // Every value is set at a real transition -- never a decorative cycle.
+    Q_PROPERTY(QString turnStatus READ turnStatus NOTIFY turnStatusChanged)
+    QString turnStatus() const;
+    // Seconds since the turn started. Ticks once a second while thinking.
+    Q_PROPERTY(int turnElapsed READ turnElapsed NOTIFY turnStatusChanged)
+    int turnElapsed() const;
+    // The same thing as "4m 21s" -- a bare seconds count stops being readable
+    // about a minute in, which on a local 4B is most turns.
+    Q_PROPERTY(QString turnElapsedText READ turnElapsedText NOTIFY turnStatusChanged)
+    QString turnElapsedText() const;
+    // Tokens this turn has cost so far, prompt + generated, summed across every
+    // round trip it takes. "2.1k tokens" past a thousand.
+    Q_PROPERTY(QString turnTokensText READ turnTokensText NOTIFY turnStatusChanged)
+    QString turnTokensText() const;
     Q_PROPERTY(bool configured READ configured CONSTANT)
     Q_PROPERTY(bool hasBle READ hasBle CONSTANT)   // true wherever HZUI_BLE is compiled in
     Q_PROPERTY(QString modelName READ modelName NOTIFY modelChanged)
@@ -39,6 +70,16 @@ class NikitaBackend : public QObject
     Q_PROPERTY(QString agentDir READ agentDir WRITE setAgentDir NOTIFY agentChanged)
 
 public:
+    // Erases everything NIKITA has kept about this user: the conversation, the
+    // durable facts, the learned moves, and the permissions granted to it --
+    // on this computer AND on the Flipper's SD card. Called when the master
+    // switch is turned off, after the person confirms.
+    //
+    // MUST stay in a public section: moc generates the entry either way, but
+    // QML refuses to call a non-public invokable, and the failure is a runtime
+    // TypeError inside the click handler -- so the button silently does
+    // nothing instead of erroring anywhere visible.
+    Q_INVOKABLE void wipeAssistantData();
     explicit NikitaBackend(QObject *parent = nullptr);
 
     // Gives Nikita access to the connected device (for the inspection tools).
@@ -69,14 +110,31 @@ public:
     Q_INVOKABLE void answerHostActionConfirm(bool allow, bool alwaysAllow);
 
     Q_INVOKABLE void send(const QString &userText, const QString &deviceContext);
-    // Interrupts whichever brain is being waited on: aborts the Ollama HTTP
-    // reply, or kills the `claude` subprocess. Doesn't reach into an
-    // in-flight tool call -- only the two dispatch paths.
+    // Typed while a turn is still running. Held, not dropped, and delivered as
+    // one message the moment the turn ends -- so a thought does not have to
+    // wait on a 4B model finishing its sentence.
+    Q_INVOKABLE void queueMessage(const QString &text);
+    Q_INVOKABLE void clearQueue();
+    Q_PROPERTY(int queuedCount READ queuedCount NOTIFY queuedChanged)
+    int queuedCount() const;
+    Q_PROPERTY(QString queuedPreview READ queuedPreview NOTIFY queuedChanged)
+    QString queuedPreview() const;
+    // Interrupts the reply being waited on: aborts the Ollama HTTP request.
+    // Does not reach into an in-flight tool call -- only the dispatch path.
     Q_INVOKABLE void stopThinking();
     // Called from the chat when the user says whether the last action actually
     // worked. Their eyes beat any check this code can run: a file can be
     // written, verified, and still be the wrong file in the wrong place.
-    Q_INVOKABLE void rateLastAction(bool worked);
+    // note is the user's own words about what went wrong -- optional, and the
+    // most valuable half when it is there. "I asked for Chrome and it made a
+    // txt file" is something no automatic check can produce: the tool reported
+    // success, the file exists, and the request was still not met.
+    Q_INVOKABLE void rateLastAction(bool worked, const QString &note = QString());
+
+    // True while the last finished turn ran at least one tool and has not been
+    // rated yet -- the window in which the feedback strip is shown.
+    Q_PROPERTY(bool canRate READ canRate NOTIFY canRateChanged)
+    bool canRate() const;
     Q_INVOKABLE void reset();
     Q_INVOKABLE void cycleModel();                    // switch to the next installed Ollama model
     Q_INVOKABLE void setModel(const QString &model);  // pick a specific model
@@ -99,28 +157,18 @@ public:
     Q_INVOKABLE void installOllama();       // platform install script/package manager
     Q_INVOKABLE void detectOllama();        // re-check whether the binary is on PATH
 
-    // An OPTIONAL extra "model": the real `claude` CLI, run as a subprocess and
-    // authenticated with the user's own Claude.ai account, never an API key --
-    // see dispatchToClaude() in the .cpp. Ollama stays the default.
-    Q_PROPERTY(bool claudeAvailable READ claudeAvailable NOTIFY claudeAvailableChanged)
-    bool claudeAvailable() const;
-    // True once the `claude` binary itself is found on PATH, regardless of
-    // login state -- distinct from claudeAvailable (installed AND logged
-    // in), so the UI can tell "click sign in" apart from "install it first".
-    Q_PROPERTY(bool claudeInstalled READ claudeInstalled NOTIFY claudeAvailableChanged)
-    bool claudeInstalled() const;
-    // "user@example.com (pro)" -- parsed from `claude auth status`'s own JSON.
-    // Empty whenever claudeAvailable is false.
-    Q_PROPERTY(QString claudeAccountLabel READ claudeAccountLabel NOTIFY claudeAvailableChanged)
-    QString claudeAccountLabel() const;
-    Q_INVOKABLE void detectClaude();        // re-check install + account login, async
-    // `claude auth login` opens a browser OAuth flow and returns once it's
-    // launched, not once the human finishes -- so this is fire-and-forget
-    // (QProcess::startDetached), not the usual watchdog-guarded QProcess.
-    Q_INVOKABLE void claudeSignIn();
-    // `claude auth logout` is quick and synchronous-ish -- normal async
-    // QProcess, refreshes claudeAvailable/claudeAccountLabel when it's done.
-    Q_INVOKABLE void claudeSignOut();
+    // ---- Access filters ----------------------------------------------------
+    // What the assistant is allowed to touch. Each list item is a QVariantMap
+    // with id, label, blurb and enabled -- ready for a Repeater. The groups
+    // themselves live in NIKITA_FILTERS in the .cpp.
+    Q_PROPERTY(QVariantList filters READ filters NOTIFY filtersChanged)
+    QVariantList filters() const;
+    // 1 = all on (full access), 0 = all off (no access), -1 = a mix. Only so
+    // the UI knows which preset to highlight.
+    Q_PROPERTY(int filterPreset READ filterPreset NOTIFY filtersChanged)
+    int filterPreset() const;
+    Q_INVOKABLE void setFilter(const QString &id, bool on);
+    Q_INVOKABLE void setAllFilters(bool on);   // the two presets: all / none
 
     // Progress of whatever model pull/remove/Ollama-install is currently running.
     // One op at a time; op == "" when idle.
@@ -193,10 +241,14 @@ signals:
     void replyReceived(const QString &text);
     void errorOccurred(const QString &text);
     void thinkingChanged();
+    void assistantEnabledChanged();
+    void canRateChanged();
+    void queuedChanged();
+    void turnStatusChanged();
     void modelChanged();
     void agentChanged();
     void ollamaInstalledChanged();
-    void claudeAvailableChanged();
+    void filtersChanged();
     void modelOpChanged();                                  // progress tick, any op
     void modelInstallFinished(const QString &name, bool ok, const QString &message);
     void modelUninstallFinished(const QString &name, bool ok, const QString &message);
@@ -229,16 +281,15 @@ private:
     void writeMemoryCache() const;
     bool adoptMemoryIfMemoryFile(const QString &path, const QString &content);
 
-    // forClaude neutralizes the handful of lines written specifically to keep
-    // a small, compliant local model on-task ("NEVER admit you lack access,
-    // that is false and the worst mistake you can make", a fabricated log of
-    // prior actions presented as verified history) -- wording that a safety-
-    // trained model reasonably reads as an injection attempt, because it has
-    // that shape. Confirmed against the real `claude` binary: it refused the
-    // Nikita persona outright and named the prompt as injection-shaped on the
-    // unmodified text. Same tool docs, same paths, same diagnostics either
-    // way -- only the coercive framing changes.
-    QString systemPrompt(bool forClaude = false) const;
+    // Filters: stored as the OFF set (the .cpp explains why that way round).
+    void loadFilters();
+    void saveFilters();
+    bool toolAllowed(const QString &tool) const;
+    QSet<QString> allowedTools() const;
+    QSet<QString> m_filtersOff;
+    bool       m_assistantEnabled = true;
+
+    QString systemPrompt() const;
     // Generated from the CLI command table so the assistant can never be taught
     // a command that no longer exists.
     static QString cliReferenceForPrompt();
@@ -266,27 +317,10 @@ private:
     // streaming bubble in QML is overwritten by the model's own words.
     void emitReply(const QString &text);
 
-    // Picks dispatchToOllama() or dispatchToClaude() by m_model. Every generic
-    // continuation point in finalizeStream()/runToolCalls() calls THIS, not
-    // either backend directly, so a mid-turn retry or tool-result round-trip
-    // stays on whichever brain the turn started with. The one exception is
-    // onStreamFinished()'s tools-unsupported retry, which is Ollama-specific
-    // (a 400 from Ollama's own HTTP API) and can never fire on a Claude turn.
+    // There is one path only (dispatchToOllama). Every continuation point in
+    // finalizeStream()/runToolCalls() calls THIS, never the backend directly,
+    // so a mid-turn retry and a tool-result round trip go the same way.
     void redispatch();
-    // Real Claude, run as `claude -p` and authenticated with the user's OWN
-    // account (never an API key -- dispatchToClaude() enforces that by
-    // stripping ANTHROPIC_API_KEY from the subprocess environment). Feeds the
-    // exact same finalizeStream()/runToolCalls()/confirmation pipeline Ollama
-    // uses, so every host_* tool is gated by the same on-screen dialogs no
-    // matter which brain proposed the call.
-    void dispatchToClaude();
-    QString claudeSystemPreamble() const;     // systemPrompt() + the tool-call JSON contract
-    QString claudeDeltaPrompt() const;        // history since m_claudeHistoryCursor, as plain text
-    QString m_claudePath;                     // resolved by detectClaude(); empty == not found
-    bool m_claudeAvailable = false;
-    QString m_claudeAccountLabel;              // "user@example.com (pro)"; empty when not available
-    QString m_claudeSessionId;                // empty == no `claude` session yet this conversation
-    int m_claudeHistoryCursor = 0;            // m_history already sent to the current session
     void runOneTool(const QString &name, const QJsonObject &args,
                     std::function<void(const QString &)> done); // one async RPC tool
     void ensureFlipperDir(const QByteArray &dirPath,
@@ -295,6 +329,7 @@ private:
     // Host agent: full access to this computer, plus the Flipper.
     bool agentReady() const;                                     // agent mode is on
     QString resolveAgentPath(const QString &rel, bool mustExist) const;
+    bool moveStillHolds(const QString &tool, const QJsonObject &args) const;
     // Where relative paths land when nothing else says otherwise. Never empty:
     // an unconfigured workspace means home.
     QString agentBaseDir() const;
@@ -365,6 +400,13 @@ private:
     QStringList m_skills;
     QString     m_lastUserText;     // phrasing the current turn gets filed under
     QString     m_lastProvenTool;   // learned this turn, so it can be unlearned
+    QStringList m_queued;           // typed while thinking, sent when the turn ends
+    QString     m_lastDeviceContext;
+    bool        m_canRate = false;  // a finished turn ran tools and awaits a verdict
+    QStringList m_mistakes;         // "ask \t what it did \t the user's words"
+    void flushQueue();
+    void loadMistakes();
+    void saveMistakes();
     void recordProvenMove(const QString &tool, const QJsonObject &args);
     void saveProvenMoves() const;
     void loadProvenMoves();
@@ -393,6 +435,9 @@ private:
     // checked against these, so "created A and B" cannot pass on having
     // written only A.
     QSet<QString> m_turnPathsTouched;
+    // Confirms this turn's work on the filesystem, independently of anything
+    // the model said. See the .cpp for the conditions it insists on.
+    bool turnWorkVerified() const;
     QList<QPair<QString, QJsonObject>> m_pendingMoves;   // this turn's lessons, unwritten
     // Every distinct tool call this turn has already made. A round that asks
     // for nothing new is a loop, and looping -- not a step count -- is what
@@ -465,10 +510,14 @@ private:
     // Tool results shown in the chat as they land, so the pane isn't blank
     // during the round trip that turns them into a sentence.
     QString    m_turnProgress;     // accumulated tool calls this response
+    void setTurnStatus(const QString &s);
+    QString    m_turnStatus;
+    qint64     m_turnStartedMs = 0;
+    int        m_turnTokens = 0;
+    bool       m_turnTruncated = false;
+    QString    m_lastTurnCost;     // "8m 36s · 4.8k tokens", frozen when the turn ends
+    QTimer     m_turnTicker;
     QNetworkReply *m_currentReply = nullptr;
-    // The live `claude -p` subprocess, tracked only so stopThinking() has
-    // something to kill; dispatchToClaude() clears it on every exit path.
-    QProcess *m_claudeProc = nullptr;
     // Set by stopThinking() right before it aborts/kills, so the finish
     // handler can tell "the user stopped this" apart from a genuine error.
     bool m_userStoppedThinking = false;

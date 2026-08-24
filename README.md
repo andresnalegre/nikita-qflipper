@@ -10,7 +10,7 @@ On top of everything upstream qFlipper does (firmware updates over DFU, screen s
 
 | | What it is |
 |---|---|
-| **Nikita** | A local LLM agent with tool-calling. Six models to choose from, switchable at runtime. It reads and writes the SD card, runs Flipper CLI commands and presses the device's buttons — and, when you opt in, carries out real work on your own computer: reading and writing files, running builds, driving shell commands. |
+| **Nikita** | A local LLM agent with tool-calling, running `qwen3:4b` on your own machine. Off until you enable it. It reads and writes the SD card, runs Flipper CLI commands and presses the device's buttons — and, within the access you grant it, carries out real work on your own computer: reading and writing files, running builds, driving shell commands. |
 | **File manager** | Upstream lets you move files on and off the card. Here you also **edit them in place** — double-click opens an editor that saves straight back over RPC — **create** new files on the device, and select many at once for batch operations. |
 | **CLI panel** | A unified shell where the same command name reaches either the Flipper or your computer, chosen by the path you give it. Transfers between the two are MD5-verified. |
 | **Firmware store** | Six firmware sources (official and community) with release/dev channels, side by side, installed through qFlipper's existing update path. |
@@ -50,7 +50,8 @@ Everything runs on your machine. The agent talks to [Ollama](https://ollama.com)
 | **Backup / restore** | The internal storage (`/int`): settings and pairing data | The whole SD card, with live progress and `.tgz` packing. Upstream's `/int` tarball could never bring back a capture or a script |
 | **Connecting to the device** | USB only | USB, or scan-and-connect over Bluetooth Low Energy — same RPC session either way |
 | **Shell access** | None | A CLI panel that reaches the Flipper *and* your computer, with MD5-verified transfers between them |
-| **AI assistant** | None | Nikita: local, tool-calling, six switchable models, installable from inside the app |
+| **AI assistant** | None | Nikita: one local model (`qwen3:4b`), tool-calling, installed from inside the app. Off until you switch it on, and erasable in one click |
+| **What the assistant may touch** | — | Nine access switches, per group, enforced at execution — not just hidden from the model |
 | **Work on your own computer** | None | Opt-in agent mode — read/write files, run builds and shell commands, with the results fed back into the conversation |
 | **App self-update** | Enabled, pointed at Flipper Devices' server | Disabled on purpose — see [why](#why-the-app-self-updater-is-off) |
 
@@ -159,39 +160,100 @@ A local 7B model will cheerfully report a file it never wrote. Most of the agent
 
 ### Memory
 
-Memory lives **on the Flipper**, not on the computer — so it travels with the device:
+Two files, and they are **not** the same thing.
 
-- `/ext/nikita/memory.txt` — durable facts about you. The agent is told to save these proactively, one concise fact per call.
-- `/ext/nikita/actions-memory.txt` — "proven moves": which tool actually worked for which kind of request. If you tell Nikita an action didn't work, the lesson is *unlearned* and removed from both copies — your eyes beat any check the code can run.
+`memory.txt` holds everything Nikita learns about **you** — who you are and how you work, the machine and tools you use, what you are building and why, opinions and preferences, things you explain, decisions and the reason behind them. Not a log of tasks.
 
-Both are mirrored to a local cache so the agent still knows you when the Flipper is unplugged, and re-synced when it comes back. `memory.txt` is a plain text file: open it in the CLI panel's editor and edit it by hand if you like.
+`actions-memory.txt` holds what it has **done**: which tool actually solved which kind of request, recorded only after the artifact was confirmed on disk. Read back into the prompt it reads as a sentence, not a stack trace — *"When asked to 'create rel2.txt in Desktop', I created rel2.txt and saved it to Desktop"* — because a small model copies the shape of what it reads.
 
-### Models — pick one, swap any time
+Both live in `/ext/nikita` on the Flipper so they travel with the device, mirrored to a local cache so the agent still knows you when it is unplugged.
 
-Nikita is not tied to a single model. A curated catalog of six ships with the app; you can install and remove them **from inside the app** (it drives `ollama` for you), and switch between them at runtime by clicking the model name in the header — no restart, no config file. Ollama itself can be installed from the setup wizard if you don't have it.
+**Remembering is automatic.** You will almost never say "remember this" — you will just mention something. Nikita calls `remember()` silently in the same turn and carries on with what you actually asked. There is **no cap** on facts: the old build kept the most recent 40, which meant it quietly forgot the oldest thing it knew about you every time it learned a new one.
 
-The catalog is a shortlist, not the whole Ollama library: these are the models actually verified against Nikita's tool-calling, and the order below is also the fallback preference order.
+If you tell Nikita an action didn't work, the lesson is unlearned **and** the correction is written to `mistakes.txt`, which is read back on every turn as *"you were asked X, you did Y, that was wrong — do not repeat it"*. Forgetting a bad lesson stops it being recommended; nothing else stops the model reaching the same wrong conclusion again.
 
-There is **no hardcoded default model**. On startup the app queries `/api/tags` and, if your saved choice isn't installed, falls back to whatever you actually have:
+### Feedback — a second opinion, never a gate
+
+After an action, a strip appears: **Did that do what you asked?** with `YES` / `NO` and an optional box to say what went wrong.
+
+It opens **after** the turn has already closed and the lesson has already been filed automatically. Ignoring it, clearing the chat or quitting changes nothing — silence is not a verdict. It only ever adds.
+
+The optional note is the valuable half: *"I asked it to open Chrome and it made a txt file"* is something no automatic check can produce. The tool reported success, the file exists, and the request was still not met. Only the person who asked can tell the difference.
+
+### While it is thinking
+
+A local 4B takes minutes, so the window says what is happening rather than sitting still:
+
+```
+●  1m 53s · 2.1k tokens · writing the file...
+· wrote /Users/you/Desktop/note.txt (17 bytes)
+· done in 2m 11s · 4.5k tokens
+```
+
+Every phrase is set at a real transition — `thinking`, `getting to work`, `writing the file`, `running the command`, `wrapping up` — never a decorative cycle. Tokens are prompt plus generated, summed across every round the turn takes.
+
+The input **stays editable** while a turn runs. Anything typed is queued, shown as `↳ queued (1): …` with a `cancel`, and delivered as one message the moment the turn ends. The send button becomes `Queue` when there is text and `Stop` when there is not: while a turn runs, stopping is almost certainly not what that text was for.
+
+### The model — one, local, yours
+
+Nikita runs on **one** model: `qwen3:4b`, pulled and run by Ollama on your own machine. Nothing is sent anywhere.
+
+The model manager (gear icon in the chat header) lists it, shows whether it is installed, and installs or removes it for you — the app drives `ollama` so you never touch a terminal. Ollama itself can be installed from the setup wizard if you don't have it.
 
 | Tag | Size | Notes |
 |---|---|---|
-| `qwen2.5:3b` | 1.9 GB | Fast, for low-end machines |
-| `qwen2.5:7b` | 4.7 GB | **Recommended.** Best tool-calling in this list |
-| `llama3.1:8b` | 4.7 GB | Strong general purpose |
-| `mistral:7b` | 4.1 GB | Fast, supports tools |
-| `phi3.5` | 2.2 GB | Small; less reliable at tool calls |
-| `gemma2:9b` | 5.4 GB | Chat only — no tool calling here |
+| `qwen3:4b` | 2.5 GB | The brain. Runs locally, reasons before it answers. |
 
-Matching is per exact tag — `qwen2.5:3b` and `qwen2.5:7b` are separate installs, so a sibling quant being present doesn't make the app think your choice is available. Downloads report progress and can be cancelled mid-pull.
+Earlier versions shipped a catalog of six models plus an optional path to the real Claude CLI. Both are gone. One model that is understood and tuned beats six that are merely listed, and the settings that matter — context size, sampling, output ceiling — can only be tuned honestly for a model you actually measured.
 
-Practical guidance: **7B is the floor for reliable tool use.** The 3B is genuinely usable for conversation and simple one-tool jobs on a weak machine, but multi-step work on the SD card wants `qwen2.5:7b` or `llama3.1:8b`. `gemma2:9b` is chat only — it has no tool-calling path here, so Nikita can talk with it but not act.
+Two things worth knowing about this particular build:
+
+`qwen3:4b` on Ollama is the **Thinking-2507** variant. It always reasons before answering; there is no way to switch that off (`/no_think` is not honoured, `"think": false` only hides the reasoning, and a pre-closed `<think>` template does not work on it). Every request pays a reasoning pass.
+
+Context is set to **8192**, not higher, and that is deliberate. Measured on an M1 with 8 GB: at 16384 the Ollama runner reaches 3.9 GB resident, the machine swaps, and generation collapses from ~18 tokens/s to 2.2 — an eight-fold slowdown that turns "create this file" into an eight-minute wait. At 8192 the model fits.
+
+### Access filters — what it is allowed to touch
+
+Under the model in the same panel, nine switches decide what Nikita can reach. `NO ACCESS` and `FULL ACCESS` are shortcuts for all of them at once; anything in between reads as `custom`.
+
+| Group | Tools |
+|---|---|
+| Memory | `remember` `list_memory` `forget` |
+| Flipper: read | `list_files` `read_file` `file_info` |
+| Flipper: create and change | `save_file` `make_dir` `rename_file` |
+| Flipper: delete | `delete_file` |
+| Flipper: control | `press_button` `run_cli` |
+| Computer: read | `host_list` `host_read` `host_find` `host_cd` |
+| Computer: create and change | `host_write` `host_mkdir` `host_move` `host_copy` |
+| Computer: delete | `host_delete` |
+| Computer: run commands | `host_run` |
+
+A disabled group is not merely hidden from the model — the call is refused at execution time as well. Hiding a tool from the list is a smaller menu, not a gate: a small model invents tool names, and an older conversation still in history carries calls from when the access was allowed.
+
+The state is stored as the set that is **off**, so a group added in a later version arrives switched on rather than appearing disabled without anyone having disabled it.
 
 ### Personality
 
 Five presets — Default (Nikita), Chill helper, Chaos gremlin, Deadpan pro, Sweet companion — or "build one from the name." The default is terse and low-key: short answers, no emoji, no mascot voice. The choice is persisted in `QSettings` and layered over the built-in system prompt.
 
 ---
+
+## Off by default
+
+A fresh install opens with Nikita **switched off**. The chat is replaced by a single control:
+
+```
+        (  ●    )
+      ENABLE NIKITA
+```
+
+Plenty of people want a Flipper companion without any AI in it, and an assistant that reads files and keeps notes about you should be something you switch on — not something you discover already running. Off is not cosmetic: with the switch off the assistant cannot start a turn, and nothing touches `/ext/nikita` on the card. Five separate code paths used to write there on startup; all five now refuse.
+
+**Turning it on** asks first, and says what starts happening: conversations kept on this computer, facts saved here and on the SD card, which actions worked, and files read or changed once you allow that in ACCESS. Nothing is sent anywhere — the model runs locally.
+
+**Turning it off** warns that it erases everything Nikita stored about you, and then does it: the conversation, the facts, the learned actions, the permissions you granted it, the local files, and the whole `/ext/nikita` folder on the card — the folder itself, not just its contents, because an empty folder left behind reads as "something is still installed".
+
+Both dialogs have Cancel and a confirm, and expand to full size if the text does not fit.
 
 ## Agent mode: read this before turning it on
 
@@ -408,14 +470,12 @@ Builds for the host architecture only — the project-compiled nanopb dependency
 
 ## First run
 
-1. Install Ollama and pull a model: `ollama pull qwen2.5:7b`
-2. Make sure `ollama serve` is running.
-3. Launch the app. A four-step setup wizard appears once:
-   - a name field,
-   - **pick your model** — the wizard detects Ollama, and offers to install it if it's missing,
-   - **pick a personality** — a preset, or one derived from the name,
-   - **agent mode** — off by default; if you turn it on, pick the workspace folder it should start in. Read the section above first.
-4. Click Nikita's model name in the header at any time to switch models.
+1. Launch the app. Nikita is **off** — you get the Flipper side of qFlipper and nothing else. If that is all you wanted, you are done.
+2. To use the assistant, click **ENABLE NIKITA** and read what it tells you before confirming.
+3. Install Ollama and pull the model: `ollama pull qwen3:4b` — or let the app do both from the model manager (gear icon).
+4. Make sure `ollama serve` is running.
+5. Open the model manager to set **ACCESS**: what Nikita may read, change, delete or run, on the Flipper and on this computer. Everything is on by default once enabled; `NO ACCESS` turns it all off in one click.
+6. **Agent mode** is separate and off by default — if you turn it on, pick the workspace folder it should start in. Read the section above first.
 
 ---
 
@@ -446,17 +506,20 @@ Everything outside `application/` is upstream qFlipper.
 
 Stated plainly, because they are the honest state of the tree:
 
-- **`nikitabackend.cpp` is ~11k lines** and holds three unrelated classes. A split into three translation units is the next structural change.
-- **No per-action confirmation for host tools.** See the agent-mode section. This is the most important open item.
-- **No automated tests.** The pure functions worth covering first are path resolution, the tool-call parser, and the claimed-but-unrun detector.
+- **`nikitabackend.cpp` is ~12k lines** and holds three unrelated classes. A split into three translation units is the next structural change.
+- **No automated tests.** The pure functions worth covering first are path resolution, the tool-call parser, and the claimed-but-unrun detector. Two bugs found by hand would have been caught by any of them: a learning check that compared the raw argument path instead of the resolved one, so every relative-path write was judged a failure; and a de-duplication that recorded its state but never read it, so the same write went over USB on every cycle.
+- **A turn takes minutes on a 4B.** Roughly 60–120 s for a simple action on an M1 with 8 GB, and 100 % of that is the model — the tool itself executes in milliseconds. The largest single win available is a non-reasoning model; the largest one already taken was fitting the context in RAM.
+- **The Flipper's name cannot be changed on Official firmware.** `hardware_name` comes from the factory OTP block, read-only, and Official reads no `name.settings` from anywhere. The `name` command detects this and refuses instead of rebooting your device for nothing. Custom firmware (Momentum, Unleashed, RogueMaster) supports it.
+- **Erasing the SD-card half is best effort.** With no Flipper attached, the local data is erased anyway and the two files on the card are not — they are recreated from scratch when the assistant is next enabled.
 - **CI builds the Linux AppImage only, and only on release.** Nothing compiles on push, and Windows/macOS aren't covered at all.
 
 ---
 
 ## Credits
 
+- **[lotei-qflipper](https://github.com/DUNKINKKD/lotei-qflipper)** — by [DUNKINKKD](https://github.com/DUNKINKKD). The visual language of this fork comes from Lotei, and Lotei is what made me want to build this architecture in the first place. The look, the terminal feel, the idea that a Flipper companion could have a character instead of a settings panel — that starting point is theirs.
 - **[qFlipper](https://github.com/flipperdevices/qFlipper)** — Flipper Devices, the base this forks.
-- **[Ollama](https://ollama.com)** and **[Qwen2.5](https://github.com/QwenLM/Qwen2.5)** — the local model stack.
+- **[Ollama](https://ollama.com)** and **[Qwen3](https://github.com/QwenLM/Qwen3)** — the local model stack.
 - Firmware sources: Flipper Devices, [Momentum](https://momentum-fw.dev), [Unleashed](https://github.com/DarkFlippers/unleashed-firmware), [RogueMaster](https://github.com/RogueMaster/flipperzero-firmware-wPlugins), [ARF](https://github.com/D4C1-Labs/Flipper-ARF), [Xero](https://github.com/noproto/xero-firmware).
 
 ## License

@@ -446,6 +446,44 @@ Rectangle {
             }
             Item { Layout.fillWidth: true }
 
+            // ---- master switch, small: turns the whole assistant off --------
+            // Sits next to the gear because that is where the panel's own
+            // controls live. Off replaces everything below with the big
+            // ENABLE NIKITA control.
+            Rectangle {
+                id: powerSwitch
+                Layout.preferredWidth: 30
+                Layout.preferredHeight: 16
+                Layout.alignment: Qt.AlignVCenter
+                radius: 8
+                color: "transparent"
+                border.width: 1
+                border.color: powerMouse.containsMouse ? Theme.color.lightorange2
+                                                       : Theme.color.mediumorange2
+                Rectangle {
+                    // Knob to the right while on, left while off -- the state is
+                    // readable without a label, which the header has no room for.
+                    width: 10; height: 10; radius: 5
+                    y: 2
+                    x: Nikita.assistantEnabled ? parent.width - width - 3 : 3
+                    // App palette, not green: green was borrowed from the status
+                    // dot, and its off state (mediumorange2, #6c3c6d) is so dark
+                    // on this background that the knob simply vanished.
+                    color: Nikita.assistantEnabled ? Theme.color.lightorange2
+                                                   : Theme.color.mediumorange1
+                    Behavior on x { NumberAnimation { duration: 120 } }
+                    Behavior on color { ColorAnimation { duration: 120 } }
+                }
+                MouseArea {
+                    id: powerMouse
+                    anchors.fill: parent
+                    anchors.margins: -4
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: consent.ask(!Nikita.assistantEnabled)
+                }
+            }
+
             // Model manager (gear icon)
             Rectangle {
                 // Needs an id because the Canvas below reads gearHot. An
@@ -635,15 +673,49 @@ Rectangle {
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar { }
 
-            // Shown while the model is generating; the only real wait in the UI.
+            // The live wait. Not a fixed "is thinking" any more: the phrase is
+            // whatever the backend is actually doing this second (writing the
+            // file, running the command, wrapping up), and the seconds counter
+            // keeps moving even when the phrase does not -- so a slow turn
+            // still reads as working rather than as hung.
             footer: Item {
                 width: ListView.view ? ListView.view.width : 0
                 height: Nikita.thinking ? 20 : 0
                 visible: Nikita.thinking
                 Row {
                     spacing: 0
+                    // A pulsing dot, so the line reads as live even in the
+                    // stretch where neither the phrase nor the second changes.
                     Text {
-                        text: root.aiName + " is thinking"
+                        id: liveDot
+                        text: "\u25cf  "
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"
+                        font.pixelSize: 12
+                        SequentialAnimation on opacity {
+                            running: Nikita.thinking
+                            loops: Animation.Infinite
+                            NumberAnimation { from: 1.0; to: 0.25; duration: 700 }
+                            NumberAnimation { from: 0.25; to: 1.0; duration: 700 }
+                        }
+                    }
+                    // elapsed · tokens · what it is doing
+                    Text {
+                        text: Nikita.turnElapsedText
+                        color: Theme.color.mediumorange2
+                        font.family: "Share Tech Mono"
+                        font.pixelSize: 12
+                    }
+                    Text {
+                        visible: Nikita.turnTokensText.length > 0
+                        text: " \u00b7 " + Nikita.turnTokensText
+                        color: Theme.color.mediumorange2
+                        font.family: "Share Tech Mono"
+                        font.pixelSize: 12
+                    }
+                    Text {
+                        text: " \u00b7 " + (Nikita.turnStatus.length > 0
+                                            ? Nikita.turnStatus : "thinking")
                         color: Theme.color.mediumorange4
                         font.family: "Share Tech Mono"
                         font.pixelSize: 12
@@ -885,6 +957,134 @@ Rectangle {
             }
         }
 
+        // ---- queued messages -------------------------------------------------
+        // What was typed while the model was busy. Shown so it is obvious the
+        // text was kept rather than swallowed, and cancellable in one click.
+        RowLayout {
+            visible: Nikita.queuedCount > 0 && root.viewState !== "min"
+            Layout.fillWidth: true
+            spacing: 6
+            Text {
+                text: "\u21b3 queued (" + Nikita.queuedCount + "): " + Nikita.queuedPreview
+                color: Theme.color.mediumorange1
+                font.family: "Share Tech Mono"; font.pixelSize: 11
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+            }
+            Text {
+                text: "cancel"
+                color: qCancelMouse.containsMouse ? Theme.color.lightorange2
+                                                  : Theme.color.mediumorange2
+                font.family: "Share Tech Mono"; font.pixelSize: 11
+                MouseArea {
+                    id: qCancelMouse
+                    anchors.fill: parent; anchors.margins: -4
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Nikita.clearQueue()
+                }
+            }
+        }
+
+        // ---- feedback strip -------------------------------------------------
+        // Appears after an action, never before: by the time this is on screen
+        // the turn has closed and the lesson is already filed. Answering adds a
+        // second opinion; ignoring it, clearing the chat or quitting leaves the
+        // automatic verdict standing. Silence is not a verdict.
+        ColumnLayout {
+            visible: Nikita.canRate && root.viewState !== "min"
+            Layout.fillWidth: true
+            spacing: 4
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+
+                Text {
+                    text: "Did that do what you asked?"
+                    color: Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 11
+                    Layout.fillWidth: true
+                }
+
+                Rectangle {
+                    Layout.preferredWidth: yesTxt.implicitWidth + 20
+                    Layout.preferredHeight: 22
+                    radius: 3
+                    color: yesMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                    border.width: 1
+                    border.color: Theme.color.mediumorange2
+                    Text {
+                        id: yesTxt
+                        anchors.centerIn: parent
+                        text: "YES"
+                        color: yesMouse.containsMouse ? "#0b0410" : Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                    }
+                    MouseArea {
+                        id: yesMouse
+                        anchors.fill: parent; hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { Nikita.rateLastAction(true, note.text); note.text = ""; }
+                    }
+                }
+
+                Rectangle {
+                    Layout.preferredWidth: noTxt.implicitWidth + 20
+                    Layout.preferredHeight: 22
+                    radius: 3
+                    color: noMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                    border.width: 1
+                    border.color: Theme.color.mediumorange2
+                    Text {
+                        id: noTxt
+                        anchors.centerIn: parent
+                        text: "NO"
+                        color: noMouse.containsMouse ? "#0b0410" : Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                    }
+                    MouseArea {
+                        id: noMouse
+                        anchors.fill: parent; hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { Nikita.rateLastAction(false, note.text); note.text = ""; }
+                    }
+                }
+            }
+
+            // Optional, and the most useful half when it is filled in: the tool
+            // reported success and the file exists, so only the person who asked
+            // can say the request was not met.
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 24
+                radius: 4
+                color: "black"
+                border.width: 1
+                border.color: Theme.color.mediumorange2
+                TextInput {
+                    id: note
+                    anchors.fill: parent
+                    anchors.leftMargin: 8
+                    anchors.rightMargin: 8
+                    verticalAlignment: TextInput.AlignVCenter
+                    color: "#eaffea"
+                    font.family: "Share Tech Mono"; font.pixelSize: 11
+                    clip: true
+                    maximumLength: 200
+                    onAccepted: { Nikita.rateLastAction(false, note.text); note.text = ""; }
+                    Text {
+                        anchors.fill: parent
+                        verticalAlignment: Text.AlignVCenter
+                        visible: note.text.length === 0 && !note.activeFocus
+                        text: "what went wrong? (optional)"
+                        color: Theme.color.mediumorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 11
+                    }
+                }
+            }
+        }
+
         // ---- input row (hidden when minimized) ----
         RowLayout {
             visible: root.viewState !== "min"
@@ -910,8 +1110,17 @@ Rectangle {
                     selectionColor: Theme.color.lightorange2
                     font.family: "Share Tech Mono"
                     font.pixelSize: 13
-                    enabled: !Nikita.thinking && root.hasModel
-                    onAccepted: root.sendCurrent()
+                    // Stays editable while a turn runs. On a model that takes
+                    // minutes, locking the field means losing the thought.
+                    enabled: root.hasModel
+                    onAccepted: {
+                        if (Nikita.thinking) {
+                            Nikita.queueMessage(input.text);
+                            input.text = "";
+                        } else {
+                            root.sendCurrent();
+                        }
+                    }
 
                     Text {
                         anchors.fill: parent
@@ -928,9 +1137,19 @@ Rectangle {
             Button {
                 // Becomes the interrupt control the instant a turn starts --
                 // same idea as Claude Code's own stop-mid-response button.
-                text: Nikita.thinking ? "Stop" : "Send"
+                // Three states, not two. While a turn runs the button is Stop
+                // -- unless something has been typed, in which case stopping is
+                // almost certainly not what that text was for.
+                text: !Nikita.thinking ? "Send"
+                     : (input.text.length > 0 ? "Queue" : "Stop")
                 enabled: Nikita.thinking || (root.hasModel && input.text.length > 0)
-                onClicked: Nikita.thinking ? Nikita.stopThinking() : root.sendCurrent()
+                onClicked: {
+                    if (!Nikita.thinking) { root.sendCurrent(); }
+                    else if (input.text.length > 0) {
+                        Nikita.queueMessage(input.text);
+                        input.text = "";
+                    } else { Nikita.stopThinking(); }
+                }
             }
         }
     }
@@ -963,6 +1182,312 @@ Rectangle {
     // this UI looks like. So this is the same shape: parented to the overlay
     // NikitaTalk itself sits in (which fills mainContent, exactly the area the
     // CLI covers), toggled by `open`, no dim behind it.
+    // ---- disabled state: the whole panel becomes one control ----------------
+    // Not a dimmed overlay on top of a visible chat: when NIKITA is off there
+    // is nothing to look at and nothing to read, so the panel shows the single
+    // thing that can be done with it. z above the model manager, because a
+    // gear panel left open must not survive the assistant being switched off.
+    Rectangle {
+        id: disabledFace
+        anchors.fill: parent
+        z: 300
+        visible: !Nikita.assistantEnabled
+        color: root.color
+        radius: root.radius
+
+        Column {
+            anchors.centerIn: parent
+            spacing: 18
+
+            // The big switch. Same shape as the small one in the header, scaled
+            // up -- one visual idea, so nobody has to learn a second control.
+            Rectangle {
+                id: bigSwitch
+                width: 96; height: 44; radius: 22
+                anchors.horizontalCenter: parent.horizontalCenter
+                color: "transparent"
+                border.width: 2
+                border.color: bigMouse.containsMouse ? Theme.color.lightorange2
+                                                     : Theme.color.mediumorange2
+
+                Rectangle {
+                    width: 32; height: 32; radius: 16
+                    y: 6
+                    x: Nikita.assistantEnabled ? parent.width - width - 6 : 6
+                    color: Nikita.assistantEnabled ? Theme.color.lightorange2
+                                                   : Theme.color.mediumorange1
+                    Behavior on x { NumberAnimation { duration: 160 } }
+                    Behavior on color { ColorAnimation { duration: 160 } }
+                }
+
+                // A slow pulse on the border, so an off panel still reads as a
+                // thing that responds rather than a dead rectangle.
+                SequentialAnimation on opacity {
+                    running: disabledFace.visible
+                    loops: Animation.Infinite
+                    NumberAnimation { from: 1.0; to: 0.55; duration: 1100 }
+                    NumberAnimation { from: 0.55; to: 1.0; duration: 1100 }
+                }
+
+                MouseArea {
+                    id: bigMouse
+                    anchors.fill: parent
+                    anchors.margins: -8
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: consent.ask(true)
+                }
+            }
+
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "ENABLE NIKITA"
+                color: Theme.color.lightorange2
+                font.family: "Share Tech Mono"
+                font.pixelSize: 15
+                font.bold: true
+            }
+        }
+    }
+
+    // ---- consent gate -------------------------------------------------------
+    // Neither direction of this switch is a preference toggle. Turning it on
+    // starts something that reads files and keeps notes about the person;
+    // turning it off destroys those notes. Both deserve a sentence and a
+    // choice, so neither happens by a misclick on a 30x16 control.
+    Rectangle {
+        id: consent
+        anchors.fill: parent
+        z: 400
+        visible: pending !== 0
+        color: Qt.rgba(0, 0, 0, 0.86)
+
+        // 0 = closed, 1 = about to enable, 2 = about to disable
+        property int pending: 0
+        // Compact by default, expandable: the sheet lives inside a panel that
+        // can be 300px tall, so the full text does not fit and the body has to
+        // scroll. The square button gives the whole message in one look --
+        // scrolling to find out what gets erased is the wrong way to read a
+        // consent notice.
+        // Expanding the sheet alone did nothing: it already filled the panel, so
+        // both branches of its height resolved to the same number. What has to
+        // grow is the PANEL -- so this drives the chat's own maximize, and puts
+        // it back the way it was when the dialog closes.
+        property bool expanded: false
+        property string viewBefore: ""
+        onExpandedChanged: {
+            if (expanded) {
+                if (viewBefore === "") { viewBefore = root.viewState; }
+                root.viewState = "max";
+            } else if (viewBefore !== "") {
+                root.viewState = viewBefore;
+                viewBefore = "";
+            }
+        }
+        readonly property bool turningOn: pending === 1
+        function ask(on) { pending = on ? 1 : 2; expanded = false }
+        onPendingChanged: if (pending === 0) { expanded = false }
+
+        MouseArea { anchors.fill: parent; hoverEnabled: true }
+
+        // The sheet is sized to the PANEL, not to its own text: this lives
+        // inside the chat panel, which can be as short as ~300px, and a sheet
+        // that grows past it puts its own buttons off-screen. So the body
+        // scrolls and the buttons are pinned.
+        Rectangle {
+            id: sheet
+            width: consent.expanded ? parent.width - 16
+                                    : Math.min(parent.width - 24, 380)
+            Behavior on width { NumberAnimation { duration: 130 } }
+            // A constant preferred height, clamped to the panel -- NOT derived
+            // from the body's contentHeight. That was a binding loop: the sheet
+            // sized itself from the body while the body sized itself from the
+            // sheet, Qt cut the cycle, and the bullet list came out at zero
+            // height. The body scrolls instead.
+            height: consent.expanded ? parent.height - 16
+                                     : Math.min(parent.height - 16, 300)
+            Behavior on height { NumberAnimation { duration: 130 } }
+            anchors.centerIn: parent
+            radius: 6
+            color: "#120818"
+            border.width: 1
+            border.color: Theme.color.mediumorange2
+
+            // Same square as the chat panel's maximize, same behaviour: filled
+            // smaller when already expanded.
+            Rectangle {
+                id: expandBtn
+                width: 26; height: 20; radius: 3
+                anchors.right: parent.right
+                anchors.rightMargin: 10
+                anchors.top: parent.top
+                anchors.topMargin: 9
+                color: expandMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.14) : "transparent"
+                Rectangle {
+                    width: consent.expanded ? 8 : 11
+                    height: width
+                    color: "transparent"
+                    border.width: 2
+                    border.color: Theme.color.lightorange2
+                    anchors.centerIn: parent
+                    Behavior on width { NumberAnimation { duration: 120 } }
+                }
+                MouseArea {
+                    id: expandMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: consent.expanded = !consent.expanded
+                }
+            }
+
+            Text {
+                id: headerTxt
+                x: 14; y: 12
+                width: parent.width - 28 - expandBtn.width
+                text: consent.turningOn ? "ENABLE NIKITA?" : "DISABLE NIKITA?"
+                color: Theme.color.lightorange2
+                font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
+            }
+
+            Flickable {
+                id: bodyArea
+                x: 14
+                anchors.top: headerTxt.bottom
+                anchors.topMargin: 8
+                anchors.bottom: btnRow.top
+                anchors.bottomMargin: 10
+                width: parent.width - 28
+                contentHeight: bodyCol.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+
+                Column {
+                    id: bodyCol
+                    width: bodyArea.width
+                    spacing: 5
+
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        color: "#eaffea"
+                        font.family: "Share Tech Mono"; font.pixelSize: 11
+                        text: consent.turningOn
+                            ? "Local AI model. Nothing is sent anywhere."
+                            : "Erases everything NIKITA stored about you:"
+                    }
+
+                    Item { width: 1; height: 3 }
+
+                    // One Text per bullet. The first version put them all in one
+                    // string with hard newlines, which fought WordWrap and broke
+                    // lines in the middle of a phrase on a narrow panel.
+                    Repeater {
+                        model: consent.turningOn
+                            ? ["keeps your conversations here",
+                               "saves facts you ask it to remember, here and in /ext/nikita",
+                               "records which actions worked",
+                               "touches files only after you allow it in ACCESS"]
+                            : ["conversations and remembered facts",
+                               "the actions it learned",
+                               "the permissions you granted it",
+                               "/ext/nikita on the SD card"]
+                        Row {
+                            width: bodyCol.width
+                            spacing: 6
+                            Text {
+                                text: "\u00b7"
+                                color: Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 11
+                            }
+                            Text {
+                                width: bodyCol.width - 14
+                                wrapMode: Text.WordWrap
+                                text: modelData
+                                color: Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 11
+                            }
+                        }
+                    }
+
+                    Item { width: 1; height: 4 }
+
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        color: Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 11
+                        text: consent.turningOn
+                            ? "Turning it off later erases all of it."
+                            : "Cannot be undone."
+                    }
+                }
+            }
+
+            // Pinned to the bottom of the sheet, so they are reachable no
+            // matter how short the panel is.
+            Row {
+                id: btnRow
+                anchors.right: parent.right
+                anchors.rightMargin: 14
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 12
+                spacing: 8
+
+                Rectangle {
+                    width: cancelTxt.implicitWidth + 22; height: 24; radius: 3
+                    color: cancelMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.12) : "transparent"
+                    border.width: 1
+                    border.color: Theme.color.mediumorange2
+                    Text {
+                        id: cancelTxt
+                        anchors.centerIn: parent
+                        text: "CANCEL"
+                        color: Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                    }
+                    MouseArea {
+                        id: cancelMouse
+                        anchors.fill: parent; hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: consent.pending = 0
+                    }
+                }
+
+                Rectangle {
+                    width: okTxt.implicitWidth + 22; height: 24; radius: 3
+                    color: okMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                    border.width: 1
+                    border.color: Theme.color.lightorange2
+                    Text {
+                        id: okTxt
+                        anchors.centerIn: parent
+                        text: consent.turningOn ? "CONFIRM" : "ERASE"
+                        color: okMouse.containsMouse ? "#0b0410" : Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                    }
+                    MouseArea {
+                        id: okMouse
+                        anchors.fill: parent; hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (consent.turningOn) {
+                                Nikita.assistantEnabled = true;
+                            } else {
+                                // Wipe BEFORE flipping: the panel is gone the
+                                // instant it flips, and an error during the
+                                // wipe still needs somewhere to show itself.
+                                Nikita.wipeAssistantData();
+                                Nikita.assistantEnabled = false;
+                            }
+                            consent.pending = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Item {
         id: modelManager
         parent: root.parent ? root.parent : root
@@ -1131,154 +1656,6 @@ Rectangle {
                 }
             }
 
-            // ---- optional extra brain: real Claude, on the user's own account ----
-            // Not part of catalogModel/catalogView on purpose: that list is built
-            // from NIKITA_CATALOG (pull/remove Ollama models), and Claude is
-            // neither -- it's detected (installed + logged in), never installed
-            // or removed from here.
-            Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: claudeRowCol.implicitHeight + 16
-                radius: 5
-                color: (Nikita.modelName === "Claude") ? "#1a0d24" : "#120818"
-                border.width: 1
-                border.color: Nikita.claudeAvailable
-                    ? ((Nikita.modelName === "Claude") ? Theme.color.lightorange2 : Theme.color.mediumorange2)
-                    : "#5a3a3a"
-
-                ColumnLayout {
-                    id: claudeRowCol
-                    x: 10; y: 8
-                    width: parent.width - 20
-                    spacing: 4
-
-                    // No polling loop tied to panel visibility to gate against
-                    // (this Rectangle exists whenever the manager does) -- cheap
-                    // enough (one quick subprocess) that ticking while not
-                    // available and stopping the moment it is costs nothing
-                    // worth guarding further.
-                    Timer {
-                        interval: 4000
-                        running: !Nikita.claudeAvailable
-                        repeat: true
-                        onTriggered: Nikita.detectClaude()
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 6
-                        Text {
-                            // Fixed -- never swaps for account text, an error, or
-                            // anything else. This is the row's name, full stop.
-                            text: "Claude"
-                            color: "#eaffea"
-                            font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
-                            Layout.fillWidth: true
-                        }
-                        Text {
-                            visible: Nikita.claudeAvailable
-                            text: Nikita.claudeAccountLabel
-                            color: "#39ff14"
-                            font.family: "Share Tech Mono"; font.pixelSize: 10
-                        }
-                        Rectangle {
-                            visible: Nikita.claudeAvailable && Nikita.modelName !== "Claude"
-                            Layout.preferredWidth: claudeEquipLabel.implicitWidth + 14
-                            Layout.preferredHeight: 16
-                            radius: 3
-                            color: claudeEquipMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
-                            border.width: 1
-                            border.color: Theme.color.lightorange2
-                            Text {
-                                id: claudeEquipLabel
-                                anchors.centerIn: parent
-                                text: "EQUIP"
-                                color: claudeEquipMouse.containsMouse ? "#0b0410" : Theme.color.lightorange2
-                                font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
-                            }
-                            MouseArea {
-                                id: claudeEquipMouse
-                                anchors.fill: parent
-                                anchors.margins: -4
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: Nikita.setModel("Claude")
-                            }
-                        }
-                    }
-
-                    Text {
-                        // Fixed -- same wording whether signed in or not. What
-                        // sign in/out below does is self-explanatory; this line
-                        // doesn't need to narrate the account state on top of it.
-                        text: "Runs on your Claude subscription plan."
-                        color: Theme.color.mediumorange1
-                        font.family: "Share Tech Mono"; font.pixelSize: 10
-                        wrapMode: Text.WordWrap
-                        Layout.fillWidth: true
-                    }
-
-                    // Status pill + sign in/out, bottom row -- same spot, same
-                    // pill styling (color(0f3d1f)/border/radius all copied
-                    // verbatim) and the same visual language for the action
-                    // link, as installed/not-installed + install/uninstall in
-                    // the catalog rows below.
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 8
-                        Rectangle {
-                            Layout.preferredWidth: claudeConnPill.implicitWidth + 12
-                            Layout.preferredHeight: 18
-                            radius: 3
-                            color: Nikita.claudeAvailable ? "#0f3d1f" : "transparent"
-                            border.width: Nikita.claudeAvailable ? 0 : 1
-                            border.color: Theme.color.mediumorange2
-                            Text {
-                                id: claudeConnPill
-                                anchors.centerIn: parent
-                                text: Nikita.claudeAvailable ? "connected" : "not connected"
-                                color: Nikita.claudeAvailable ? "#39ff14" : Theme.color.mediumorange1
-                                font.family: "Share Tech Mono"; font.pixelSize: 10
-                            }
-                        }
-                        Item { Layout.fillWidth: true }
-                        Text {
-                            visible: !Nikita.claudeAvailable
-                            // Two different clicks behind one label would be
-                            // fine if they both did something -- but "sign
-                            // in" on a machine with no `claude` CLI used to
-                            // just do nothing, which read as broken rather
-                            // than as "go install it first".
-                            text: Nikita.claudeInstalled ? "sign in" : "install"
-                            color: claudeSignInMouse.containsMouse ? Theme.color.lightgreen : Theme.color.lightorange2
-                            font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
-                            MouseArea {
-                                id: claudeSignInMouse
-                                anchors.fill: parent
-                                anchors.margins: -4
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: Nikita.claudeSignIn()
-                            }
-                        }
-                        Text {
-                            visible: Nikita.claudeAvailable
-                            text: "sign out"
-                            color: claudeSignOutMouse.containsMouse ? "#ff6a6a" : Theme.color.mediumorange1
-                            font.family: "Share Tech Mono"; font.pixelSize: 11
-                            MouseArea {
-                                id: claudeSignOutMouse
-                                anchors.fill: parent
-                                anchors.margins: -4
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: Nikita.claudeSignOut()
-                            }
-                        }
-                    }
-                }
-            }
-
             // ---- Ollama missing: one big themed button instead of a list of
             // models that can't be installed anyway. Laypeople land here with
             // no idea what Ollama even is, so this has to be the one obvious
@@ -1347,7 +1724,10 @@ Rectangle {
                 id: catalogView
                 visible: Nikita.ollamaInstalled
                 Layout.fillWidth: true
-                Layout.fillHeight: true
+                // Was fillHeight, back when this list had six models. With a
+                // single model that left half the panel empty -- now the list
+                // takes what it needs and the rest goes to the filters.
+                Layout.preferredHeight: Math.min(contentHeight, 260)
                 clip: true
                 model: catalogModel
                 spacing: 6
@@ -1572,6 +1952,162 @@ Rectangle {
                                     onClicked: Nikita.uninstallModel(model.tag)
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // ---- ACCESS FILTERS ----------------------------------------
+            // What NIKITA is allowed to touch. The two buttons up top are
+            // shortcuts for the same toggles below -- not separate modes, just
+            // all-on/all-off in one click. The actual blocking happens in the
+            // backend (runOneTool), never here: a control that only hides a
+            // tool from the list is decoration, not a gate.
+            Rectangle {
+                visible: Nikita.ollamaInstalled
+                Layout.fillWidth: true
+                Layout.preferredHeight: 1
+                color: Theme.color.mediumorange2
+                opacity: 0.4
+            }
+
+            RowLayout {
+                visible: Nikita.ollamaInstalled
+                Layout.fillWidth: true
+                spacing: 8
+
+                Text {
+                    text: "ACCESS"
+                    color: Theme.color.lightorange2
+                    font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
+                }
+                Text {
+                    text: Nikita.filterPreset === 1 ? "full"
+                        : Nikita.filterPreset === 0 ? "none" : "custom"
+                    // No red here. FORMAT wipes the entire SD card and uses the
+                    // standard palette, so red is not this app's language for
+                    // "destructive" -- it appears only on uninstall/cancel.
+                    color: Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 11
+                    Layout.fillWidth: true
+                }
+
+                // preset: nothing
+                Rectangle {
+                    Layout.preferredWidth: noneLabel.implicitWidth + 16
+                    Layout.preferredHeight: 20
+                    radius: 3
+                    color: noneMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                    border.width: 1
+                    border.color: Nikita.filterPreset === 0 ? Theme.color.lightorange2
+                                                            : Theme.color.mediumorange2
+                    Text {
+                        id: noneLabel
+                        anchors.centerIn: parent
+                        text: "NO ACCESS"
+                        color: noneMouse.containsMouse ? "#0b0410"
+                             : (Nikita.filterPreset === 0 ? Theme.color.lightorange2
+                                                          : Theme.color.mediumorange1)
+                        font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                    }
+                    MouseArea {
+                        id: noneMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: Nikita.setAllFilters(false)
+                    }
+                }
+
+                // preset: everything
+                Rectangle {
+                    Layout.preferredWidth: allLabel.implicitWidth + 16
+                    Layout.preferredHeight: 20
+                    radius: 3
+                    color: allMouse.containsMouse ? Theme.color.lightgreen : "transparent"
+                    border.width: 1
+                    border.color: Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange2
+                    Text {
+                        id: allLabel
+                        anchors.centerIn: parent
+                        text: "FULL ACCESS"
+                        color: allMouse.containsMouse ? "#0b0410"
+                             : (Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange1)
+                        font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                    }
+                    MouseArea {
+                        id: allMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: Nikita.setAllFilters(true)
+                    }
+                }
+            }
+
+            ListView {
+                id: filterView
+                visible: Nikita.ollamaInstalled
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                spacing: 4
+                model: Nikita.filters
+
+                delegate: Rectangle {
+                    width: filterView.width
+                    height: filterCol.implicitHeight + 12
+                    radius: 4
+                    color: modelData.enabled ? "#120818" : "#0d0610"
+                    border.width: 1
+                    border.color: modelData.enabled ? Theme.color.mediumorange2 : "#3a2a3a"
+
+                    ColumnLayout {
+                        id: filterCol
+                        x: 10; y: 6
+                        width: parent.width - 20
+                        spacing: 2
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            Text {
+                                text: modelData.label
+                                color: modelData.enabled ? "#eaffea" : Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                Layout.fillWidth: true
+                            }
+                            // Same pill styling as installed/not installed in
+                            // the model list above: one visual language, one click.
+                            Rectangle {
+                                Layout.preferredWidth: 44
+                                Layout.preferredHeight: 18
+                                radius: 3
+                                color: modelData.enabled ? "#0f3d1f" : "transparent"
+                                border.width: modelData.enabled ? 0 : 1
+                                border.color: Theme.color.mediumorange2
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: modelData.enabled ? "ON" : "OFF"
+                                    color: modelData.enabled ? "#39ff14" : Theme.color.mediumorange1
+                                    font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    anchors.margins: -4
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: Nikita.setFilter(modelData.id, !modelData.enabled)
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: modelData.blurb
+                            color: Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 10
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
                         }
                     }
                 }
