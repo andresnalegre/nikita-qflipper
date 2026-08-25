@@ -10,15 +10,33 @@ On top of everything upstream qFlipper does (firmware updates over DFU, screen s
 
 | | What it is |
 |---|---|
-| **Nikita** | A local LLM agent with tool-calling, running `qwen3:4b` on your own machine. Off until you enable it. It reads and writes the SD card, runs Flipper CLI commands and presses the device's buttons — and, within the access you grant it, carries out real work on your own computer: reading and writing files, running builds, driving shell commands. |
+| **Nikita** | An LLM agent with tool-calling, running on the **Kimi API** (`kimi-k2.6` by default). Off until you enable it. It reads and writes the SD card, runs Flipper CLI commands, **sees and drives the device's screen** — and, within the access you grant it, carries out real work on your own computer: reading and writing files, running builds, driving shell commands. |
 | **File manager** | Upstream lets you move files on and off the card. Here you also **edit them in place** — double-click opens an editor that saves straight back over RPC — **create** new files on the device, and select many at once for batch operations. |
 | **CLI panel** | A unified shell where the same command name reaches either the Flipper or your computer, chosen by the path you give it. Transfers between the two are MD5-verified. |
 | **Firmware store** | Six firmware sources (official and community) with release/dev channels, side by side, installed through qFlipper's existing update path. |
 | **Bluetooth (BLE)** | Cable-free connect — scan, pair and run the same RPC session over Bluetooth Low Energy as an alternative to USB. |
 
-Everything runs on your machine. The agent talks to [Ollama](https://ollama.com) on `localhost`; there is no API key, no account, and no request leaves the computer except firmware downloads and whatever you explicitly ask the agent to fetch.
+The agent runs on the **Kimi API** — you supply an API key (or export `MOONSHOT_API_KEY`), and each turn is sent to Moonshot's servers. Nothing else leaves the computer except firmware downloads and whatever you explicitly ask the agent to fetch. Everything the agent *does* — the SD card, the CLI, the buttons, your files — happens locally on the link to the device and on your own machine.
 
 > **Not affiliated with Flipper Devices.** "Flipper Zero" and "qFlipper" are their trademarks. This is an independent fork, licensed GPLv3 like the original.
+
+---
+
+## Recent changes
+
+The most significant changes since the first cut, newest work first. Some sections further down still describe the earlier local-model design; where they conflict with this list, this list is current.
+
+- **The brain moved from a local model to the Kimi API.** Nikita no longer runs `qwen3:4b` under Ollama — it talks to Moonshot's Kimi over the OpenAI-compatible API. **`kimi-k2.6` is the default** (GA, the account's full rate limit, and it prompt-caches the stable prefix so repeated rounds are cheap); **`kimi-k3`** is selectable for the hardest jobs but is rate-limited in preview. The whole Ollama path — model catalog, pull/remove, runtime installer — was removed. The setup panel gained a **BRAIN** model picker and an **API-key field** with show/copy/save; the key is write-only to the UI (there is no getter), and the environment variable `MOONSHOT_API_KEY` overrides a stored key.
+- **The cost, not the context window, is what the footer now shows** for an API turn — dollars per round and per turn, from the real token usage.
+- **Seeing and driving the Flipper's screen.** `read_screen` reads the current framebuffer so the agent is no longer blind, and `press_button` hands the resulting screen back with every press. Navigation is CLI-first: `loader open <App>` reaches an app deterministically instead of counting D-pad steps, and blind button sequences are never stored as reusable "recipes" (they only reproduce from the exact screen they started on).
+- **Universal remotes, done in code.** `ir_universal(remote, button)` reads `/ext/infrared/assets/<remote>.ir` and transmits every brand's code for that button over `ir tx` — the on-screen universal remote, without navigation. "Turn on/off the TV" (and its variants, in EN and pt-BR) is a **deterministic shortcut** that fires `ir_universal(tv, Power)` with no model round at all, because TV power is a toggle.
+- **The Flipper can no longer be crashed from the CLI by the agent.** `ir universal …` crashes this firmware (NULL-pointer reboot), so it is refused before it reaches the device; and if any command does reboot the Flipper, the app detects the fault / dropped link and reports failure instead of claiming success.
+- **Determinism over the model's word.** The BadUSB Apple-keyboard `ID` line is enforced in `sanitizeDuckyScript` regardless of what the model writes; the "claimed success without acting" guard now also catches "it's already at …"-style existence claims; and `{{LAST_RESULT}}` lets a saved file carry a command's real output instead of the model retyping a number.
+- **Memory respects your edits.** Hand-editing `actions-memory.txt` (including clearing it) now sticks instead of being overwritten by the in-memory copy, and multi-step "recipes" record the whole chain with each step's target, not just the first file.
+- **Erase means disconnect.** Wiping assistant data now also removes the API key and switches **every access filter off**; a re-opened chat starts with no access until you grant it.
+- **macOS file access fixed.** `Info.plist` now carries the Desktop / Documents / Downloads / removable-volume usage-description keys. Without them a Developer-ID + hardened-runtime build is denied those folders outright (EPERM), which had read as "the Desktop is read-only."
+- **The release build actually runs on other Macs.** `build_mac.sh` now bundles the Qt frameworks and QML plugins with `macdeployqt` and signs them bottom-up. The earlier notarized DMG launched only where Homebrew's Qt happened to sit and crashed everywhere else with "Library not loaded … different Team IDs."
+- **UI.** Each tool line in the chat is a clickable row that expands to the exact call (`ir_universal(remote=tv, button=Power)`); the live progress line (elapsed · tokens · cost · status) sits under the answer and stays in view; and the send control is **Stop** during a turn, with **Send** appearing only when you start typing something to queue.
 
 ---
 
@@ -50,7 +68,7 @@ Everything runs on your machine. The agent talks to [Ollama](https://ollama.com)
 | **Backup / restore** | The internal storage (`/int`): settings and pairing data | The whole SD card, with live progress and `.tgz` packing. Upstream's `/int` tarball could never bring back a capture or a script |
 | **Connecting to the device** | USB only | USB, or scan-and-connect over Bluetooth Low Energy — same RPC session either way |
 | **Shell access** | None | A CLI panel that reaches the Flipper *and* your computer, with MD5-verified transfers between them |
-| **AI assistant** | None | Nikita: one local model (`qwen3:4b`), tool-calling, installed from inside the app. Off until you switch it on, and erasable in one click |
+| **AI assistant** | None | Nikita: an LLM agent on the Kimi API (`kimi-k2.6`), tool-calling, with a key you paste into setup. Off until you switch it on, and erasable in one click |
 | **What the assistant may touch** | — | Nine access switches, per group, enforced at execution — not just hidden from the model |
 | **Work on your own computer** | None | Opt-in agent mode — read/write files, run builds and shell commands, with the results fed back into the conversation |
 | **App self-update** | Enabled, pointed at Flipper Devices' server | Disabled on purpose — see [why](#why-the-app-self-updater-is-off) |
@@ -85,7 +103,7 @@ flowchart TB
         DFU["DFU / update path"]
     end
 
-    OLL["Ollama<br/>localhost:11434"]
+    OLL["Kimi API<br/>api.moonshot.ai"]
     DEV["Flipper Zero<br/>USB CDC"]
     HOST["Your computer<br/>shell + filesystem"]
 
@@ -109,10 +127,10 @@ The four singletons are registered in `application/application.cpp` as `Nikita`,
 
 ### The loop
 
-A turn is: build the prompt → stream from Ollama → if the model asked for tools, run them and feed the results back → repeat until it answers in prose.
+A turn is: build the prompt → send to the Kimi API → if the model asked for tools, run them and feed the results back → repeat until it answers in prose.
 
-- **Endpoint:** `POST http://localhost:11434/api/chat`, streamed.
-- **Context:** `num_ctx` is set to 16384. The system prompt alone measures ~7.7k tokens, and 8192 left so little headroom that Ollama silently truncated *from the front* mid-turn — dropping the instructions that say which machine is which. Raising the window fixed a whole class of "hallucination" that was really amnesia.
+- **Endpoint:** `POST https://api.moonshot.ai/v1/chat/completions` (OpenAI-compatible), one reply parsed whole — not streamed, so a tool call can never arrive half-built.
+- **Window:** Kimi holds 256K tokens and prompt-caches the stable prefix, so the system prompt (~8k tokens) is re-sent every round but billed as a cache hit, and the conversation budget is large enough that a multi-round turn keeps its own context instead of being trimmed mid-task.
 - **No step cap.** A job that genuinely needs forty tool calls gets forty. What is bounded instead is *going in circles*: three consecutive rounds that produce no new call ends the turn, with a far-off ceiling as a runaway stop.
 
 ### The tool surface
@@ -130,8 +148,10 @@ Tools are assembled per turn, not fixed. Tool **count** is the single biggest le
 | `read_file` | Read a device file, up to ~8 KB |
 | `save_file` | Write a file to the SD card |
 | `make_dir` / `delete_file` / `rename_file` / `file_info` | The rest of the storage verbs |
-| `press_button` | Tap up/down/left/right/ok/back — real D-pad input over RPC |
-| `run_cli` | Any Flipper CLI command: `device_info`, `subghz`, `nfc`, `gpio`, `ir`, `led`, `vibro`, `power`, `js`, … |
+| `read_screen` | Read the current screen (the framebuffer) as text — the agent is not blind |
+| `press_button` | Tap up/down/left/right/ok/back — real D-pad input over RPC; hands back the resulting screen |
+| `run_cli` | Any Flipper CLI command: `device_info`, `subghz`, `nfc`, `gpio`, `ir`, `led`, `vibro`, `power`, `js`, … (known crashers like `ir universal` are refused) |
+| `ir_universal` | Fire a universal remote button (`tv`/`ac`/`audio`/`projector` × `Power`/`Mute`/…) — reads the `.ir` asset and transmits every brand's code over `ir tx`, no navigation |
 
 **Your computer** — only offered when agent mode is on. This is the part with no equivalent upstream: Nikita stops being a chat window about the Flipper and becomes something that does work on your machine.
 
@@ -194,23 +214,22 @@ Every phrase is set at a real transition — `thinking`, `getting to work`, `wri
 
 The input **stays editable** while a turn runs. Anything typed is queued, shown as `↳ queued (1): …` with a `cancel`, and delivered as one message the moment the turn ends. The send button becomes `Queue` when there is text and `Stop` when there is not: while a turn runs, stopping is almost certainly not what that text was for.
 
-### The model — one, local, yours
+### The model — the Kimi API
 
-Nikita runs on **one** model: `qwen3:4b`, pulled and run by Ollama on your own machine. Nothing is sent anywhere.
+Nikita runs on **Moonshot's Kimi API** over the OpenAI-compatible wire format. Pick the model in the **BRAIN** section of setup:
 
-The model manager (gear icon in the chat header) lists it, shows whether it is installed, and installs or removes it for you — the app drives `ollama` so you never touch a terminal. Ollama itself can be installed from the setup wizard if you don't have it.
+| Model | Notes |
+|---|---|
+| `kimi-k2.6` | **Default.** GA, runs at the account's full rate limit, and prompt-caches the stable prefix so repeated rounds of a turn are cheap. Best for tool-heavy work. |
+| `kimi-k2.7-code-highspeed` | Fast, coding-tuned. |
+| `kimi-k3` | Newest, 1M-token context — reserve it for the hardest jobs; in preview it carries its own tighter rate limit than the account tier. |
 
-| Tag | Size | Notes |
-|---|---|---|
-| `qwen3:4b` | 2.5 GB | The brain. Runs locally, reasons before it answers. |
+You supply the key: paste it into the field under **BRAIN** (write-only to the UI — there is no getter, and clicking the field opens it for editing with the key masked), or export `MOONSHOT_API_KEY` before launching, which overrides a stored key. **Erase** removes the stored key.
 
-Earlier versions shipped a catalog of six models plus an optional path to the real Claude CLI. Both are gone. One model that is understood and tuned beats six that are merely listed, and the settings that matter — context size, sampling, output ceiling — can only be tuned honestly for a model you actually measured.
+This replaced an earlier local design that ran a single `qwen3:4b` under Ollama, with a whole model manager to pull and remove it. That path — and the 8 GB / 8192-context arithmetic that came with running a 4B on an M1 — is gone. Two consequences worth knowing:
 
-Two things worth knowing about this particular build:
-
-`qwen3:4b` on Ollama is the **Thinking-2507** variant. It always reasons before answering; there is no way to switch that off (`/no_think` is not honoured, `"think": false` only hides the reasoning, and a pre-closed `<think>` template does not work on it). Every request pays a reasoning pass.
-
-Context is set to **8192**, not higher, and that is deliberate. Measured on an M1 with 8 GB: at 16384 the Ollama runner reaches 3.9 GB resident, the machine swaps, and generation collapses from ~18 tokens/s to 2.2 — an eight-fold slowdown that turns "create this file" into an eight-minute wait. At 8192 the model fits.
+- Sampling is per model family: `kimi-k3` is a reasoning model that fixes its own `temperature` (sending one gets *"only 1 is allowed for this model"*), so the API request sends none.
+- The conversation window is bounded by a large token budget (Kimi holds 256K and caches the growing prefix), so a multi-round navigation turn keeps its own context instead of being trimmed mid-task; a stale `read_screen` framebuffer collapses to a one-line placeholder so screenshots of menus long gone don't pile up.
 
 ### Access filters — what it is allowed to touch
 
@@ -222,7 +241,7 @@ Under the model in the same panel, nine switches decide what Nikita can reach. `
 | Flipper: read | `list_files` `read_file` `file_info` |
 | Flipper: create and change | `save_file` `make_dir` `rename_file` |
 | Flipper: delete | `delete_file` |
-| Flipper: control | `press_button` `run_cli` |
+| Flipper: control | `press_button` `run_cli` `read_screen` `ir_universal` |
 | Computer: read | `host_list` `host_read` `host_find` `host_cd` |
 | Computer: create and change | `host_write` `host_mkdir` `host_move` `host_copy` |
 | Computer: delete | `host_delete` |
@@ -392,9 +411,9 @@ The base project structure is otherwise unchanged from [upstream](https://github
 **Runtime**
 
 - A Flipper Zero — a USB cable that carries data, or Bluetooth on a build with `HZUI_BLE` enabled (the CLI panel still needs the cable; see [Bluetooth](#bluetooth)).
-- [Ollama](https://ollama.com) running (`ollama serve`) with at least one model from the catalog above.
-- ~6 GB of VRAM is comfortable for a 7B model. CPU-only works and is slower.
-- Nikita is optional: without Ollama the app is still a working qFlipper with the CLI panel and firmware store.
+- A Kimi API key (from [platform.kimi.ai](https://platform.kimi.ai)) — pasted into setup or exported as `MOONSHOT_API_KEY`. Turns cost a cent or two each; the account needs a little balance.
+- Network access to `api.moonshot.ai` while the assistant is in use.
+- Nikita is optional: without a key the app is still a working qFlipper with the CLI panel and firmware store.
 
 **Build** — Qt **6.4.2** or newer (builds on 6.7 / 6.8), modules `qtserialport`, `qt5compat`, `qtsvg`, `qtimageformats`, `qtconnectivity`, plus libusb-1.0 and zlib.
 
@@ -466,16 +485,17 @@ After that, `build_windows_dev_inc.bat` is the fast incremental build for code a
 
 Builds for the host architecture only — the project-compiled nanopb dependency has no x86_64 slice on Apple Silicon, so a forced universal build fails to link. Override with `BUILD_ARCHS="x86_64 arm64" ./build_mac.sh` if you have universal dependencies.
 
+The script bundles the Qt frameworks and QML plugins with `macdeployqt` so the `.app` runs on a Mac without Homebrew's Qt. `RELEASE=1 ./build_mac.sh` additionally signs everything bottom-up with a Developer ID, notarizes, staples, and produces a signed, notarized `qFlipper.dmg` — it needs a Developer ID in the keychain and a `notarytool` profile named `nikita`.
+
 ---
 
 ## First run
 
 1. Launch the app. Nikita is **off** — you get the Flipper side of qFlipper and nothing else. If that is all you wanted, you are done.
 2. To use the assistant, click **ENABLE NIKITA** and read what it tells you before confirming.
-3. Install Ollama and pull the model: `ollama pull qwen3:4b` — or let the app do both from the model manager (gear icon).
-4. Make sure `ollama serve` is running.
-5. Open the model manager to set **ACCESS**: what Nikita may read, change, delete or run, on the Flipper and on this computer. Everything is on by default once enabled; `NO ACCESS` turns it all off in one click.
-6. **Agent mode** is separate and off by default — if you turn it on, pick the workspace folder it should start in. Read the section above first.
+3. Open setup (gear icon) and, under **BRAIN**, pick a model (`kimi-k2.6` by default) and paste your Kimi API key — or export `MOONSHOT_API_KEY` before launching.
+4. In the same panel set **ACCESS**: what Nikita may read, change, delete or run, on the Flipper and on this computer. Everything is on by default once enabled; `NO ACCESS` turns it all off in one click.
+5. **Agent mode** is separate and off by default — if you turn it on, pick the workspace folder it should start in. Read the section above first.
 
 ---
 
@@ -519,7 +539,7 @@ Stated plainly, because they are the honest state of the tree:
 
 - **[lotei-qflipper](https://github.com/DUNKINKKD/lotei-qflipper)** — by [DUNKINKKD](https://github.com/DUNKINKKD). The visual language of this fork comes from Lotei, and Lotei is what made me want to build this architecture in the first place. The look, the terminal feel, the idea that a Flipper companion could have a character instead of a settings panel — that starting point is theirs.
 - **[qFlipper](https://github.com/flipperdevices/qFlipper)** — Flipper Devices, the base this forks.
-- **[Ollama](https://ollama.com)** and **[Qwen3](https://github.com/QwenLM/Qwen3)** — the local model stack.
+- **[Kimi / Moonshot AI](https://platform.kimi.ai)** — the model behind the agent (`kimi-k2.6` by default).
 - Firmware sources: Flipper Devices, [Momentum](https://momentum-fw.dev), [Unleashed](https://github.com/DarkFlippers/unleashed-firmware), [RogueMaster](https://github.com/RogueMaster/flipperzero-firmware-wPlugins), [ARF](https://github.com/D4C1-Labs/Flipper-ARF), [Xero](https://github.com/noproto/xero-firmware).
 
 ## License

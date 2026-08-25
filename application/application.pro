@@ -100,8 +100,11 @@ win32 {
 macx: ICON = assets/icons/$${NAME}.icns
 else:win32: RC_ICONS = assets/icons/$${NAME}.ico
 
-# Qt's own template plus NSBluetoothAlwaysUsageDescription (see the file for
-# why) -- needed once BLE is enabled on macOS below.
+# Qt's own template plus the macOS usage-description strings (see the file for
+# why each one is there): NSBluetoothAlwaysUsageDescription for BLE, and the
+# Desktop/Documents/Downloads/RemovableVolumes keys without which a hardened,
+# Developer-ID-signed build is denied those folders outright -- no prompt, just
+# EPERM out of every write.
 macx: QMAKE_INFO_PLIST = Info.plist.app
 
 INCLUDEPATH += \

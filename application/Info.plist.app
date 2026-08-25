@@ -31,5 +31,31 @@
 	     failure with no error dialog to explain it. -->
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>qFlipper uses Bluetooth to connect to a Flipper Zero over BLE, as an alternative to the USB cable.</string>
+	<!-- macOS protects Desktop, Documents, Downloads and removable volumes
+	     behind TCC. This app is signed with a Developer ID AND the hardened
+	     runtime, which is exactly the combination the system enforces
+	     strictly: with no usage-description string for a protected folder it
+	     does not prompt the user at all, it denies the access outright, and
+	     the call comes back as EPERM -- "Operation not permitted".
+	     That is what NIKITA's host_write hit when asked to put a file on the
+	     Desktop, and why it looked like the Desktop was read-only when the
+	     POSIX permissions on it were perfectly normal.
+	     Each key below is the sentence the user is shown in the permission
+	     prompt, so it says what the app actually wants the folder for.
+	     NOTE: a folder that was already denied stays denied -- macOS caches
+	     the verdict per bundle id. After installing a build with these keys,
+	     clear the old record once:
+	       tccutil reset SystemPolicyDesktopFolder com.yourcompany.qFlipper
+	     (or reset the app entirely: tccutil reset All com.yourcompany.qFlipper) -->
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>NIKITA needs access to your Desktop to save and edit the files you ask it for.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>NIKITA needs access to your Documents folder to save and edit the files you ask it for.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>NIKITA needs access to your Downloads folder to save and edit the files you ask it for.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>qFlipper needs access to removable volumes to read and write the Flipper Zero's microSD card when it is mounted.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>NIKITA runs the shell commands you approve on screen; some of them ask other apps to do the work.</string>
 </dict>
 </plist>

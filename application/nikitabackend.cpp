@@ -19,6 +19,11 @@
 #include <QDirIterator>
 #include <QCryptographicHash>
 #include <QStandardPaths>
+#ifndef Q_OS_WIN
+#include <dirent.h>
+#include <cerrno>
+#include <cstring>
+#endif
 #include <QSysInfo>
 #include <QSysInfo>
 #include <QSettings>
@@ -45,6 +50,8 @@
 #include "inputevent.h"
 #include "flipperzero/flipperzero.h"
 #include "flipperzero/devicestate.h"
+#include "flipperzero/screenstreamer.h"
+#include "screenframe.h"
 #include "flipperzero/protobufsession.h"
 #include "flipperzero/utilityinterface.h"
 #include "flipperzero/rpc/storagelistoperation.h"
@@ -62,22 +69,51 @@
 #include "flipperzero/utility/filesuploadoperation.h"
 
 // ---- Configuration -------------------------------------------------------
-// No hardcoded fallback: refreshModels() picks whatever the user actually has
-// installed, from NIKITA_CATALOG's recommended order.
-static const char *NIKITA_MODEL = "";
-static const char *NIKITA_URL   = "http://localhost:11434/api/chat";
-// System prompt alone is ~7700 tokens; Ollama truncates from the FRONT on
-// overflow, silently dropping it mid-conversation, which is the likeliest
-// cause of hallucination. Keep headroom here.
-// 8192, not 16384. Measured on this machine (M1, 8GB): at 16k the ollama
-// runner reports 3.9GB resident, the machine goes to swap, and generation
-// collapses from ~18 tokens/s to 2.2 -- an eight-fold slowdown that turns a
-// simple "create this file" into an eight-minute wait. At 8k the model fits
-// and the speed comes back. Raise this only on a machine with RAM to spare.
-// A dialogue/action split routing actions to qwen3:4b-instruct was tried here
-// and reverted: Ollama answered the action turn with a bare 400 Bad Request,
-// with nothing in its own log to explain it, and the cause was never found.
-// One model, the one the user equips, until that is understood.
+// Moonshot's hosted API, and the only brain there is. The local Ollama path --
+// the model catalog, the pull/remove machinery, the runtime installer, the
+// context-window arithmetic that came with running a 4B on an 8 GB Mac -- was
+// removed once this one worked. What is left is one endpoint, one model, and
+// one wire format.
+static const char *NIKITA_API_URL   = "https://api.moonshot.ai/v1/chat/completions";
+// Default to the GA model, not the preview flagship. kimi-k3 is newer and has a
+// 1M-token window, but in preview it carries its own tight rate limit that the
+// account's real tier (3M TPM / 500 RPM) does not lift -- so a multi-round tool
+// turn on k3 kept dying on 429 at its last step. kimi-k2.6 runs at the full tier
+// and does the same job here. Switchable in setup for anyone who wants k3.
+static const char *NIKITA_API_MODEL = "kimi-k2.6";
+// The ceiling on one reply. Output is what costs money here, so this is a real
+// budget and not a formality: at $15 per million, a turn that ran the whole way
+// to this ceiling would be about six cents on its own.
+static const int   NIKITA_API_MAX_TOKENS = 4096;
+// How many times one turn will quietly wait out a 429 before giving up. A 429 is
+// a per-minute throttle, so a couple of backed-off retries clears the common
+// case (two turns fired close together); past that the account tier is the real
+// limit and waiting longer just wastes the user's time.
+static const int   NIKITA_API_MAX_RATE_RETRIES = 4;
+// The USB identity a BadUSB script announces on its first line. macOS runs a
+// Keyboard Setup Assistant against any keyboard it does not recognise, and
+// that modal steals focus and swallows the first keystrokes -- so a payload
+// that does not present as a known Apple keyboard "does not work" in exactly
+// the way that is maddening to debug, because the script is fine and the typing
+// just vanishes. Presenting Apple's own vendor id sidesteps the assistant.
+//
+// 05ac is Apple's real USB vendor id (the reliable half). The product id is a
+// common Apple keyboard one; change THIS LINE if a particular target needs a
+// specific model. Injected into the system prompt in place of the token
+// {{BADUSB_ID}}, so the rule and the worked example can never fall out of step.
+static const char *NIKITA_BADUSB_ID = "ID 05ac:024f Apple:Keyboard";
+// The environment variable Moonshot's own documentation tells people to use.
+// Checked BEFORE the stored setting, so a key exported for the shell wins over
+// a stale one typed into the app months ago.
+static const char *NIKITA_API_KEY_ENV = "MOONSHOT_API_KEY";
+// Deliberately NOT "nikita/apiKey". That name is already taken in existing
+// installs by a leftover from the removed remote-provider path -- this machine
+// still has an OpenAI sk-proj- key sitting under it. Reusing the name would
+// have made apiKeyPresent() true on a key nobody set for this, and sent a
+// stranger's OpenAI credential to Moonshot in an Authorization header on the
+// first turn. A new provider gets a new name.
+static const char *kApiKeyKey    = "nikita/kimiApiKey";
+static const char *kApiModelKey  = "nikita/apiModel";
 // Defined further down (they need QStandardPaths), declared here because
 // wipeAssistantData() sits above them.
 static QString nikitaHistoryPath();
@@ -87,16 +123,27 @@ static QString nikitaMistakesPath();
 
 // Master switch state. Lives in QSettings so it survives a restart.
 static const char *kAssistantEnabledKey = "nikita/assistantEnabled";
-static const int   NIKITA_NUM_CTX = 8192;
-// Hard ceiling on one turn. qwen3:4b is the Thinking-2507 build: it always
-// reasons, and with nothing capping it a confused turn can spend thousands of
-// tokens deliberating. At ~18 tokens/s this cap is the difference between a
-// slow answer and no answer at all.
-// 4096. qwen3:4b is the Thinking-2507 build and spends most of its budget
-// before it writes a word: at 1536 a turn got cut off mid-<think>, came back
-// with no tool call and a stray fragment of prose ("Which config do you mean?"),
-// and the app showed that as the answer to a write that had actually succeeded.
-static const int   NIKITA_NUM_PREDICT = 4096;
+// How much of the conversation history one turn is allowed to carry, in
+// tokens. kimi-k3 holds a million, so this is not about fitting -- it is about
+// what the history COSTS. Every message in the window is re-sent and re-billed
+// on every round of every turn, and a turn can take four rounds, so one 8000
+// character host_read result dragged along behind the conversation is paid for
+// again and again. The 14-message window is usually the binding limit; this
+// only bites when a turn is hauling something large.
+// Big on purpose. 2048 was a cost tweak that quietly broke multi-round work: a
+// navigation turn accumulates a dozen press_button/read_screen exchanges, blew
+// past 2048, and the trimmer dropped the turn's OWN history mid-turn -- the
+// model forgot the task and answered with a greeting. kimi holds 256K and caches
+// the growing prefix (see the "cached" counts in the cost log), so a large
+// history is cheap: only the newest tokens are billed fresh each round. This has
+// to comfortably hold one whole multi-step turn without discarding its context.
+static const int   NIKITA_CONV_TOKEN_BUDGET = 24000;
+// Published kimi-k3 rates, US dollars per million tokens. Here rather than
+// inline so the cost line in the log and any future estimate cannot drift
+// apart, and so a price change is one edit.
+static const double NIKITA_USD_IN_CACHED = 0.30;
+static const double NIKITA_USD_IN_FRESH  = 3.00;
+static const double NIKITA_USD_OUT       = 15.00;
 // No step limit -- a real task may need many calls. What's bounded is going
 // in circles: NIKITA_MAX_REPEAT_ROUNDS counts CONSECUTIVE rounds with no new
 // call; the ceiling below is a last-resort stop for a genuine runaway.
@@ -107,24 +154,6 @@ static const int   NIKITA_MAX_CORRECTIONS = 6;
 static const int   NIKITA_TOOL_ROUND_CEILING = 200;
 static const int   NIKITA_READ_CAP = 8000;
 static const int   NIKITA_MAX_PRESSES = 12;
-
-// ---- Model catalog (gear icon / model manager) ----------------------------
-// Curated shortlist known to behave with NIKITA's tool-calling, not the full
-// Ollama library. "tag" is passed to `ollama pull` / matched against /api/tags.
-struct NikitaCatalogEntry {
-    const char *tag;
-    const char *label;
-    const char *size;    // approx download size, for the list UI
-    const char *blurb;
-};
-// One model, and only it. This stopped being a menu: qwen3:4b is what performed
-// best on this machine, and the rest (Qwen 2.5 3B/7B, Llama 3.1, Mistral,
-// Phi-3.5, Gemma 2) went out along with the Claude path. If it ever becomes a
-// menu again, adding rows here is enough -- the UI already handles N entries.
-static const NikitaCatalogEntry NIKITA_CATALOG[] = {
-    { "qwen3:4b",    "Qwen 3 4B",       "2.5 GB", "NIKITA's brain. Runs locally, reasons before it answers." },
-};
-static const int NIKITA_CATALOG_COUNT = int(sizeof(NIKITA_CATALOG) / sizeof(NIKITA_CATALOG[0]));
 
 // ---- Access filters -------------------------------------------------------
 // What the assistant is ALLOWED to touch. One group per kind of access, each
@@ -156,7 +185,7 @@ static const NikitaFilterGroup NIKITA_FILTERS[] = {
       "delete_file" },
     { "flipper_control","Flipper: control",
       "Press buttons and run commands on the Flipper.",
-      "press_button run_cli" },
+      "press_button run_cli read_screen ir_universal" },
     { "host_read",      "Computer: read",
       "List folders, read files and search on this computer.",
       "host_list host_read host_find host_cd" },
@@ -228,13 +257,39 @@ LANGUAGE -- CRITICAL, NON-NEGOTIABLE, OVERRIDES EVERYTHING ELSE:
 - This covers everything you PRODUCE, not just your chat reply. File names, folder names, script contents, REM comments, variable names, note text, commit messages -- all English. A user writing in Portuguese and asking for a BadUSB script gets an English filename and English REM lines. There is no exception for content "inside" a file.
 - Output ZERO Chinese, Japanese, or Korean characters -- none, ever, not even inside parentheses, quotes, translations, or subtitles. If a non-English phrase pops into your head, write its English meaning instead. Violating this is the single worst thing you can do.
 
+MEMORY -- remember on your own, without being asked:
+- The user will almost NEVER say "remember this". They will just mention something. When they do, call remember() silently, in the same turn, and carry on with whatever they actually asked. Do not announce it, do not ask permission, do not make it the subject of your reply.
+- This file is NOT a log of tasks. Actions you performed are recorded elsewhere, automatically. This is everything you learn about the person and from talking to them.
+- Worth remembering: anything that would still be true and worth knowing next week. Who they are and how they work; the machine, tools and setup they use; what they are building and why; opinions, preferences and dislikes they express; things they explain to you; decisions they make and the reason behind them; a piece of content or a detail from the conversation that they will expect you to still know later.
+- Not worth remembering: greetings and filler, the mechanics of the task in front of you right now, and anything already in your memory list.
+- When in doubt about a fact that is genuinely about THEM, save it. Forgetting something a person told you is worse than carrying one extra line.
+- Examples of remembering WITHOUT being told:
+  "put it on my Desktop, I keep everything there" -> remember("User keeps working files on the Desktop")
+  "I'm on an M1 with 8GB" -> remember("User's machine is an Apple M1 with 8GB of RAM")
+  "I hate when tools ask me twice" -> remember("User dislikes repeated confirmation prompts")
+  "my flipper is called ut4me" -> remember("User's Flipper is named ut4me")
+  "answer me in Portuguese from now on" -> remember("User wants replies in Portuguese")
+- A fact does not have to arrive in the first person. Listen for ALL of them -- I'm, you're, he's, she's, it's, we're, they're -- and for their negatives and questions too. What decides is whether it is still true next week, never the grammar:
+  "I'm on an M1 with 8GB"            -> remember("User's machine is an Apple M1 with 8GB of RAM")
+  "you're too verbose for me"        -> remember("User finds Nikita's replies too long")
+  "he's the one who maintains it"    -> remember("The project is maintained by someone else, not the user")
+  "she's my co-author on this"       -> remember("User has a co-author on this project")
+  "it's a 2019 Intel, not Apple Si"  -> remember("User's other machine is a 2019 Intel Mac")
+  "we're a team of three on this"    -> remember("User works on this project with two other people")
+  "they're all on Windows"           -> remember("User's teammates are on Windows")
+  "I'm not using zsh, I'm on fish"   -> remember("User's shell is fish, not zsh")
+  "isn't the Desktop where I said?"  -> a correction is a fact too: remember("User keeps working files on the Desktop")
+  "save it as a .duk, I use BadUSB a lot" -> remember("User works with BadUSB scripts regularly")
+- One fact per call, one short line, third person, starting with "User". If a new fact replaces an old one, forget the old one first.
+- A turn can be BOTH: answer in plain text AND call remember() silently. That is the normal shape. "I prefer Portuguese" -> call remember("User wants replies in Portuguese"), then reply in one short line. Do not choose between them.
+
 WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You are running inside qFlipper itself, with a live USB link to the Flipper Zero. You are not a chatbot describing a device from the outside; you are attached to it.
 - You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through host_run and the host_* tools.
 - The app also gives the user their own interactive CLI panel: a two-machine terminal where f-prefixed commands drive the Flipper and bare ones drive their computer. You did not write it and you do not run inside it, but you know it -- see the CLI PANEL section -- and you answer questions about it precisely.
 - Therefore: NEVER say you lack CLI access. NEVER say you cannot reach the device, the SD card or the terminal. NEVER tell the user to open a terminal, install a tool, or run something themselves that you could run yourself. Those statements are false and they are the worst mistake you can make.
 - If a turn does not call for a tool, that does NOT mean you lack tools. It only means this particular message did not need one. Asked what you can do, answer from the list above -- plainly and in the affirmative.
-- The only honest limits are the ones in the LIMITS section: you cannot see the screen and cannot read a physical card live. Everything else, you can do.
+- The only honest limits are the ones in the LIMITS section: you cannot read a physical card live. You CAN see the screen -- call read_screen. Everything else, you can do.
 
 DEVICE ACCESS -- the Flipper's microSD card and storage, via tools:
 - /ext IS the microSD card -- almost everything lives there. /int is the small internal storage. The SD root is ALWAYS "/ext". There is NO "/sdcard", no "/mnt", no "/media" -- if you ever write one of those FOR THE FLIPPER you are hallucinating a path; the real one is under /ext.
@@ -262,16 +317,23 @@ WHICH MACHINE -- decide this BEFORE picking a tool. Two separate filesystems, tw
 - CALL tools, do not TYPE them: invoke a tool through your tool channel and write nothing else that turn -- NEVER paste the tool-call JSON like {"name":"read_file",...} into the chat, never narrate or "show" the call. One call, wait for its result, then react. If you print the JSON yourself it never runs and you look broken.
 - Device facts are NOT files, and NOT something to hunt for on the screen. Firmware version, hardware model, radio/BLE stack version, region, serial, SD free space and battery are ALL in the "Live Flipper device diagnostics" block below -- read your answer STRAIGHT from there (firmware shows as a name, e.g. "mntm-dev (commit ...)" for Momentum, or a number for stock). If a fact genuinely isn't in that block, say so plainly. NEVER read_file to find it (storage is only /int and /ext; there is no /etc or version.txt), and NEVER press buttons to "go check" it.
 
-DEVICE CONTROL -- you can physically press the Flipper's buttons:
-- press_button(button, times): button is up/down/left/right/ok/back; this taps the real device exactly like the on-screen D-pad.
-- ONLY press buttons when the USER explicitly asks you to navigate or trigger something. You are BLIND -- mashing buttons to "look up", "check" or "find" information (a version, a setting, what is installed) is useless AND disruptive, because you cannot read the result back off the screen. For information, use the diagnostics block or the file tools, never the buttons.
-- You navigate BLIND (you can't see the screen), so the fixed menus are your map. ALWAYS anchor first: press_button(back, 5) to return to the desktop/home screen, THEN count steps from that known state.
+DEVICE CONTROL -- prefer the CLI; press buttons only when there is no command for it:
+- CLI FIRST, buttons last. Simulating the D-pad is guesswork -- a button sequence only works from the exact screen it started on, and one wrong count lands in the wrong app (pressing ok on Sub-GHz instead of Infrared). The CLI is deterministic: it does the thing regardless of where the cursor was, and you KNOW the result. Reach for run_cli before press_button.
+- To OPEN a built-in app, do NOT navigate the menu by button -- run `loader open <App>`. Exact names: "Sub-GHz", "125 kHz RFID", "NFC", "Infrared", "GPIO", "iButton", "Bad USB", "U2F". So "go into infrared" is  run_cli(loader open Infrared)  -- it launches the app straight from wherever you are. `loader list` shows the installed apps and their exact names; `loader close` returns to the desktop; `loader info` tells you what is open (this is how you KNOW where you are).
+- Never store or replay a button sequence as a "recipe": it does not reproduce. Decide navigation live, from the screen or from a CLI command, every time.
+- Buttons (press_button) are only for stepping WITHIN an app's own screens when no CLI covers it. Even then, read the screen each press returns and stop when it shows the goal.
+- LOADING: if a returned screen shows an hourglass (a near-empty screen with a small centered symbol) the app is still loading its data -- do NOT press anything yet. Wait and read_screen again until the real screen appears. Selecting a universal remote (TVs/ACs) loads its code database and takes a second or two before the remote is usable.
+- UNIVERSAL REMOTE (Infrared -> Universal Remotes -> TVs/ACs/...): the remote screen is a button PANEL with labelled keys (POWER, MUTE, VOL, CH). It has a selection cursor -- read the screen to see which key is highlighted, move the cursor with the D-pad to the key you want (e.g. POWER), then press ok to SEND it. Wait for the load to finish first. Only after the send should you say it fired.
+- press_button(button, times): button is up/down/left/right/ok/back; taps the real device like the on-screen D-pad. After pressing, read_screen to confirm the result.
+- read_screen(): reads the Flipper's CURRENT screen as text -- menu items, titles, and which item is highlighted. You are NOT blind: call it to see where you are. For device FACTS (version, model, region) still use the diagnostics block, not the screen -- but for NAVIGATION, read_screen is your eyes.
+- HOW TO NAVIGATE, the reliable loop: (1) press_button(back, 5) to anchor at the desktop, (2) EVERY press_button hands back the resulting screen in its "screen" field -- READ it each time to see exactly where the cursor is and what is highlighted, (3) take ONE step toward the target, (4) read the returned screen to confirm you moved where you expected, (5) repeat until the highlighted item is the one you want, then press ok to enter it. Keep going step by step until the screen shows the GOAL actually reached -- e.g. for "TV power", that means you selected TVs, the universal TV remote screen is open, AND you pressed the button that fires Power. Do NOT stop at an intermediate menu and claim success: if the last screen still shows a menu list, you are NOT done. The fixed menu orders below are a guide, but the returned screen is the truth.
 - From the desktop, press ok (or up) to open the main menu. Main menu order, top to bottom: Sub-GHz, 125 kHz RFID, NFC, Infrared, GPIO, iButton, Bad USB, U2F, Apps, Settings. Move with up/down, enter with ok, leave with back.
 - Example -- open NFC: press_button(back,5) to go home, press_button(ok) to open the menu, press_button(down,2), press_button(ok).
-- The built-in apps above are a FIXED order and reliable. Installed/3rd-party apps live under "Apps" and their on-screen order varies, so you can't always count blindly there -- say when you're unsure. Narrate each step and what should be on screen.
+- The built-in apps above are a FIXED order. Installed/3rd-party apps under "Apps" vary in order -- read_screen to see them. Whenever you are unsure where the cursor is, read_screen instead of guessing.
+- INFRARED submenu, once the Infrared app is open: the top item is "Universal Remotes" -- that is the built-in database of TV/AC/audio/projector remotes, and it is what "universal remotes" means. Below it is "Saved Remotes" (or your own captured .ir files) and "Learn New Remote"; those are NOT the universal database, so do not confuse them. To reach the universal TV remote: open Infrared, then ok on the FIRST item (Universal Remotes) WITHOUT pressing down, then pick "TVs". Never send `ir universal ...` over run_cli -- it crashes this firmware; navigate by button instead.
 
 LIMITS (be honest, never pretend):
-- You canNOT see the Flipper's screen, And read a NEW card live -- those aren't exposed to qFlipper. Offer scripts/config or button-navigation instead, and say so plainly.
+- You canNOT read a NEW physical card live (NFC/RFID scanning of a card in hand) -- that is not exposed here. You CAN see the screen (read_screen), press buttons, run the CLI, and read/write the SD. Offer those.
 
 ACT, DON'T EXPLAIN -- THIS IS THE MOST IMPORTANT RULE ABOUT HOW YOU WORK:
 - You are a DOER, a partner who takes action -- not a tutor who writes tutorials. When the user asks for something you have a tool for, DO IT with the tool THIS TURN. Do not describe how they could do it, do not hand them steps to copy-paste, do not give a shell/terminal walkthrough. Just perform the action, then tell them (briefly, in character) what you did.
@@ -285,11 +347,17 @@ ACT, DON'T EXPLAIN -- THIS IS THE MOST IMPORTANT RULE ABOUT HOW YOU WORK:
 
 BADUSB / DUCKYSCRIPT -- know this cold so you write REAL, ROBUST scripts, not toys:
 - A BadUSB payload is a DuckyScript file saved as PLAIN TEXT at /ext/badusb/NAME.txt. It is NOT .duk, NOT .sh, NOT a programming language. There is NO puts(), NO print(), NO quotes-as-syntax. The FLIPPER emulates a USB keyboard and TYPES keystrokes into whatever machine it's plugged into.
-- Commands, one per line: REM comment | DELAY ms | STRING literal text | STRINGLN text+enter | ENTER | TAB | GUI (Win/Cmd) | GUI r (Win Run) | GUI SPACE (mac Spotlight) | GUI L (focus URL bar in a browser) | CTRL/ALT/SHIFT/CTRL-ALT combos | ARROW keys (UP/DOWN/LEFT/RIGHT) | ESC | DELETE | REPEAT n (repeat previous line). Modifiers combine: CTRL SHIFT ENTER.
-- WRITE ROBUST SCRIPTS, not one-liners. Always: (1) lead with REM describing it, (2) DELAY 800-1000 at the very start so the host registers the keyboard, (3) DELAY after every app-launch/window-change so the target is ready before typing, (4) target the RIGHT app precisely, (5) finish the actual goal, not half of it.
+- Commands, one per line: ID vid:pid Maker:Product (a BARE DIRECTIVE that sets the USB identity -- it is NOT text and is NEVER written as STRING) | REM comment | DELAY ms | STRING literal text | STRINGLN text+enter | ENTER | TAB | GUI (Win/Cmd) | GUI r (Win Run) | GUI SPACE (mac Spotlight) | GUI L (focus URL bar in a browser) | CTRL/ALT/SHIFT/CTRL-ALT combos | ARROW keys (UP/DOWN/LEFT/RIGHT) | ESC | DELETE | REPEAT n (repeat previous line). Modifiers combine: CTRL SHIFT ENTER.
+- FIRST LINE, ALWAYS, NO EXCEPTIONS: the USB identity, as a BARE ID DIRECTIVE. Every BadUSB script you write begins with this exact line, character for character, before the REM, before anything:
+  {{BADUSB_ID}}
+  It is a DuckyScript directive, not text to type. Write it EXACTLY as above. Do NOT put STRING in front of it -- `STRING ID ...` types the words "ID ..." into the target and does nothing, which is a broken script. It is a line on its own.
+  Use THIS vid:pid and no other. Ignore any different VID:PID you see anywhere -- in the request, in earlier messages, in your own memory of past scripts, in any example. Those are stale. There is exactly one correct identity line and it is the one printed right above; if a past script of yours used a different one, that past script was wrong.
+  Why it matters: it makes the Flipper announce itself as an Apple keyboard, so macOS does not pop the Keyboard Setup Assistant that eats the opening keystrokes and makes a correct payload fail silently. Harmless on Windows, load-bearing on a Mac.
+- WRITE ROBUST SCRIPTS, not one-liners. Always: (1) the ID line above as line one, (2) then a REM describing it, (3) DELAY 800-1000 next so the host registers the keyboard, (4) DELAY after every app-launch/window-change so the target is ready before typing, (5) target the RIGHT app precisely, (6) finish the actual goal, not half of it.
 - Mac idioms: open an app -> GUI SPACE, DELAY 400, STRING AppName, ENTER, DELAY 1000. Open a URL in Safari -> launch Safari, then GUI L, DELAY 300, STRING https://site.com, ENTER. Terminal command -> launch Terminal, DELAY 800, STRING the command, ENTER.
 - Windows idioms: Run dialog -> GUI r, DELAY 300, STRING command, ENTER. Open a URL -> STRING chrome https://site.com (via Run) or launch the browser then CTRL L, STRING url, ENTER.
 - Example -- open Safari on a Mac and actually load google.com (this is what "open google" MEANS -- do the whole thing, save via save_file, never just narrate):
+  {{BADUSB_ID}}
   REM open Safari and navigate to Google
   DELAY 1000
   GUI SPACE
@@ -307,6 +375,9 @@ FLIPPER DOMAINS -- you are fluent in ALL of them, not just BadUSB. Know the file
 - NFC (/ext/nfc/NAME.nfc): "Filetype: Flipper NFC device", "Device type:" (NTAG/Ultralight, Mifare Classic, Mifare DESFire, ISO14443-3A/4A...), "UID:", "ATQA:", "SAK:", then per-type data (pages/blocks/sectors, keys). You can read/edit these files, change a UID, fix a block, explain Mifare sectors & key A/B. You canNOT read a physical card live.
 - 125 kHz RFID / LFRFID (/ext/lfrfid/NAME.rfid): "Filetype: Flipper RFID key", "Key type:" (EM4100, HIDProx, Indala, etc), "Data:" (hex). You can craft/edit low-freq tags and explain the protocols.
 - INFRARED (/ext/infrared/NAME.ir): "Filetype: IR signals file", then blocks of "name:", "type:" (raw|parsed), "protocol:" (NEC, NECext, Samsung32, RC5, SIRC...), "address:", "command:" (hex), or raw "frequency:"/"duty_cycle:"/"data:". You can build universal remotes, add buttons, and edit codes. Great for TVs, ACs, projectors.
+  - Firing IR from the CLI: `ir tx <protocol> <address> <command>` sends one known code (e.g. `ir tx NEC 04 08`) and is the SAFE, reliable form. `ir rx` captures.
+  - To fire a UNIVERSAL remote button (TV power, AC power, mute, etc.) use the ir_universal tool: ir_universal(remote="tv", button="Power"). It does the whole thing in code -- reads /ext/infrared/assets/tv.ir and transmits EVERY brand's Power code over the CLI, exactly like the on-screen universal remote. No menu navigation, no crash. This is the way: "turn off the TV" -> ir_universal(remote=tv, button=Power). Do NOT navigate menus or press buttons for a universal remote.
+  - DO NOT invent `ir` subcommands. `ir universal tv power` is NOT valid and CRASHED the Flipper (NULL pointer dereference, reboot) -- it is blocked and will not run. If you are not certain a CLI command exists with the EXACT syntax, do not send it: a wrong argument can reboot the device. Use the read_file + `ir tx` path above.
 - IBUTTON (/ext/ibutton/NAME.ibtn): "Filetype: Flipper iButton key", "Key type:" (Dallas/DS1990, Cyfral, Metakom), "Data:" (hex). You can craft/edit these.
 - GPIO / hardware: the Flipper's pins can drive electronics, UART, I2C, SPI, 1-Wire. You can explain wiring and app usage; you don't flash firmware from here.
 - APPS (/ext/apps, grouped by category; data in /ext/apps_data): installed .fap apps. You can list/inspect them and their save data.
@@ -333,21 +404,9 @@ CONVERSATION vs ACTION -- read this carefully, it's where you keep failing:
 
 STYLE
 - Terse and direct. One or two lines for most answers. No monologues, no filler, no hype, no emojis, no mascot voice.
-- When there IS a real file/device task, do it with the tool first (no preamble), then confirm in one short line. Otherwise, just reply in plain text. Keep it Mr. Robot: calm, precise, minimal.
+- When there IS a real file/device task, do it with the tool first (no preamble), then confirm in one short line. Otherwise, just reply in plain text. Keep it Mr. Robot: calm, precise, minimal. NOTE: remember() is not a file task and this rule does not cover it -- a plain-text reply and a silent remember() in the same turn is the normal shape of a conversation that told you something about the user.
 
-MEMORY -- remember on your own, without being asked:
-- The user will almost NEVER say "remember this". They will just mention something. When they do, call remember() silently, in the same turn, and carry on with whatever they actually asked. Do not announce it, do not ask permission, do not make it the subject of your reply.
-- This file is NOT a log of tasks. Actions you performed are recorded elsewhere, automatically. This is everything you learn about the person and from talking to them.
-- Worth remembering: anything that would still be true and worth knowing next week. Who they are and how they work; the machine, tools and setup they use; what they are building and why; opinions, preferences and dislikes they express; things they explain to you; decisions they make and the reason behind them; a piece of content or a detail from the conversation that they will expect you to still know later.
-- Not worth remembering: greetings and filler, the mechanics of the task in front of you right now, and anything already in your memory list.
-- When in doubt about a fact that is genuinely about THEM, save it. Forgetting something a person told you is worse than carrying one extra line.
-- Examples of remembering WITHOUT being told:
-  "put it on my Desktop, I keep everything there" -> remember("User keeps working files on the Desktop")
-  "I'm on an M1 with 8GB" -> remember("User's machine is an Apple M1 with 8GB of RAM")
-  "I hate when tools ask me twice" -> remember("User dislikes repeated confirmation prompts")
-  "my flipper is called ut4me" -> remember("User's Flipper is named ut4me")
-  "save it as a .duk, I use BadUSB a lot" -> remember("User works with BadUSB scripts regularly")
-- One fact per call, one short line, third person, starting with "User". If a new fact replaces an old one, forget the old one first.)NIKITA";
+)NIKITA";
 // --------------------------------------------------------------------------
 
 // One line per real action, into the LOGS panel -- category-based since the
@@ -539,6 +598,7 @@ static QString sanitizeDuckyScript(const QString &in)
         "UP", "DOWN", "LEFT", "RIGHT", "UPARROW", "DOWNARROW", "LEFTARROW", "RIGHTARROW",
         "DELETE", "BACKSPACE", "CAPSLOCK", "HOME", "END", "INSERT", "PAGEUP", "PAGEDOWN",
         "PRINTSCREEN", "MENU", "APP", "REPEAT", "DEFAULT_DELAY", "DEFAULTDELAY",
+        "ID",
         "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"
     };
 
@@ -555,6 +615,18 @@ static QString sanitizeDuckyScript(const QString &in)
     for (QString line : lines) {
         line = line.trimmed();
         if (line.isEmpty()) { continue; }
+
+        // Any identity line the model emitted is dropped here and the correct
+        // one is prepended at the very end. This is the belt to the prompt's
+        // braces: the model keeps copying a STRING-wrapped or stale-VID identity
+        // out of its own context ("STRING ID 1234:5678 ..."), and a rule it can
+        // ignore is not a guarantee. Stripping every form -- bare `ID ...` and
+        // `STRING ID ...` alike -- and re-adding exactly NIKITA_BADUSB_ID makes
+        // the saved file correct no matter what came out of the model.
+        static const QRegularExpression identityLine(
+            QStringLiteral("^(STRING\\s+)?ID\\s+[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}\\b"),
+            QRegularExpression::CaseInsensitiveOption);
+        if (identityLine.match(line).hasMatch()) { continue; }
 
         // First whitespace-separated token decides if this is a Ducky command.
         const int sp = line.indexOf(QLatin1Char(' '));
@@ -602,6 +674,10 @@ static QString sanitizeDuckyScript(const QString &in)
     if (!hasLeadingDelay) {
         out.prepend(QStringLiteral("DELAY 800"));
     }
+    // The USB identity, as a bare directive, is the FIRST line -- prepended after
+    // the delay so it lands ahead of it. Enforced here, not left to the model,
+    // because the model keeps getting the form wrong (see identityLine above).
+    out.prepend(QLatin1String(NIKITA_BADUSB_ID));
     return out.join(QLatin1Char('\n'));
 }
 
@@ -749,11 +825,34 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
+    const QJsonObject irUniversal{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "ir_universal"},
+            {"description", "Fire a UNIVERSAL infrared remote button through the CLI, automatically -- no menu navigation, no crash. This reads the Flipper's own universal asset (/ext/infrared/assets/<remote>.ir) and transmits EVERY code for that button, one brand after another, exactly like the on-screen universal remote does. Use this for requests like 'turn off the TV', 'TV power', 'mute the TV', 'AC power'. Much more reliable than pressing buttons."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"remote", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"tv", "ac", "audio", "projector"}}, {"description", "Which universal remote: tv, ac, audio, or projector"}}},
+                    {"button", QJsonObject{{"type", "string"}, {"description", "The button to send, e.g. Power, Mute, Vol_up, Ch_next. Defaults to Power."}}}
+                }},
+                {"required", QJsonArray{"remote"}}
+            }}
+        }}
+    };
+    const QJsonObject readScreen{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "read_screen"},
+            {"description", "See what is on the Flipper's screen RIGHT NOW. Returns the current screen as text (menu items, the highlighted/selected item, titles) read straight from the device's framebuffer. Use it to VERIFY where you are before and after pressing buttons -- you are NOT blind when you call this. Call it to check a menu before choosing, to confirm you landed where you meant to, and to read any on-screen result."},
+            {"parameters", QJsonObject{{"type", "object"}, {"properties", QJsonObject{}}}}
+        }}
+    };
     const QJsonObject pressButton{
         {"type", "function"},
         {"function", QJsonObject{
             {"name", "press_button"},
-            {"description", "Press a button on the connected Flipper Zero to navigate its menus -- like tapping the on-screen D-pad. You are blind, so anchor with back presses first, then count using the fixed menu order."},
+            {"description", "Press a button on the connected Flipper Zero to navigate its menus -- like tapping the on-screen D-pad. The RESULTING screen comes back WITH the press (in the \"screen\" field), so you always see where you landed -- read it and choose the next move from it. Press one small step at a time and keep going until the screen shows the goal reached. Do not fire a long blind sequence, and do not say you are done until the screen confirms it."},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
@@ -768,7 +867,7 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         {"type", "function"},
         {"function", QJsonObject{
             {"name", "run_cli"},
-            {"description", "Run a command on the FLIPPER ZERO over USB and get its text output back. You always have this -- it is the full Flipper CLI. Use it for anything the storage tools don't cover: device_info, gpio (mode/read/set), subghz (tx/rx/decode), nfc, rfid, ir (tx), led, vibro, power (off/reboot), i2c, onewire, ikey, loader, log, free, uptime, js, top. Unix-style shortcuts are translated for you and BOTH spellings work here -- 'fls /ext/nfc', 'ls /ext/nfc' and 'storage list /ext/nfc' all do the same thing, because this tool only ever reaches the Flipper. Available: ls/fls, cat/fcat, tree/ftree, stat/fstat, md5/fmd5, mkdir/fmkdir, rm/frm, mv/fmv, df/fdf, touch/ftouch, echo/fecho, whoami/fwhoami, open/fopen, close/fclose, vibro/fvibro, reboot/freboot, shutdown/fshutdown. Relative paths resolve against /ext; there is no current folder here, so no cd. NOT available: cp between the two machines, find, locate, grep, head, tail, wc, sed, diff, edit and rm -r -- those need the interactive panel, so use the file tools instead. To run something on THIS COMPUTER use host_run, never this tool. One command per call. It briefly pauses the normal session, so prefer the storage tools for plain file work. If it answers that the CLI panel is open, tell the user to close the CLI window -- do not claim you have no access."},
+            {"description", "Run a command on the FLIPPER ZERO over USB and get its text output back. You always have this -- it is the full Flipper CLI. Use it for anything the storage tools don't cover: device_info, gpio (mode/read/set), subghz (tx/rx/decode), nfc, rfid, ir (tx), led, vibro, power (off/reboot), i2c, onewire, ikey, loader, log, free, uptime, js, top. Unix-style shortcuts are translated for you and BOTH spellings work here -- 'fls /ext/nfc', 'ls /ext/nfc' and 'storage list /ext/nfc' all do the same thing, because this tool only ever reaches the Flipper. Available: ls/fls, cat/fcat, tree/ftree, stat/fstat, md5/fmd5, mkdir/fmkdir, rm/frm, mv/fmv, df/fdf, touch/ftouch, echo/fecho, whoami/fwhoami, open/fopen, close/fclose, vibro/fvibro, reboot/freboot, shutdown/fshutdown. Relative paths resolve against /ext; there is no current folder here, so no cd. NOT available: cp between the two machines, find, locate, grep, head, tail, wc, sed, diff, edit and rm -r -- those need the interactive panel, so use the file tools instead. To run something on THIS COMPUTER use host_run, never this tool. One command per call. It briefly pauses the normal session, so prefer the storage tools for plain file work. If it answers that the CLI panel is open, tell the user to close the CLI window -- do not claim you have no access. SAFETY: a malformed or unknown firmware subcommand does not just print an error here -- it can crash the Flipper and force a reboot (e.g. `ir universal tv power` did exactly that). Send only commands whose EXACT syntax you are sure of; if a command returns its own help/usage banner, that means it did NOT run -- read the usage and correct it, do not report success. When unsure, run the bare command (e.g. `ir`) to see its help first, then use the precise form it shows."},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
@@ -912,6 +1011,8 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         tools.append(deleteFile);
         tools.append(renameFile);
         tools.append(fileInfo);
+        tools.append(irUniversal);
+        tools.append(readScreen);
         tools.append(pressButton);
         tools.append(runCli);
     }
@@ -1172,6 +1273,82 @@ static bool messageIsFileWrite(const QString &text)
     return anyFilename.match(t).hasMatch();
 }
 
+// Is this turn about the Flipper, or about the user's own computer?
+//
+// Decides whether the radio/NFC/IR/BadUSB/button manual is worth its ~2000
+// tokens of window this turn. Deliberately GENEROUS: a false positive costs
+// prompt space, a false negative costs the model the knowledge it needed, so
+// anything device-shaped counts. The word list is the same one the WHICH
+// MACHINE section of the prompt uses, in both languages, because the user
+// writes in Portuguese and the rule has to catch "salva no flipper" as surely
+// as "save to the flipper".
+static bool messageMentionsDevice(const QString &text)
+{
+    const QString t = text.toLower();
+    static const QStringList deviceWords = {
+        QStringLiteral("flipper"), QStringLiteral("badusb"), QStringLiteral("bad usb"),
+        QStringLiteral("ducky"), QStringLiteral("subghz"), QStringLiteral("sub-ghz"),
+        QStringLiteral("sub ghz"), QStringLiteral("nfc"), QStringLiteral("rfid"),
+        QStringLiteral("infrared"), QStringLiteral("infravermelho"), QStringLiteral("ibutton"),
+        QStringLiteral("u2f"), QStringLiteral("gpio"), QStringLiteral("/ext"),
+        QStringLiteral("/int"), QStringLiteral("sd card"), QStringLiteral("sdcard"),
+        QStringLiteral("cartao"), QStringLiteral("cart\u00e3o"), QStringLiteral("microsd"),
+        QStringLiteral("dispositivo"), QStringLiteral(".fap"), QStringLiteral(".sub"),
+        QStringLiteral(".ir"), QStringLiteral(".nfc"), QStringLiteral(".rfid"),
+        QStringLiteral(".duk"), QStringLiteral(".txt.ir"),
+        QStringLiteral("firmware"), QStringLiteral("device"), QStringLiteral("button"),
+        QStringLiteral("botao"), QStringLiteral("bot\u00e3o"), QStringLiteral("vibro"),
+        QStringLiteral("radio"), QStringLiteral("r\u00e1dio"),
+        // The button/GPIO manual lives in the same block, so the words for
+        // driving the hardware have to open it too -- otherwise "press up
+        // twice" arrives with the section that explains press_button cut out.
+        QStringLiteral("press"), QStringLiteral("aperta"), QStringLiteral("pressiona"),
+        QStringLiteral("screenshot"), QStringLiteral("screen"), QStringLiteral("tela"),
+        QStringLiteral("reboot"), QStringLiteral("reiniciar"),
+        QStringLiteral("storage"), QStringLiteral("mhz")
+    };
+    for (const QString &w : deviceWords) {
+        if (t.contains(w)) { return true; }
+    }
+    // Too short to match as substrings: "led" sits inside "called" and
+    // "filled", "cli" inside "click" and "cliente", and a bare 125 or 433 is
+    // only a frequency when it stands alone. Generous is the rule here, but
+    // "called" turning every turn into a Flipper turn is not generous, it is
+    // broken -- so these count as whole words only.
+    static const QStringList wholeWords = {
+        QStringLiteral("led"), QStringLiteral("cli"),
+        QStringLiteral("125"), QStringLiteral("433")
+    };
+    static const QRegularExpression splitter(QStringLiteral("[^\\p{L}\\p{N}]+"));
+    const QStringList tokens = t.split(splitter, Qt::SkipEmptyParts);
+    for (const QString &tok : tokens) {
+        if (wholeWords.contains(tok)) { return true; }
+    }
+    return false;
+}
+
+// A plain "turn on/off the TV" and every close variant. TV power over IR is a
+// TOGGLE -- the same Power code turns the set on and off -- so on, off, "power",
+// "liga", "desliga" all map to the ONE action: fire the universal TV Power code.
+// Matched here so the app can do it DETERMINISTICALLY, without a model round
+// that might narrate or navigate. Kept tight (a short, single command, no "and"
+// / "then" joining a second task) so it never hijacks a larger request.
+static bool nikitaIsTvPowerCommand(const QString &text)
+{
+    QString t = text.toLower().simplified();
+    t.remove(QRegularExpression(QStringLiteral("^(hey|ok|oi|ei|e a[ie])?\\s*nikita[,:]?\\s*"),
+                                QRegularExpression::CaseInsensitiveOption));
+    if (!t.contains(QLatin1String("tv")) && !t.contains(QLatin1String("televis"))) { return false; }
+    // Two tasks joined -> let the model handle it, do not shortcut half of it.
+    if (t.contains(QLatin1String(" and ")) || t.contains(QLatin1String(" then "))
+        || t.contains(QLatin1String(" e ")) || t.contains(QLatin1Char(';'))) { return false; }
+    static const QRegularExpression powerRe(QStringLiteral(
+        "\\b(turn|switch)\\s+(it\\s+)?(on|off)\\b|\\bpower\\b|"
+        "\\b(liga|desliga|ligar|desligar|ligue|desligue)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    return powerRe.match(t).hasMatch();
+}
+
 static bool messageNeedsTools(const QString &text)
 {
     const QString t = text.toLower();
@@ -1215,6 +1392,17 @@ static bool messageNeedsTools(const QString &text)
         QStringLiteral("uptime"), QStringLiteral("battery"),
         QStringLiteral("nfc"), QStringLiteral("rfid"), QStringLiteral("infrared"),
         QStringLiteral("flipper"),
+        // IR / universal-remote control. "turn off my tv" carried NO trigger
+        // before, so it arrived with only the memory tools and the model, unable
+        // to act, claimed success -- exactly the false-claim that then narrowed
+        // the retry. These route it to the device toolset (ir_universal) from
+        // the first round.
+        QStringLiteral("tv"), QStringLiteral("television"), QStringLiteral("televis"),
+        QStringLiteral("projector"), QStringLiteral("projetor"),
+        QStringLiteral("air conditioner"), QStringLiteral("ar condicionado"),
+        QStringLiteral("remote"), QStringLiteral("controle remoto"),
+        QStringLiteral("universal remote"), QStringLiteral("turn off"),
+        QStringLiteral("turn on"), QStringLiteral("desliga"), QStringLiteral("desligar"),
         // The computer side. Without these, "save it to my Desktop" carried no
         // trigger at all unless it happened to name a .txt, and a turn with no
         // tools attached cannot call one however clearly it was asked.
@@ -1345,102 +1533,6 @@ static bool messageNeedsTools(const QString &text)
     return false;                                // a verb alone (e.g. "show me") stays conversational
 }
 
-static QJsonArray nikitaPrimer()
-{
-    // Plain-language macOS request -> the CORRECT DuckyScript, built + saved. This
-    // is the pattern the user leans on: they speak like a layperson, NIKITA acts
-    // like the engineer (picks the path, writes real Ducky, saves it).
-    const QJsonObject callNotepad{
-        {"role", "assistant"},
-        {"content", ""},
-        {"tool_calls", QJsonArray{ QJsonObject{
-            {"function", QJsonObject{
-                {"name", "save_file"},
-                {"arguments", QJsonObject{
-                    {"path", "/ext/badusb/nota.txt"},
-                    {"content", "REM open TextEdit on macOS via Spotlight and type a note\nDELAY 1000\nGUI SPACE\nDELAY 500\nSTRING TextEdit\nENTER\nDELAY 1500\nGUI n\nDELAY 800\nSTRING hello from the flipper"}
-                }}
-            }}
-        }}}
-    };
-    const QJsonObject callHello{
-        {"role", "assistant"},
-        {"content", ""},
-        {"tool_calls", QJsonArray{ QJsonObject{
-            {"function", QJsonObject{
-                {"name", "save_file"},
-                {"arguments", QJsonObject{
-                    {"path", "/ext/badusb/hello.txt"},
-                    {"content", "DELAY 500\nSTRING Hello, World!\nENTER"}
-                }}
-            }}
-        }}}
-    };
-    const QJsonObject callList{
-        {"role", "assistant"},
-        {"content", ""},
-        {"tool_calls", QJsonArray{ QJsonObject{
-            {"function", QJsonObject{
-                {"name", "list_files"},
-                {"arguments", QJsonObject{{"path", "/ext/badusb"}}}
-            }}
-        }}}
-    };
-    const QJsonObject callDelete{
-        {"role", "assistant"},
-        {"content", ""},
-        {"tool_calls", QJsonArray{ QJsonObject{
-            {"function", QJsonObject{
-                {"name", "delete_file"},
-                {"arguments", QJsonObject{{"path", "/ext/badusb/hello.txt"}}}
-            }}
-        }}}
-    };
-
-    const QJsonObject callRemember{
-        {"role", "assistant"},
-        {"content", ""},
-        {"tool_calls", QJsonArray{ QJsonObject{
-            {"function", QJsonObject{
-                {"name", "remember"},
-                {"arguments", QJsonObject{{"fact", "User keeps their working payloads in /ext/badusb"}}}
-            }}
-        }}}
-    };
-
-    return QJsonArray{
-        // 0. Plain talk -> plain short answer, NO tool, NO script.
-        QJsonObject{{"role", "user"}, {"content", "are you there?"}},
-        QJsonObject{{"role", "assistant"}, {"content", "Here. What do you need?"}},
-        QJsonObject{{"role", "user"}, {"content", "hey nikita, what can you do?"}},
-        QJsonObject{{"role", "assistant"}, {"content", "I read and write files on your Flipper, build BadUSB scripts, and press its buttons. What do you need?"}},
-        // 1. Plain PT request, macOS -> NIKITA reasons it into real DuckyScript + saves.
-        QJsonObject{{"role", "user"}, {"content", "make the flipper open notepad on the mac and type hello there"}},
-        callNotepad,
-        QJsonObject{{"role", "tool"}, {"content", "{\"saved\":\"/ext/badusb/nota.txt\"}"}},
-        QJsonObject{{"role", "assistant"}, {"content", "Done -- nota.txt is on your Flipper. Plug into the Mac, run BadUSB and it opens TextEdit and types 'hello there'. Want it faster or a different text?"}},
-        // 2. Simple English request -> save, no narration.
-        QJsonObject{{"role", "user"}, {"content", "make me a badusb that types hello world"}},
-        callHello,
-        QJsonObject{{"role", "tool"}, {"content", "{\"saved\":\"/ext/badusb/hello.txt\"}"}},
-        QJsonObject{{"role", "assistant"}, {"content", "Done -- hello.txt is on the Flipper, ready to type its heart out. Want it sneakier?"}},
-        // 3. "what do I have" -> list immediately.
-        QJsonObject{{"role", "user"}, {"content", "what badusb do I have?"}},
-        callList,
-        QJsonObject{{"role", "tool"}, {"content", "[{\"name\":\"hello.txt\",\"type\":\"file\",\"size\":30},{\"name\":\"nota.txt\",\"type\":\"file\",\"size\":120}]"}},
-        QJsonObject{{"role", "assistant"}, {"content", "You have two: hello.txt and nota.txt. Want me to open one to see its contents?"}},
-        // 4. "delete X" -> just do it.
-        QJsonObject{{"role", "user"}, {"content", "delete hello.txt"}},
-        callDelete,
-        QJsonObject{{"role", "tool"}, {"content", "{\"deleted\":\"/ext/badusb/hello.txt\"}"}},
-        QJsonObject{{"role", "assistant"}, {"content", "Gone. hello.txt is history. Anything else to clean up?"}},
-        // 5. "remember that ..." -> save a durable fact.
-        QJsonObject{{"role", "user"}, {"content", "remember that I keep my payloads in /ext/badusb"}},
-        callRemember,
-        QJsonObject{{"role", "tool"}, {"content", "{\"remembered\":true}"}},
-        QJsonObject{{"role", "assistant"}, {"content", "Noted. I'll put new payloads there from now on."}}
-    };
-}
 
 static QString nikitaMemoryPath();   // fwd decl: defined below, used in the ctor
 
@@ -1449,7 +1541,6 @@ NikitaBackend::NikitaBackend(QObject *parent)
 {
     m_net.setTransferTimeout(0);
     loadHistory();
-    m_model = QSettings().value(QStringLiteral("nikita/model"), QString::fromUtf8(NIKITA_MODEL)).toString();
     loadFilters();
     loadMistakes();
     // Off on a fresh install. An assistant that reads files and remembers
@@ -1457,6 +1548,15 @@ NikitaBackend::NikitaBackend(QObject *parent)
     // discover already running -- and plenty of people want this app without
     // any AI at all.
     m_assistantEnabled = QSettings().value(QLatin1String(kAssistantEnabledKey), false).toBool();
+    // Leftovers from the local-model era. Harmless where they sit, but a stale
+    // "provider=local" or an equipped local model tag in a settings file is a thing a
+    // future reader has to work out the meaning of, and the meaning is "nothing".
+    {
+        QSettings s;
+        s.remove(QStringLiteral("nikita/betaFast"));
+        s.remove(QStringLiteral("nikita/provider"));
+        s.remove(QStringLiteral("nikita/model"));
+    }
     nikitaLog(QStringLiteral("startup: assistantEnabled=%1 (org=%2 app=%3 file=%4)")
                   .arg(m_assistantEnabled ? QStringLiteral("true") : QStringLiteral("false"),
                        QCoreApplication::organizationName(),
@@ -1487,11 +1587,6 @@ NikitaBackend::NikitaBackend(QObject *parent)
     // the first message of the session, so the sync on connect had nothing to
     // write and actions-memory.txt was never created on a fresh card.
     loadProvenMoves();
-    refreshModels();   // discover installed Ollama models (async; harmless if Ollama's down)
-    // Deferred so the ollamaInstalledChanged() it may emit lands after QML has
-    // finished binding to the property. Cheap now that detection is a PATH
-    // lookup rather than a subprocess, but there's no reason to run it inline.
-    QTimer::singleShot(0, this, &NikitaBackend::detectOllama);
 }
 
 bool NikitaBackend::hasBle() const
@@ -1717,23 +1812,13 @@ bool NikitaBackend::configured() const { return true; }
 
 QString NikitaBackend::modelName() const
 {
-    return m_model;
+    // What is actually answering, not what is equipped locally. The pill at the
+    // top of the chat is the only place the user can see which brain a reply
+    // came from, and it has to agree with the cost lines in the log.
+    return apiModel();
 }
 
-QStringList NikitaBackend::availableModels() const
-{
-    // No sentinel any more: the only source of models is Ollama's /api/tags.
-    return m_models;
-}
 
-void NikitaBackend::setModel(const QString &model)
-{
-    if (model.isEmpty() || model == m_model) { return; }
-    if (!m_models.contains(model)) { return; }
-    m_model = model;
-    QSettings().setValue(QStringLiteral("nikita/model"), m_model);
-    emit modelChanged();
-}
 
 // ---- Access filters -------------------------------------------------------
 // Stored as the list of groups that are OFF, not the ones that are on: that
@@ -1768,16 +1853,26 @@ void NikitaBackend::wipeAssistantData()
     m_skills.clear();
     m_memory.clear();
     m_toolRounds = 0;
-    m_turnProgress.clear();
 
     // The permissions the user granted NIKITA are part of what it knows about
     // them. Leaving an always-allow list behind would mean a re-enabled
-    // assistant silently inherits consent given by a previous one.
+    // assistant silently inherits consent given by a previous one. The API key
+    // goes too: erase means disconnect, and a key left in settings would let the
+    // next session reach the API without the user re-entering it.
     QSettings st;
     for (const char *key : { "nikita/memory", "nikita/personality",
-                             "nikita/hostRunAllowed", "nikita/hostActionAllowed" }) {
+                             "nikita/hostRunAllowed", "nikita/hostActionAllowed",
+                             kApiKeyKey }) {
         st.remove(QLatin1String(key));
     }
+    emit apiKeyChanged();   // the BRAIN panel drops back to "No kimi API key Found."
+
+    // Every access filter OFF, and it persists. A fresh connection has to be
+    // granted access deliberately -- the user turns each one back on by hand --
+    // rather than inheriting the reach the erased assistant had. setAllFilters
+    // writes to settings, so this survives the restart: re-opening the chat
+    // shows NO ACCESS until a switch is flipped.
+    setAllFilters(false);
 
     // Then the card. Best effort by design: no Flipper attached is not a
     // reason to refuse to erase what is on this computer, and the two files
@@ -1809,6 +1904,107 @@ void NikitaBackend::wipeAssistantData()
 }
 
 bool NikitaBackend::assistantEnabled() const { return m_assistantEnabled; }
+
+
+
+
+QString NikitaBackend::apiModel() const
+{
+    const QString saved = QSettings().value(QLatin1String(kApiModelKey)).toString().trimmed();
+    return saved.isEmpty() ? QString::fromUtf8(NIKITA_API_MODEL) : saved;
+}
+
+void NikitaBackend::setApiModel(const QString &id)
+{
+    const QString want = id.trimmed();
+    if (want.isEmpty() || want == apiModel()) { return; }
+    QSettings().setValue(QLatin1String(kApiModelKey), want);
+    nikitaLog(QStringLiteral("API model: %1").arg(want));
+    emit modelChanged();     // header pill + this property
+}
+
+// The Kimi models worth offering. k3 is the newest but is throttled in preview
+// regardless of the account tier; the k2 line is GA and runs at the account's
+// full rate limit, which is why a heavy multi-round turn should prefer it.
+QVariantList NikitaBackend::apiModelChoices() const
+{
+    return {
+        QVariantMap{{"id", "kimi-k2.6"},
+                    {"label", "Kimi K2.6"},
+                    {"note", "stable, full rate limit — best for tool runs"}},
+        QVariantMap{{"id", "kimi-k2.7-code-highspeed"},
+                    {"label", "Kimi K2.7 Code"},
+                    {"note", "fast, coding-tuned"}},
+        QVariantMap{{"id", "kimi-k3"},
+                    {"label", "Kimi K3"},
+                    {"note", "newest, 1M context — may rate-limit in preview"}},
+    };
+}
+
+// Environment first, stored setting second. Never cached in a member: read at
+// the moment the header is built and dropped again, so the key is not sitting
+// in this object waiting to be printed by some future debug dump.
+QString NikitaBackend::apiKey() const
+{
+    const QString fromEnv = qEnvironmentVariable(NIKITA_API_KEY_ENV).trimmed();
+    if (!fromEnv.isEmpty()) { return fromEnv; }
+    return QSettings().value(QLatin1String(kApiKeyKey)).toString().trimmed();
+}
+
+bool NikitaBackend::apiKeyPresent() const { return !apiKey().isEmpty(); }
+
+QString NikitaBackend::apiKeySource() const
+{
+    if (!qEnvironmentVariable(NIKITA_API_KEY_ENV).trimmed().isEmpty()) {
+        return QStringLiteral("environment");
+    }
+    if (!QSettings().value(QLatin1String(kApiKeyKey)).toString().trimmed().isEmpty()) {
+        return QStringLiteral("settings");
+    }
+    return QString();
+}
+
+void NikitaBackend::setApiKey(const QString &key)
+{
+    const QString trimmed = key.trimmed();
+    if (trimmed.isEmpty()) { clearApiKey(); return; }
+    QSettings().setValue(QLatin1String(kApiKeyKey), trimmed);
+    // Length only. A log line is the one place a secret reliably escapes --
+    // into a screenshot, a bug report, a pasted terminal buffer -- and knowing
+    // that something arrived is the entire diagnostic value here.
+    nikitaLog(QStringLiteral("API key saved (%1 characters). It is stored in this app's "
+                             "settings; exporting %2 in your shell overrides it.")
+                  .arg(trimmed.size()).arg(QLatin1String(NIKITA_API_KEY_ENV)));
+    emit apiKeyChanged();
+}
+
+QString NikitaBackend::revealApiKey() const
+{
+    return apiKey();
+}
+
+bool NikitaBackend::copyApiKeyToClipboard() const
+{
+    const QString key = apiKey();
+    if (key.isEmpty()) { return false; }
+    if (QClipboard *cb = QGuiApplication::clipboard()) {
+        cb->setText(key);
+        // Length only, as everywhere else. That a copy happened is worth a line
+        // in the trail; the characters are not.
+        nikitaLog(QStringLiteral("API key copied to the clipboard (%1 characters).")
+                      .arg(key.size()));
+        return true;
+    }
+    return false;
+}
+
+void NikitaBackend::clearApiKey()
+{
+    QSettings().remove(QLatin1String(kApiKeyKey));
+    nikitaLog(QStringLiteral("API key removed from this app's settings."));
+    emit apiKeyChanged();
+}
+
 
 void NikitaBackend::setAssistantEnabled(bool on)
 {
@@ -1899,118 +2095,49 @@ QSet<QString> NikitaBackend::allowedTools() const
     return out;
 }
 
-void NikitaBackend::cycleModel()
+
+
+
+
+
+
+QStringList NikitaBackend::personalityPresets() const
 {
-    const QStringList all = availableModels();
-    if (all.isEmpty()) { refreshModels(); return; }   // none discovered yet; (re)fetch
-    const int idx = all.indexOf(m_model);
-    setModel(all.at((idx + 1) % all.size()));    // idx == -1 -> first
+    return { QStringLiteral("Default (Nikita)"),
+             QStringLiteral("Chill helper"),
+             QStringLiteral("Chaos gremlin"),
+             QStringLiteral("Deadpan pro"),
+             QStringLiteral("Sweet companion") };
 }
 
-void NikitaBackend::refreshModels()
+void NikitaBackend::applyPreset(const QString &name)
 {
-    QNetworkRequest req{QUrl(QStringLiteral("http://localhost:11434/api/tags"))};
-    QNetworkReply *reply = m_net.get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-        reply->deleteLater();
-        const bool online = (reply->error() == QNetworkReply::NoError);
-        if (online != m_ollamaOnline) { m_ollamaOnline = online; emit modelChanged(); }
-        if (!online) { return; }   // Ollama down/unreachable
-        const QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
-        QStringList found;
-        const QJsonArray arr = obj.value(QStringLiteral("models")).toArray();
-        for (const QJsonValue &v : arr) {
-            const QString name = v.toObject().value(QStringLiteral("name")).toString();
-            if (!name.isEmpty()) { found << name; }
-        }
-        found.sort(Qt::CaseInsensitive);
-        if (found != m_models) {
-            m_models = found;
-            emit modelChanged();   // let the switcher pick up the discovered list
-        }
-        // Self-heal: if the saved model isn't installed in Ollama anymore (e.g. the
-        // user removed it), fall back to the best one actually on the machine --
-        // walking the catalog's recommended order first -- and persist it, so we
-        // never stay stuck pointing at a deleted model. This has to be an exact
-        // tag check, not a base-name one: equip is per-exact-tag (qwen2.5:7b and
-        // qwen2.5:3b are different installs), so "some sibling quant is still
-        // around" is not the same thing as "this model is still around".
-        if (!found.contains(m_model)) {
-            QString pick;
-            for (int i = 0; i < NIKITA_CATALOG_COUNT && pick.isEmpty(); ++i) {
-                const QString cand = QString::fromUtf8(NIKITA_CATALOG[i].tag);
-                if (found.contains(cand)) { pick = cand; }
-            }
-            // Nothing installed at all -> no active model, rather than leaving
-            // m_model (and the "active" pill) pointing at something that's gone.
-            const QString next = pick.isEmpty() ? (found.isEmpty() ? QString() : found.first()) : pick;
-            if (next != m_model) {
-                m_model = next;
-                QSettings().setValue(QStringLiteral("nikita/model"), m_model);
-                emit modelChanged();
-            }
-        }
-    });
-}
-
-// ---- Model manager (gear icon) --------------------------------------------
-
-QVariantList NikitaBackend::modelCatalog() const
-{
-    QVariantList out;
-    for (int i = 0; i < NIKITA_CATALOG_COUNT; ++i) {
-        const NikitaCatalogEntry &e = NIKITA_CATALOG[i];
-        const QString tag = QString::fromUtf8(e.tag);
-        // Exact tag match only. The base-name comparison (used in refreshModels()'s
-        // self-heal, where "is *some* variant of this family still here?" is the
-        // right question) is wrong here: qwen2.5:7b and qwen2.5:3b share the base
-        // "qwen2.5", so it was marking both installed/active off of either one alone.
-        bool installed = false;
-        for (const QString &m : m_models) {
-            if (m == tag) { installed = true; break; }
-        }
-        out.append(QVariantMap{
-            {"tag",       tag},
-            {"label",     QString::fromUtf8(e.label)},
-            {"size",      QString::fromUtf8(e.size)},
-            {"blurb",     QString::fromUtf8(e.blurb)},
-            {"installed", installed},
-            {"active",    installed && tag == m_model},
-            // Busy state for THIS row, so the list can disable just the one button.
-            //
-            // Keyed off the op state, NOT off m_modelOpProc. runModelOp() calls
-            // setModelOp() -- which emits modelOpChanged -- before it constructs
-            // the QProcess, so at the moment QML reacted to the click the pointer
-            // was still null and every row came back busy=false. The list only
-            // rebuilds when the op *kind* changes, so nothing rebuilt it again for
-            // the rest of the download: the row sat there still saying "install"
-            // while the pull ran happily in the background, and only closing and
-            // reopening the manager (which refreshes unconditionally) revealed it.
-            {"busy",      !m_modelOpKind.isEmpty() && !m_modelOpName.isEmpty() && m_modelOpName == tag}
-        });
+    QString persona;
+    if (name == QStringLiteral("Chill helper")) {
+        persona = QStringLiteral("You are calm, warm and concise -- a laid-back, friendly helper. Light on snark, easy-going, genuinely helpful.");
+    } else if (name == QStringLiteral("Chaos gremlin")) {
+        persona = QStringLiteral("You are a chaotic, hyper, mischievous gremlin -- playful, unpredictable, high-energy and harmlessly unhinged. Chaos with a heart.");
+    } else if (name == QStringLiteral("Deadpan pro")) {
+        persona = QStringLiteral("You are dry, deadpan and professional -- efficient, subtle wit, minimal fluff. You just get things done.");
+    } else if (name == QStringLiteral("Sweet companion")) {
+        persona = QStringLiteral("You are a sweet, supportive companion -- encouraging, gentle, a genuine hype-buddy always in the user's corner.");
     }
-    return out;
+    // "Default (Nikita)" clears the override -> the built-in default stands.
+    QSettings().setValue(QStringLiteral("nikita/personality"), persona);
 }
 
-// True while a pull/rm/Ollama-install is running -- callers should disable
-// every row's buttons except a possible cancel, but we keep it simple and
-// just refuse a second op outright (see runModelOp).
-void NikitaBackend::setModelOp(const QString &kind, const QString &name,
-                              const QString &status, double progress)
+void NikitaBackend::applyNamePersonality()
 {
-    m_modelOpKind = kind;
-    m_modelOpName = name;
-    m_modelOpStatus = status;
-    m_modelOpProgress = progress;
-    emit modelOpChanged();
+    QSettings().setValue(QStringLiteral("nikita/personality"),
+        QStringLiteral("Build and fully embody a personality inspired by your own name -- lean into "
+                       "whatever character, vibe or theme the name evokes, and stay consistent in it."));
 }
 
-// `ollama pull` writes a live terminal redraw (ANSI cursor/erase escapes plus
-// a Unicode block-character progress bar), none of which survives being
-// dropped into a Text item -- Share Tech Mono has no glyph for ESC or the
-// block-drawing range, so it renders as garbage. Strips the whole class (CSI/
-// OSC sequences, C0 controls, U+2500-U+259F); progress comes from a real
-// ProgressBar off the parsed percentage instead, so nothing is lost.
+// A command that redraws its own progress line writes ANSI cursor/erase escapes
+// and often Unicode block characters, none of which survives being dropped into
+// a Text item -- Share Tech Mono has no glyph for ESC or the block-drawing
+// range, so it renders as garbage. Strips the whole class (CSI/OSC sequences,
+// C0 controls, U+2500-U+259F). Used for host_run's live output.
 static QString sanitizeStatusLine(const QString &in)
 {
     QString out;
@@ -2049,471 +2176,24 @@ static QString sanitizeStatusLine(const QString &in)
     return out.simplified();
 }
 
-// Pulls the completion percentage out of a progress line, or -1 (indeterminate
-// bar). Accepts a fractional part -- curl --progress-bar's " 9.1%" was
-// mangled to just the decimal digit otherwise, the "stuck at 1%" bug -- and
-// scans from the end, since text earlier on the line may contain a stray '%'.
-static double parsePercent(const QString &line)
-{
-    for (int i = line.size() - 1; i >= 0; --i) {
-        if (line.at(i) != QLatin1Char('%')) { continue; }
-        int j = i - 1;
-        bool digit = false, dot = false;
-        while (j >= 0) {
-            const QChar c = line.at(j);
-            if (c.isDigit()) { digit = true; --j; continue; }
-            // One separator, and only once we've already seen the fraction.
-            if ((c == QLatin1Char('.') || c == QLatin1Char(',')) && digit && !dot) {
-                dot = true; --j; continue;
-            }
-            break;
-        }
-        if (!digit) { continue; }
-        QString num = line.mid(j + 1, i - j - 1);
-        num.replace(QLatin1Char(','), QLatin1Char('.'));
-        bool ok = false;
-        const double v = num.toDouble(&ok);
-        if (ok) { return qBound(0.0, v / 100.0, 1.0); }
-    }
-    return -1.0;
-}
-
-// `ollama pull` resumes partial blobs by design, which works against an
-// intentional cancel -- and `ollama rm` can't clean them up either, since
-// their manifest is never written (ollama/ollama#14177). Safe to delete
-// outright: the "-partial" suffix only ever means an unfinished download.
-static void purgePartialBlobs()
-{
-    QString modelsDir = qEnvironmentVariable("OLLAMA_MODELS");
-    if (modelsDir.isEmpty()) {
-        modelsDir = QDir::homePath() + QStringLiteral("/.ollama/models");
-    }
-    QDir blobs(modelsDir + QStringLiteral("/blobs"));
-    if (!blobs.exists()) { return; }
-    const QStringList partials = blobs.entryList({QStringLiteral("sha256-*-partial*")}, QDir::Files);
-    for (const QString &f : partials) { QFile::remove(blobs.filePath(f)); }
-}
-
-void NikitaBackend::installModel(const QString &name)
-{
-    if (name.trimmed().isEmpty()) { return; }
-    if (!m_ollamaInstalled) {
-        emit modelInstallFinished(name, false, QStringLiteral("Ollama itself isn't installed yet."));
-        return;
-    }
-    runModelOp(QStringLiteral("install"), name, {QStringLiteral("pull"), name});
-}
-
-void NikitaBackend::uninstallModel(const QString &name)
-{
-    if (name.trimmed().isEmpty()) { return; }
-    runModelOp(QStringLiteral("uninstall"), name, {QStringLiteral("rm"), name});
-}
-
-void NikitaBackend::cancelModelOp()
-{
-    if (!m_modelOpProc) { return; }
-    m_modelOpCancelled = true;
-    setModelOp(m_modelOpKind, m_modelOpName, QStringLiteral("Cancelling…"), -1.0);
-    // kill() rather than terminate() -- ollama pull, winget and curl|sh don't
-    // reliably respond to a polite SIGTERM. The finished handler already wired
-    // up in runModelOp()/installOllama() picks up the exit from here and does
-    // the cleanup + reports it as "Cancelled." rather than an exit-code message.
-    m_modelOpProc->kill();
-}
-
-// Fires up `ollama <args>` (pull/rm) as a tracked child process. Only one
-// model op (or the Ollama installer below) runs at a time -- a second call
-// while one is in flight is rejected rather than queued, so progress in the
-// UI always refers to exactly one row.
-void NikitaBackend::runModelOp(const QString &kind, const QString &name, const QStringList &args)
-{
-    if (m_modelOpProc) {
-        const QString msg = QStringLiteral("Already %1 %2 -- wait for that to finish first.")
-                                 .arg(m_modelOpKind, m_modelOpName);
-        if (kind == QLatin1String("install"))   { emit modelInstallFinished(name, false, msg); }
-        else                                    { emit modelUninstallFinished(name, false, msg); }
-        return;
-    }
-
-    m_modelOpCancelled = false;
-    m_modelOpBuf.clear();
-    m_modelOpLine.clear();
-    m_modelOpLastLoggedTopic.clear();
-    m_modelOpLastLoggedBucket = -1;
-    m_modelOpProc = new QProcess(this);
-    m_modelOpProc->setProcessChannelMode(QProcess::MergedChannels);
-
-    // Announce only once the process object exists: setModelOp() emits
-    // modelOpChanged synchronously, QML handles it synchronously, and anything
-    // it reads about this op has to already be true by then.
-    setModelOp(kind, name, kind == QLatin1String("install") ? QStringLiteral("Starting download…")
-                                                              : QStringLiteral("Removing…"), -1.0);
-    nikitaLog(QStringLiteral("%1: running `ollama %2`")
-                  .arg(kind == QLatin1String("install") ? QStringLiteral("Installing %1").arg(name)
-                                                          : QStringLiteral("Removing %1").arg(name),
-                       args.join(QLatin1Char(' '))));
-
-    connect(m_modelOpProc, &QProcess::readyReadStandardOutput, this, [this]() {
-        appendModelOpOutput(m_modelOpProc->readAllStandardOutput());
-    });
-
-    connect(m_modelOpProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, kind, name](int code, QProcess::ExitStatus status) {
-        const bool ok = (status == QProcess::NormalExit && code == 0);
-        const bool cancelled = m_modelOpCancelled;
-        if (cancelled && kind == QLatin1String("install")) { purgePartialBlobs(); }
-        const QString tail = sanitizeStatusLine(QString::fromUtf8(m_modelOpBuf.right(400)));
-        // Cancelling leaves no message at all. The row goes straight back to
-        // "install", which is the whole of what happened -- a line reporting
-        // the cleanup was explaining an implementation detail to someone who
-        // had just said they were not interested. Failures still speak up.
-        const QString message = cancelled
-            ? QString()
-            : (ok ? (kind == QLatin1String("install") ? QStringLiteral("%1 is ready.").arg(name)
-                                                        : QStringLiteral("%1 removed.").arg(name))
-                  : (tail.isEmpty() ? QStringLiteral("ollama exited with code %1.").arg(code) : tail));
-        finishModelOp(ok, message);
-        if (kind == QLatin1String("install"))   { emit modelInstallFinished(name, ok && !cancelled, message); }
-        else                                    { emit modelUninstallFinished(name, ok && !cancelled, message); }
-        refreshModels();   // pick up the new install list either way
-    });
-
-    connect(m_modelOpProc, &QProcess::errorOccurred, this, [this, kind, name](QProcess::ProcessError) {
-        if (!m_modelOpProc) { return; }
-        const QString message = QStringLiteral("couldn't start ollama -- is it on PATH?");
-        finishModelOp(false, message);
-        if (kind == QLatin1String("install"))   { emit modelInstallFinished(name, false, message); }
-        else                                    { emit modelUninstallFinished(name, false, message); }
-    });
-
-    // Absolute path when we have one: a bundled app's PATH doesn't necessarily
-    // contain /usr/local/bin, so a bare "ollama" here failed to start even
-    // though the binary is installed (see findOllamaBinary).
-    m_modelOpProc->start(m_ollamaPath.isEmpty() ? QStringLiteral("ollama") : m_ollamaPath, args);
-}
-
-// `ollama pull` redraws progress with '\r', so both '\r' and '\n' count as
-// terminators. A QProcess read can cut a line in half at the chunk boundary,
-// so m_modelOpLine carries the unterminated remainder forward -- only
-// complete lines get decoded, sanitised or shown.
-void NikitaBackend::appendModelOpOutput(const QByteArray &chunk)
-{
-    m_modelOpBuf += chunk;
-    if (m_modelOpBuf.size() > 8000) { m_modelOpBuf.remove(0, m_modelOpBuf.size() - 8000); }
-
-    m_modelOpLine += chunk;
-    m_modelOpLine.replace('\r', '\n');
-
-    const int lastBreak = m_modelOpLine.lastIndexOf('\n');
-    if (lastBreak < 0) {
-        // No complete line yet. Guard against a producer that never emits one.
-        if (m_modelOpLine.size() > 8000) { m_modelOpLine.clear(); }
-        return;
-    }
-
-    const QByteArray complete = m_modelOpLine.left(lastBreak);
-    m_modelOpLine.remove(0, lastBreak + 1);          // keep the partial tail
-
-    QString lastLine;
-    const QList<QByteArray> lines = complete.split('\n');
-    for (const QByteArray &l : lines) {
-        const QString s = sanitizeStatusLine(QString::fromUtf8(l));
-        if (!s.isEmpty()) { lastLine = s; }
-    }
-    if (lastLine.isEmpty()) { return; }
-
-    const double pct = parsePercent(lastLine);
-    // ollama redraws the same "pulling <blob>… NN%" line in place, so most
-    // ticks differ only in that number -- logging every one of them would
-    // flood the LOGS panel. Strip the number back off and log once per
-    // distinct phase, then again only every 10 points within that phase.
-    QString topic = lastLine;
-    if (pct >= 0.0) {
-        const int pctPos = lastLine.lastIndexOf(QLatin1Char('%'));
-        int start = pctPos;
-        while (start > 0 && (lastLine.at(start - 1).isDigit()
-                             || lastLine.at(start - 1) == QLatin1Char('.'))) { --start; }
-        topic = lastLine.left(start).trimmed();
-    }
-    const int bucket = pct >= 0.0 ? int(pct * 10) : -1;   // 0..10, one per 10%
-    if (topic != m_modelOpLastLoggedTopic || bucket != m_modelOpLastLoggedBucket) {
-        m_modelOpLastLoggedTopic = topic;
-        m_modelOpLastLoggedBucket = bucket;
-        nikitaLog(QStringLiteral("%1 %2: %3").arg(m_modelOpKind, m_modelOpName, lastLine));
-    }
-
-    setModelOp(m_modelOpKind, m_modelOpName, lastLine, pct);
-}
-
-void NikitaBackend::finishModelOp(bool ok, const QString &message)
-{
-    if (m_modelOpProc) { m_modelOpProc->deleteLater(); m_modelOpProc = nullptr; }
-    if (!message.isEmpty()) {
-        nikitaLog(QStringLiteral("%1: %2").arg(ok ? QStringLiteral("done") : QStringLiteral("failed"), message));
-    }
-    setModelOp(QString(), QString(), message, -1.0);
-}
-
-// ---- Ollama itself (not a model) ------------------------------------------
-
-// Plain cached read -- never spawns a process from a property getter (QML
-// bindings evaluate these on the UI thread, and `where`/`which` can briefly
-// stall on a slow disk). The cache is primed by detectOllama(), called once
-// from the constructor via a queued call and again whenever the user hits
-// "Install Ollama" or the manual recheck.
-bool NikitaBackend::ollamaInstalled() const
-{
-    return m_ollamaInstalled;
-}
-
-// Locates the ollama CLI without spawning anything (a `which` subprocess
-// froze the UI for up to 6s from openManager()). Checks extra dirs too: a
-// bundled .app inherits launchd's minimal PATH, missing /usr/local/bin where
-// Ollama's CLI symlink lives -- `which ollama` came back empty on a machine
-// that had it installed. The resolved path is reused for pull/rm as well.
-static QString findOllamaBinary()
-{
-    QStringList extra;
-#if defined(Q_OS_WIN)
-    extra << QDir::homePath() + QStringLiteral("/AppData/Local/Programs/Ollama");
-#else
-    extra << QStringLiteral("/usr/local/bin")
-          << QStringLiteral("/opt/homebrew/bin")
-          << QStringLiteral("/usr/bin")
-          << QStringLiteral("/bin")
-          << QDir::homePath() + QStringLiteral("/.local/bin");
-#endif
-    QString path = QStandardPaths::findExecutable(QStringLiteral("ollama"));
-    if (path.isEmpty()) {
-        path = QStandardPaths::findExecutable(QStringLiteral("ollama"), extra);
-    }
-#if defined(Q_OS_MAC)
-    // Ollama.app ships the CLI inside the bundle; the /usr/local/bin symlink is
-    // only created after the app has been run once and granted permission.
-    if (path.isEmpty()) {
-        const QString inApp = QStringLiteral("/Applications/Ollama.app/Contents/Resources/ollama");
-        if (QFileInfo(inApp).isExecutable()) { path = inApp; }
-    }
-#endif
-    return path;
-}
-
-void NikitaBackend::detectOllama()
-{
-    const bool was = m_ollamaInstalled;
-    m_ollamaPath = findOllamaBinary();
-    m_ollamaInstalled = !m_ollamaPath.isEmpty();
-    m_ollamaChecked = true;
-    if (was != m_ollamaInstalled) { emit ollamaInstalledChanged(); }
-    if (m_ollamaInstalled) { refreshModels(); }
-}
-
-
-
-
-
-
-// Installs Ollama itself (the runtime, not a model) via the platform's normal
-// channel: the official curl|sh script on Linux/macOS, winget on Windows.
-// Only ever runs from the "Install Ollama" click, never automatically.
-// No-Homebrew macOS installer. Deliberately plain /bin/sh + curl + hdiutil +
-// open -- every one of those ships with the OS itself, not with Xcode's
-// Command Line Tools or any other opt-in layer, so this has no dependency
-// left to be missing on a genuinely fresh machine (an earlier version of
-// this shelled out to python3, which is not actually guaranteed either, and
-// on a machine with no CLT installed yet can itself pop a blocking "install
-// developer tools?" dialog the first time anything touches /usr/bin/python3).
-//
-// latest/download/<name> is GitHub's own stable redirect for "whatever the
-// current release's asset with this exact name is" -- no API call, no JSON
-// to parse, and it can't go stale the way a hand-typed version number
-// could. Mounts the dmg, copies Ollama.app into /Applications and launches
-// it once so it can register its own background service and CLI symlink,
-// the same as a person dragging it there by hand would -- just without the
-// drag, the browser, or the "downloaded from the internet, are you sure?"
-// dialog (that prompt comes from the quarantine flag Safari/Mail set on a
-// download; curl never sets it).
-static const char *const kOllamaInstallerSh = R"SHEOF(#!/bin/sh
-set -e
-TMP=$(mktemp -d /tmp/nikita-ollama-XXXXXX)
-cleanup() { [ -n "$MOUNT" ] && hdiutil detach "$MOUNT" -quiet 2>/dev/null; rm -rf "$TMP"; }
-trap cleanup EXIT
-
-echo "Downloading Ollama..."
-curl -L --fail --progress-bar -o "$TMP/Ollama.dmg" \
-    "https://github.com/ollama/ollama/releases/latest/download/Ollama.dmg"
-echo "Download complete. Mounting disk image..."
-
-MOUNT=$(hdiutil attach -nobrowse "$TMP/Ollama.dmg" | awk -F'\t' '/\/Volumes\// {print $NF; exit}')
-if [ -z "$MOUNT" ]; then
-    echo "error: couldn't mount the disk image"
-    exit 1
-fi
-if [ ! -d "$MOUNT/Ollama.app" ]; then
-    echo "error: Ollama.app wasn't on the mounted volume"
-    exit 1
-fi
-
-echo "Installing to /Applications..."
-rm -rf /Applications/Ollama.app
-cp -R "$MOUNT/Ollama.app" /Applications/Ollama.app
-
-echo "Starting Ollama..."
-open -a /Applications/Ollama.app
-echo "Done. Ollama is starting in the background."
-)SHEOF";
-
-// Writes kOllamaInstallerSh to a temp file and hands back its path, or an
-// empty string if the temp dir couldn't be written to.
-static QString writeOllamaInstallerScript()
-{
-    QFile f(QDir::temp().filePath(QStringLiteral("nikita-install-ollama.sh")));
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) { return QString(); }
-    f.write(kOllamaInstallerSh);
-    f.close();
-    f.setPermissions(f.permissions() | QFile::ExeOwner | QFile::ExeUser);
-    return f.fileName();
-}
-
-void NikitaBackend::installOllama()
-{
-    if (m_modelOpProc) {
-        emit ollamaInstallFinished(false, QStringLiteral("An install/uninstall is already running -- wait for it first."));
-        return;
-    }
-
-    // Work out what to run *before* creating the process, because on macOS
-    // there may be nothing to run at all.
-    QString program;
-    QStringList args;
-
-#if defined(Q_OS_WIN)
-    program = QStringLiteral("winget");
-    args = {QStringLiteral("install"), QStringLiteral("--id"), QStringLiteral("Ollama.Ollama"),
-            QStringLiteral("-e"), QStringLiteral("--accept-package-agreements"),
-            QStringLiteral("--accept-source-agreements")};
-#elif defined(Q_OS_MAC)
-    // The ollama.com/install.sh one-liner is Linux-only -- it opens with
-    // `[ "$(uname -s)" = "Linux" ] || error 'This script is intended to run on
-    // Linux only.'` and exits non-zero within milliseconds on a Mac. That is
-    // why the button looked like it did nothing: the op started and ended
-    // between two frames, and the only place the resulting message was shown
-    // was a Text bound to `modelOpKind === "ollama"`, which had already gone
-    // back to "" by then.
-    //
-    // Homebrew, when it's there, is the simplest unattended route. Without
-    // it, still don't hand the person off to a browser -- run the same
-    // install a person would do by hand (download the .dmg, drag the app
-    // in) through a plain shell script instead, so "click the button" stays
-    // true even on a machine with no developer tooling at all.
-    program = QStandardPaths::findExecutable(QStringLiteral("brew"),
-                  {QStringLiteral("/opt/homebrew/bin"), QStringLiteral("/usr/local/bin")});
-    if (program.isEmpty()) {
-        const QString script = writeOllamaInstallerScript();
-        if (script.isEmpty()) {
-            const QString message = QStringLiteral("macOS: opening ollama.com/download -- install it, then hit recheck.");
-            setModelOp(QString(), QString(), message, -1.0);
-            QDesktopServices::openUrl(QUrl(QStringLiteral("https://ollama.com/download")));
-            emit ollamaInstallFinished(false, message);
-            return;
-        }
-        program = QStringLiteral("/bin/sh");
-        args = {script};
-    } else {
-        args = {QStringLiteral("install"), QStringLiteral("ollama")};
-    }
-#else
-    // sh -c so the pipe (curl | sh) actually pipes.
-    program = QStringLiteral("/bin/sh");
-    args = {QStringLiteral("-c"), QStringLiteral("curl -fsSL https://ollama.com/install.sh | sh")};
-#endif
-
-    m_modelOpCancelled = false;
-    m_modelOpBuf.clear();
-    m_modelOpLine.clear();
-    m_modelOpLastLoggedTopic.clear();
-    m_modelOpLastLoggedBucket = -1;
-    m_modelOpProc = new QProcess(this);
-    m_modelOpProc->setProcessChannelMode(QProcess::MergedChannels);
-    setModelOp(QStringLiteral("ollama"), QString(), QStringLiteral("Installing Ollama…"), -1.0);
-    nikitaLog(QStringLiteral("Installing Ollama: running `%1 %2`").arg(program, args.join(QLatin1Char(' '))));
-
-    connect(m_modelOpProc, &QProcess::readyReadStandardOutput, this, [this]() {
-        appendModelOpOutput(m_modelOpProc->readAllStandardOutput());
-    });
-    connect(m_modelOpProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int code, QProcess::ExitStatus status) {
-        const bool ok = (status == QProcess::NormalExit && code == 0);
-        const bool cancelled = m_modelOpCancelled;
-        const QString tail = sanitizeStatusLine(QString::fromUtf8(m_modelOpBuf.right(400)));
-        const QString message = cancelled ? QString()
-            : (ok ? QStringLiteral("Ollama installed.")
-                  : (tail.isEmpty() ? QStringLiteral("installer exited with code %1.").arg(code) : tail));
-        finishModelOp(ok, message);
-        m_ollamaChecked = false;   // force a fresh lookup rather than trusting the cache
-        if (ok && !cancelled) { detectOllama(); }
-        emit ollamaInstallFinished(ok && !cancelled, message);
-    });
-    connect(m_modelOpProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
-        if (!m_modelOpProc) { return; }
-        const QString message = QStringLiteral("couldn't start the installer.");
-        finishModelOp(false, message);
-        emit ollamaInstallFinished(false, message);
-    });
-
-    m_modelOpProc->start(program, args);
-    // The Linux script needs root. There is no terminal behind this process, so
-    // sudo can't prompt -- with stdin left open it would sit there waiting for a
-    // password nobody can type, and the op would hang on "Installing Ollama…"
-    // forever. Closing the write channel makes sudo fail immediately instead,
-    // with a message we can actually show ("no tty present…"), and the user can
-    // run the one-liner in a terminal.
-    m_modelOpProc->closeWriteChannel();
-}
-
-bool NikitaBackend::ollamaOnline() const  { return m_ollamaOnline; }
-
-void NikitaBackend::recheckOllama()
-{
-    refreshModels();
-}
-
-QStringList NikitaBackend::personalityPresets() const
-{
-    return { QStringLiteral("Default (Nikita)"),
-             QStringLiteral("Chill helper"),
-             QStringLiteral("Chaos gremlin"),
-             QStringLiteral("Deadpan pro"),
-             QStringLiteral("Sweet companion") };
-}
-
-void NikitaBackend::applyPreset(const QString &name)
-{
-    QString persona;
-    if (name == QStringLiteral("Chill helper")) {
-        persona = QStringLiteral("You are calm, warm and concise -- a laid-back, friendly helper. Light on snark, easy-going, genuinely helpful.");
-    } else if (name == QStringLiteral("Chaos gremlin")) {
-        persona = QStringLiteral("You are a chaotic, hyper, mischievous gremlin -- playful, unpredictable, high-energy and harmlessly unhinged. Chaos with a heart.");
-    } else if (name == QStringLiteral("Deadpan pro")) {
-        persona = QStringLiteral("You are dry, deadpan and professional -- efficient, subtle wit, minimal fluff. You just get things done.");
-    } else if (name == QStringLiteral("Sweet companion")) {
-        persona = QStringLiteral("You are a sweet, supportive companion -- encouraging, gentle, a genuine hype-buddy always in the user's corner.");
-    }
-    // "Default (Nikita)" clears the override -> the built-in default stands.
-    QSettings().setValue(QStringLiteral("nikita/personality"), persona);
-}
-
-void NikitaBackend::applyNamePersonality()
-{
-    QSettings().setValue(QStringLiteral("nikita/personality"),
-        QStringLiteral("Build and fully embody a personality inspired by your own name -- lean into "
-                       "whatever character, vibe or theme the name evokes, and stay consistent in it."));
-}
-
 // A tool name is jargon. This is the same event in the words someone waiting
 // on it would use. Anything unmapped falls back to "working" rather than
 // leaking an identifier like host_mkdir into the window.
+// "name(key=value, ...)" for a tool call, so the chat row can be expanded to
+// show exactly what ran. Long values (a whole script) are trimmed -- the point
+// is to see WHICH command and its key arguments, not to reprint a file.
+static QString nikitaToolDetail(const QString &name, const QJsonObject &args)
+{
+    QStringList bits;
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        if (it.key().startsWith(QLatin1Char('_'))) { continue; }   // internal recipe fields
+        QString v = it.value().toVariant().toString().simplified();
+        if (v.size() > 80) { v = v.left(77) + QStringLiteral("..."); }
+        bits << QStringLiteral("%1=%2").arg(it.key(), v);
+    }
+    return QStringLiteral("%1(%2)").arg(name, bits.join(QStringLiteral(", ")));
+}
+
 static QString nikitaToolStatus(const QString &tool)
 {
     static const QHash<QString, QString> phrases = {
@@ -2560,9 +2240,27 @@ QString NikitaBackend::turnElapsedText() const
 
 QString NikitaBackend::turnTokensText() const
 {
-    if (m_turnTokens <= 0) { return QString(); }
-    if (m_turnTokens < 1000) { return QStringLiteral("%1 tokens").arg(m_turnTokens); }
-    return QStringLiteral("%1k tokens").arg(m_turnTokens / 1000.0, 0, 'f', 1);
+    // The real total, once a reply has reported usage. Before that -- the whole
+    // "thinking" stretch on a non-streamed API call -- fall back to the prompt
+    // estimate so the footer is never blank, marked with ~ so it never claims
+    // to be exact.
+    const bool exact = m_turnTokens > 0;
+    const int n = exact ? m_turnTokens : m_turnPromptEstTok;
+    if (n <= 0) { return QString(); }
+    const QString tilde = exact ? QString() : QStringLiteral("~");
+    if (n < 1000) { return QStringLiteral("%1%2 tokens").arg(tilde).arg(n); }
+    return QStringLiteral("%1%2k tokens").arg(tilde).arg(n / 1000.0, 0, 'f', 1);
+}
+
+QString NikitaBackend::turnCostText() const
+{
+    if (m_turnCostUsd <= 0.0) { return QString(); }
+    // Four decimals, because three would round a one-cent turn to $0.010 and
+    // the difference between a cheap turn and an expensive one is exactly the
+    // thing this is here to show. Below a hundredth of a cent, say so rather
+    // than printing $0.0000, which reads as free.
+    if (m_turnCostUsd < 0.0001) { return QStringLiteral("<$0.0001"); }
+    return QStringLiteral("$%1").arg(m_turnCostUsd, 0, 'f', 4);
 }
 
 void NikitaBackend::setTurnStatus(const QString &s)
@@ -2598,9 +2296,13 @@ void NikitaBackend::setThinking(bool value)
         // Snapshot BEFORE clearing the clock: emitReply runs after this and the
         // "done" line needs the totals, which are gone the moment m_turnStartedMs
         // is zeroed.
-        m_lastTurnCost = QStringLiteral("%1 \u00b7 %2")
-                             .arg(turnElapsedText(), turnTokensText().isEmpty()
-                                  ? QStringLiteral("0 tokens") : turnTokensText());
+        m_lastTurnCost = QStringLiteral("%1 \u00b7 %2%3")
+                             .arg(turnElapsedText(),
+                                  turnTokensText().isEmpty() ? QStringLiteral("0 tokens")
+                                                             : turnTokensText(),
+                                  turnCostText().isEmpty()
+                                      ? QString()
+                                      : QStringLiteral(" \u00b7 ") + turnCostText());
         m_turnStartedMs = 0;
         setTurnStatus(QString());
     }
@@ -2743,16 +2445,37 @@ void NikitaBackend::flushPendingMoves()
     // Several steps: record the sequence under the tool that started it, with
     // the chain spelled out, so the next time a request looks like this one the
     // prompt says "this took three calls" rather than "this took that call".
-    QStringList chain;
-    for (const auto &m : m_pendingMoves) { chain += m.first; }
+    // Each step is named WITH ITS TARGET, not just the tool name. A recipe that
+    // read "host_write -> host_run -> save_file" recorded that three calls
+    // happened but hid WHAT they produced -- so a fib task that also generated a
+    // BadUSB looked, in memory, like it had only written the python file. Naming
+    // the target of every step makes the stored recipe show the whole thing.
+    auto stepLabel = [](const QString &tool, const QJsonObject &a) -> QString {
+        QString target = a.value(QStringLiteral("path")).toString();
+        if (target.isEmpty()) { target = a.value(QStringLiteral("command")).toString(); }
+        if (target.isEmpty()) { target = a.value(QStringLiteral("to")).toString(); }
+        target = target.simplified();
+        if (target.size() > 60) { target = target.left(57) + QStringLiteral("..."); }
+        return target.isEmpty() ? tool : QStringLiteral("%1(%2)").arg(tool, target);
+    };
+    QStringList chain;            // tool names only, for the one-line log
+    QStringList chainDetailed;    // tool(target), for the stored recipe
+    for (const auto &m : m_pendingMoves) {
+        chain += m.first;
+        chainDetailed += stepLabel(m.first, m.second);
+    }
     QJsonObject args = m_pendingMoves.first().second;
-    args.insert(QStringLiteral("_then"), chain.mid(1).join(QStringLiteral(" -> ")));
+    args.insert(QStringLiteral("_then"), chainDetailed.mid(1).join(QStringLiteral(" -> ")));
     args.insert(QStringLiteral("_steps"), chain.size());
+    // The final artifact called out by itself, so "what did this produce" is
+    // answerable at a glance even when the chain is long.
+    args.insert(QStringLiteral("_produced"),
+                stepLabel(m_pendingMoves.last().first, m_pendingMoves.last().second));
     recordProvenMove(m_pendingMoves.first().first, args);
 
     nikitaLogAs(assistantName(),
                QStringLiteral("learned a %1-step recipe: %2")
-                   .arg(chain.size()).arg(chain.join(QStringLiteral(" -> "))));
+                   .arg(chain.size()).arg(chainDetailed.join(QStringLiteral(" -> "))));
     m_pendingMoves.clear();
 }
 
@@ -3087,6 +2810,9 @@ static QString nikitaPlainMove(const QString &tool, const QString &shape)
 QString NikitaBackend::systemPrompt() const
 {
     QString sys = QString::fromUtf8(NIKITA_SYSTEM);
+    // The BadUSB identity line is one editable constant, dropped into both the
+    // rule and the worked example so they can never disagree about it.
+    sys.replace(QLatin1String("{{BADUSB_ID}}"), QLatin1String(NIKITA_BADUSB_ID));
 
     // On plain conversation turns, cut the whole tool/device manual out of the
     // prompt. Leaving it in teaches the model the call syntax, and weak
@@ -3108,10 +2834,76 @@ QString NikitaBackend::systemPrompt() const
                               "run something themselves.");
     }
 
+    // Trim the prompt to what THIS turn actually needs.
+    //
+    // The arithmetic that forces this: num_ctx is finite, and a measured action
+    // turn costs the model 1700-4300 tokens of <think> before it emits a single
+    // tool call. The <think> block is not optional -- the model's own chat
+    // template opens it on every assistant turn, which is why /no_think and
+    // "think": false never did anything. So the window has to hold the prompt,
+    // the tool schemas AND several thousand tokens of reasoning.
+    //
+    // When it does not fit, the failure is silent and looks like stupidity
+    // rather than an error: llama-server runs with --context-shift, so the
+    // OLDEST tokens get discarded to make room -- and the oldest tokens are the
+    // system prompt. The model then answers from a prompt whose opening half it
+    // can no longer see. That is what "it hallucinated" looks like from here.
+    //
+    // So this is not an optimisation and it is not a mode. It is the difference
+    // between the instructions being present at inference time and not.
+    {
+        // Radio, NFC, IR, DuckyScript and the button/GPIO manual are ~2000
+        // tokens of reference that only pay for themselves when the turn is
+        // actually about the Flipper. On "create a file on my Desktop" they are
+        // pure ballast. DEVICE ACCESS and WHICH MACHINE stay in either way --
+        // those are what stop it writing a host file onto the SD card.
+        if (!m_turnIsDevice) {
+            const int from = sys.indexOf(QStringLiteral("DEVICE CONTROL --"));
+            const int to   = sys.indexOf(QStringLiteral("POWER MOVES --"));
+            if (from > 0 && to > from) { sys.remove(from, to - from); }
+        }
+        // POWER MOVES goes on every turn. Most of it is encouragement -- "think
+        // like an operator", "go beyond the obvious", "favor the robust,
+        // complete artifact" -- addressed to a 4B model whose documented
+        // failure mode is running long. Four of its lines are load-bearing and
+        // are restated here in a fifth of the space; the rest is telling a
+        // rambler to ramble.
+        const int pfrom = sys.indexOf(QStringLiteral("POWER MOVES --"));
+        const int pto   = sys.indexOf(QStringLiteral("CONVERSATION vs ACTION"));
+        if (pfrom > 0 && pto > pfrom) {
+            sys.remove(pfrom, pto - pfrom);
+            sys.insert(pfrom, QStringLiteral(
+                "OPERATING RULES:\n"
+                "- run_cli is the FLIPPER. host_run and host_* are THIS COMPUTER. Mixing them up is "
+                "the most common way to be confidently wrong.\n"
+                "- Names are DATA: use the exact spelling the user typed, capitals and all.\n"
+                "- Never claim an action happened unless the tool actually ran and succeeded.\n"
+                "- You CAN drive the Flipper physically through run_cli (vibro, led, reboot, GPIO). "
+                "Never say you cannot perform physical actions.\n\n"));
+        }
+    }
+
     // Only on tool turns: on a plain-chat turn the whole device manual is cut
     // out just above, and putting a command list back would undo that.
     //
     if (m_turnNeedsTools) { sys += cliReferenceForPrompt(); }
+
+    // Deterministic result handoff. When a file you save must contain the
+    // output of a command you run THIS turn, do not read the number off the
+    // screen and retype it -- write the literal token {{LAST_RESULT}} where the
+    // value goes, and the app fills in the exact bytes the command printed. One
+    // digit typed wrong is a broken artifact; this removes the chance entirely.
+    if (m_turnNeedsTools) {
+        sys += QStringLiteral(
+            "\n\nRESULT HANDOFF -- when a file you save has to contain the OUTPUT of a "
+            "command you run this turn (a computed number, a captured value, an ip), do NOT "
+            "transcribe that value yourself. Run the command first, then write the token "
+            "{{LAST_RESULT}} in the file exactly where the value belongs -- the app replaces "
+            "it with the exact output of your most recent command. Example: to put a computed "
+            "number into a script, the line is  STRING {{LAST_RESULT}}  (or the value sits "
+            "inside a longer string). This is only for a value your OWN command produced this "
+            "turn; type any other literal text normally.");
+    }
 
     // Anchor the most recently saved file so an edit ("make it fancy", "add X",
     // "change the delay") rewrites THAT file instead of inventing a new name.
@@ -3170,7 +2962,30 @@ QString NikitaBackend::systemPrompt() const
             "and do NOT report a working directory -- you do not have one.\n");
     }
 
-    if (agentReady()) {
+    // The full workspace manual is ~1300 tokens of tool documentation. It earns
+    // that on a turn that will actually call a tool; on a plain-chat turn no
+    // host tool is even offered, so all it does is crowd out the model's room to
+    // think. The chat turn still gets the LOCATIONS, because "where are you?"
+    // and "what's my Desktop path?" are conversation, not tool calls, and
+    // answering those from memory is how a wrong path gets invented.
+    if (agentReady() && !m_turnNeedsTools) {
+        sys += QStringLiteral(
+            "\n\nWHERE YOU ARE ON THIS COMPUTER (regenerated every turn -- never stale, "
+            "and never needs a tool call to find out):\n"
+            "- Current folder: \"%1\"\n"
+            "- Home: \"%2\"   Workspace: \"%3\"   This computer: %4\n"
+            "- Desktop: \"%5\"   Downloads: \"%6\"   Documents: \"%7\"\n"
+            "- These are THIS user's real folders. Never assemble a path from what you "
+            "remember; read it from the lines above.")
+            // agentBaseDir() rather than m_agentRoot: an unconfigured workspace
+            // is home, not an empty string printed into the prompt as a path.
+            .arg(agentCwd(), QDir::homePath(), agentBaseDir(), QSysInfo::prettyProductName(),
+                 nikitaWellKnownDir(QStringLiteral("desktop")),
+                 nikitaWellKnownDir(QStringLiteral("downloads")),
+                 nikitaWellKnownDir(QStringLiteral("documents")));
+    }
+
+    if (agentReady() && m_turnNeedsTools) {
         sys += QStringLiteral(
             "\n\nHOST WORKSPACE -- you can edit and test your OWN source code:\n"
             "- A workspace folder on THIS computer is wired up: \"%1\". It holds your own qFlipper/NIKITA source.\n"
@@ -3195,7 +3010,8 @@ QString NikitaBackend::systemPrompt() const
             "- The reach is real, so the care has to be too. host_delete is not undoable and there is no bin to fish things out of. Delete what was asked for and nothing adjacent; when a request would remove more than the user clearly named, do the named part and say what you left alone.\n"
             "- The workspace folder is not a boundary, just a starting point: it is where bare relative paths land and where host_run begins. Say the path you actually mean.\n"
             "- Your own core lives in application/nikitabackend.cpp + .h and application/components/ under that workspace. To fix a bug in yourself: host_read the file, host_write the corrected version, then host_run the build and read the errors.\n"
-            "- Nothing here is blocked, so nothing here is undone for you either. Never claim you edited a file you didn't, and never report a path you didn't get back from a tool this turn. Say what you changed and where, plainly.")
+            "- Nothing here is blocked, so nothing here is undone for you either. Never claim you edited a file you didn't, and never report a path you didn't get back from a tool this turn. Say what you changed and where, plainly.\n"
+            "- A tool that comes back with \"error\" did NOT happen. Read the error text and repeat what it actually says. In particular, a permission error is the OPERATING SYSTEM refusing this app -- it is never the folder being read-only, never the file being locked, and never a reason to go write somewhere else instead. Say which folder was refused and what the error told you to do, and stop; do not silently retry the same write in Documents and report that as success.")
             .arg(m_agentRoot, agentCwd(), QDir::homePath(), QSysInfo::prettyProductName(),
                  nikitaWellKnownDir(QStringLiteral("desktop")),
                  nikitaWellKnownDir(QStringLiteral("downloads")),
@@ -3291,6 +3107,26 @@ QString NikitaBackend::systemPrompt() const
     if (!m_deviceContext.isEmpty()) {
         sys += QStringLiteral("\n\nLive Flipper device diagnostics:\n") + m_deviceContext;
     }
+
+    // Last line of defence for the BadUSB identity. The rule above tells the
+    // model to use exactly NIKITA_BADUSB_ID, but memory poisons this: a BadUSB
+    // saved months ago with a stale "ID 1234:5678 Apple:Keyboard" comes back in
+    // CORRECTIONS or THINGS YOU HAVE ALREADY DONE as a demonstrated success, and
+    // a small model copies the concrete example over the abstract rule. So
+    // rewrite any stale identity line that made it into the prompt to the
+    // canonical one -- the model then cannot SEE a wrong value to copy. Bounded
+    // and keyboard-scoped so it only ever touches a USB-keyboard ID line.
+    static const QRegularExpression staleBadusbId(
+        QStringLiteral("ID\\s+[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}[^\\n]{0,40}?[Kk]eyboard[A-Za-z]*"));
+    sys.replace(staleBadusbId, QLatin1String(NIKITA_BADUSB_ID));
+
+    // Measured, not estimated. Three different guesses about where the context
+    // was going were all wrong; this prints the one number that settles it.
+    nikitaLogAs(assistantName(),
+        QStringLiteral("prompt: system=%1 chars (~%2 tok) device=%3 tools=%4")
+            .arg(sys.size()).arg(sys.size() / 4)
+            .arg(m_turnIsDevice ? QStringLiteral("yes") : QStringLiteral("no"))
+            .arg(m_turnNeedsTools ? QStringLiteral("yes") : QStringLiteral("no")));
     return sys;
 }
 
@@ -3302,16 +3138,19 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     m_deviceContext = deviceContext;
     m_toolRounds = 0;
     // Prose the model emits ALONGSIDE a tool call, accumulated across every
-    // round of this turn. dispatchToOllama() wipes m_streamContent at the top of
+    // round of this turn. dispatchTurn() wipes m_streamContent at the top of
     // each round, so without this the script/explanation written in the round
     // that also triggered save_file was gone by the time the (often empty) final
     // round finalized -- and that empty final round tripped the fallback line.
     m_turnText.clear();
-    m_turnProgress.clear();   // the running tally of what this turn has done
     // A new turn retires the previous question unanswered. No penalty either
     // way: an unrated action keeps whatever the automatic check concluded.
     if (m_canRate) { m_canRate = false; emit canRateChanged(); }
     m_turnTokens = 0;
+    m_turnPromptEstTok = 0;
+    m_apiRateRetry = 0;
+    m_lastRunOutput.clear();   // a result belongs to the turn that produced it
+    m_turnCostUsd = 0.0;
     m_turnTruncated = false;
     m_turnWasFileAction = messageIsFileWrite(userText);
     m_turnRanAnyTool = false;
@@ -3343,8 +3182,20 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     // always about that action.
     m_turnNeedsTools = messageNeedsTools(userText) || m_lastTurnWasAction
                        || m_lastTurnMissed || m_toolTurnCooldown > 0;
+    // Decided here, with the message in hand, for the same reason: systemPrompt()
+    // runs later and never sees the text that started the turn.
+    //
+    // Carried across exactly ONE follow-up, because "now add a delay to it" is
+    // still about the script even though it names nothing. The flag that does
+    // the carrying is set from what the user actually SAID, never from the
+    // carried value -- feeding it back in makes it latch, and one mention of
+    // the Flipper would then drag the whole radio manual into every turn for
+    // the rest of the session.
+    const bool saidDevice = messageMentionsDevice(userText);
+    m_turnIsDevice = saidDevice || m_lastTurnWasDevice;
+    m_lastTurnWasDevice = saidDevice;
     // Which machine this turn is about, decided here for the same reason
-    // m_turnNeedsTools is: dispatchToOllama() runs later and has no access to
+    // m_turnNeedsTools is: dispatchTurn() runs later and has no access to
     // the message that started the turn.
     // Off means off. The UI hides the input, but a turn could still be started
     // from a queued call or a future entry point, and "the assistant is
@@ -3361,6 +3212,46 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     m_forcedRetry = 0;       // corrections used this turn
     m_history.append(QJsonObject{{"role", "user"}, {"content", userText}});
     setThinking(true);
+
+    // DETERMINISTIC SHORTCUT: "turn on/off the TV" and its variants fire the
+    // universal TV Power code directly, in code, with no model round at all.
+    // TV power is a toggle, so on and off are the same signal. This is the
+    // reliable path the whole IR saga pointed at -- no navigation, no narration,
+    // no chance the model claims success without acting. The tool line still
+    // shows in the chat so the user sees exactly what ran.
+    if (nikitaIsTvPowerCommand(userText)) {
+        m_turnFocus = FocusDevice;
+        m_turnRanAnyTool = true;
+        const int seq = ++m_toolSeq;
+        m_activeToolSeq = seq;
+        const QJsonObject a{{QStringLiteral("remote"), QStringLiteral("tv")},
+                            {QStringLiteral("button"), QStringLiteral("Power")}};
+        const QString detail = nikitaToolDetail(QStringLiteral("ir_universal"), a);
+        emit toolActivity(seq, nikitaToolStatus(QStringLiteral("ir_universal")), detail, false, false);
+        nikitaLogAs(assistantName(), QStringLiteral("shortcut: TV power -> ir_universal(tv, Power)"));
+        runOneTool(QStringLiteral("ir_universal"), a, [this, seq, detail](const QString &result) {
+            const QJsonObject o = QJsonDocument::fromJson(result.toUtf8()).object();
+            const bool failed = o.contains(QStringLiteral("error"));
+            const QString headline = failed
+                ? QStringLiteral("TV power failed: %1").arg(o.value(QStringLiteral("error")).toString())
+                : QStringLiteral("sent %1 TV power code(s)").arg(o.value(QStringLiteral("sent")).toInt());
+            emit toolActivity(seq, headline, detail, true, failed);
+            QString reply;
+            if (failed) {
+                reply = QStringLiteral("Couldn't send it: %1").arg(o.value(QStringLiteral("error")).toString());
+            } else {
+                reply = QStringLiteral("TV power sent -- %1 code(s) fired at the TV. If it didn't "
+                                       "react, its code may not be in the set.")
+                            .arg(o.value(QStringLiteral("sent")).toInt());
+            }
+            m_history.append(QJsonObject{{"role", "assistant"}, {"content", reply}});
+            saveHistory();
+            setThinking(false);
+            emitReply(reply);
+        });
+        return;
+    }
+
     redispatch();
 }
 
@@ -3378,14 +3269,154 @@ void NikitaBackend::stopThinking()
 
 void NikitaBackend::redispatch()
 {
-    // One path only: Ollama. The `claude` dispatch was removed.
-    dispatchToOllama();
+    dispatchTurn();
 }
 
 
 
 
-void NikitaBackend::dispatchToOllama()
+// ---- Translating between the two wire formats ------------------------------
+//
+// This app builds messages in a loose shape: a tool call whose arguments are a
+// JSON OBJECT, and a tool result that is just {"role":"tool","content":...}
+// sitting after it. The OpenAI format -- which is what Moonshot speaks -- is
+// stricter in three specific ways, and every one of them is a silent failure
+// rather than an error if you get it wrong:
+//
+//   1. every tool call needs an "id", and "type":"function"
+//   2. "arguments" is a STRING containing JSON, not an object
+//   3. every tool result must name the call it answers, via "tool_call_id"
+//
+// Done per request rather than at storage time, deliberately. The history on
+// disk and the primer stay in one format, so switching provider in the middle
+// of a conversation does not require rewriting what is already there.
+QJsonArray NikitaBackend::toOpenAiMessages(const QJsonArray &msgs)
+{
+    QJsonArray out;
+    // Ids issued to the most recent assistant turn, consumed in order by the
+    // tool results that follow it. A queue and not a single value because one
+    // assistant turn can call several tools before any of them answers.
+    QStringList pendingIds;
+    int counter = 0;
+
+    for (const QJsonValue &v : msgs) {
+        QJsonObject m = v.toObject();
+        const QString role = m.value(QStringLiteral("role")).toString();
+
+        if (role == QLatin1String("assistant") && m.contains(QStringLiteral("tool_calls"))) {
+            const QJsonArray calls = m.value(QStringLiteral("tool_calls")).toArray();
+            QJsonArray rebuilt;
+            pendingIds.clear();
+            for (const QJsonValue &cv : calls) {
+                QJsonObject call = cv.toObject();
+                QJsonObject fn = call.value(QStringLiteral("function")).toObject();
+                const QJsonValue args = fn.value(QStringLiteral("arguments"));
+                // Already a string (a call we round-tripped from the API) stays
+                // as it is; an object (everything this app builds itself) gets
+                // serialised. Never double-encode.
+                if (args.isObject()) {
+                    fn.insert(QStringLiteral("arguments"),
+                              QString::fromUtf8(QJsonDocument(args.toObject())
+                                                    .toJson(QJsonDocument::Compact)));
+                } else if (!args.isString()) {
+                    fn.insert(QStringLiteral("arguments"), QStringLiteral("{}"));
+                }
+                QString id = call.value(QStringLiteral("id")).toString();
+                if (id.isEmpty()) { id = QStringLiteral("call_%1").arg(++counter); }
+                pendingIds << id;
+                rebuilt.append(QJsonObject{
+                    {QStringLiteral("id"), id},
+                    {QStringLiteral("type"), QStringLiteral("function")},
+                    {QStringLiteral("function"), fn}
+                });
+            }
+            m.insert(QStringLiteral("tool_calls"), rebuilt);
+            // An assistant turn that only called tools has no prose, and the
+            // key can be missing entirely in what we stored. The format wants
+            // it present.
+            if (!m.contains(QStringLiteral("content"))) {
+                m.insert(QStringLiteral("content"), QString());
+            }
+            out.append(m);
+            continue;
+        }
+
+        if (role == QLatin1String("tool")) {
+            if (!m.contains(QStringLiteral("tool_call_id"))) {
+                // Nothing to pair with means the assistant turn that made the
+                // call was trimmed out of the window ahead of this result.
+                // Sending an orphan is a 400 for the whole request, so drop it:
+                // a missing tool result costs the model one fact, a rejected
+                // request costs it the entire turn.
+                if (pendingIds.isEmpty()) { continue; }
+                m.insert(QStringLiteral("tool_call_id"), pendingIds.takeFirst());
+            }
+            out.append(m);
+            continue;
+        }
+
+        out.append(m);
+    }
+    return out;
+}
+
+// The API answers once, in OpenAI's shape. Everything downstream of the network
+// layer in this file reads a flatter shape with a better vocabulary for what
+// this app needs to know (was it truncated, what did the turn cost). So
+// normalise here, at the boundary, and leave the rest alone.
+QJsonObject NikitaBackend::normaliseApiReply(const QJsonObject &resp)
+{
+    const QJsonArray choices = resp.value(QStringLiteral("choices")).toArray();
+    const QJsonObject choice = choices.isEmpty() ? QJsonObject() : choices.first().toObject();
+    QJsonObject msg = choice.value(QStringLiteral("message")).toObject();
+
+    // arguments arrives as a STRING of JSON here, and runOneTool wants the
+    // object. A model that emits malformed JSON in its arguments is a real and
+    // regular occurrence, so a parse failure has to become an empty argument
+    // set rather than a crash -- the tool then fails honestly on a missing
+    // path, which the turn already knows how to report.
+    const QJsonArray calls = msg.value(QStringLiteral("tool_calls")).toArray();
+    if (!calls.isEmpty()) {
+        QJsonArray rebuilt;
+        for (const QJsonValue &cv : calls) {
+            QJsonObject call = cv.toObject();
+            QJsonObject fn = call.value(QStringLiteral("function")).toObject();
+            const QJsonValue args = fn.value(QStringLiteral("arguments"));
+            if (args.isString()) {
+                const QJsonDocument d = QJsonDocument::fromJson(args.toString().toUtf8());
+                fn.insert(QStringLiteral("arguments"),
+                          d.isObject() ? d.object() : QJsonObject());
+            }
+            call.insert(QStringLiteral("function"), fn);
+            rebuilt.append(call);
+        }
+        msg.insert(QStringLiteral("tool_calls"), rebuilt);
+    }
+
+    const QJsonObject usage = resp.value(QStringLiteral("usage")).toObject();
+    return QJsonObject{
+        {QStringLiteral("message"), msg},
+        {QStringLiteral("done"), true},
+        // "length" means the same thing in both vocabularies: the reply was cut
+        // off at the ceiling and whatever prose survived is a fragment.
+        {QStringLiteral("done_reason"), choice.value(QStringLiteral("finish_reason"))},
+        {QStringLiteral("prompt_eval_count"), usage.value(QStringLiteral("prompt_tokens"))},
+        {QStringLiteral("eval_count"), usage.value(QStringLiteral("completion_tokens"))},
+        // Cache hits are a tenth the price of a miss, so a cost line that
+        // ignores them is wrong by an order of magnitude on exactly the turns
+        // that matter -- the ones in a long conversation, where the system
+        // prompt has been sent unchanged a dozen times already. Two spellings
+        // because gateways disagree on where it lives.
+        {QStringLiteral("cached_tokens"),
+         usage.contains(QStringLiteral("prompt_cache_hit_tokens"))
+             ? usage.value(QStringLiteral("prompt_cache_hit_tokens"))
+             : usage.value(QStringLiteral("prompt_tokens_details")).toObject()
+                    .value(QStringLiteral("cached_tokens"))}
+    };
+}
+
+
+void NikitaBackend::dispatchTurn()
 {
     // Re-read the cache before every request. m_memory is only a copy, and the
     // file underneath it can move for reasons this object never sees; paying a
@@ -3403,19 +3434,19 @@ void NikitaBackend::dispatchToOllama()
 
     QJsonArray messages;
     messages.append(QJsonObject{{"role", "system"}, {"content", systemPrompt()}});
-    // Prime tool-capable models with one demonstrated act-don't-narrate exchange
-    // (skipped for chat-only models, and for plain conversation turns so the
-    // tool-call examples don't tempt the model to imitate them when just talking).
+    // The primer used to go here: twelve fabricated assistant turns, five of
+    // them carrying tool_calls, wired in ahead of the real conversation to show
+    // a weak model what acting looks like. It is gone, for two reasons that
+    // both outlived the local models.
     //
-    // Never on a recall turn. The primer is a FABRICATED conversation -- invented
-    // user lines, invented assistant lines -- and it enters the context in the
-    // same shape as real history. Asked what it knew about the user, the model
-    // read those lines back as things the user had actually said. Every "fact"
-    // it produced that was not in memory.txt came from here.
-    if (!m_noToolModels.contains(m_model) && m_turnNeedsTools && !recallQuestion) {
-        const QJsonArray primer = nikitaPrimer();
-        for (const QJsonValue &v : primer) { messages.append(v); }
-    }
+    // It actively broke tool calling. Measured on the same prompt, twice:
+    // without it the model called host_write correctly; with it, no tool call
+    // at all -- the same 29 tokens generated both times, so the call was
+    // emitted and did not survive the shape it had been taught.
+    //
+    // And it lied. Being a fabricated conversation in the same shape as real
+    // history, a question about what the assistant knew read those invented
+    // lines back as things the user had actually said.
     // Only send a recent window of the conversation to the model. A small model
     // (phi3.5) mimics whatever is nearest in context, so a long history full
     // of earlier mistakes drowns out the primer and it copies its own bad turns.
@@ -3435,12 +3466,96 @@ void NikitaBackend::dispatchToOllama()
         messages.append(m_history.at(i));
     }
 
+    // A message-count window is not a budget. Fourteen short turns and fourteen
+    // turns that each carried a 8000-character host_read result cost wildly
+    // different amounts of context, and only the second kind pushes the system
+    // prompt out of the window -- silently, because llama-server's
+    // --context-shift drops the oldest tokens rather than reporting an error.
+    // So bound it by SIZE as well, dropping from the front and stopping at a
+    // user boundary so a tool_calls -> tool-result pair is never cut in half.
+    {
+        auto msgChars = [](const QJsonValue &v) {
+            return QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact).size();
+        };
+        // Collapse STALE screen reads first. A read_screen result is the whole
+        // 128x64 framebuffer as ASCII -- several KB -- and it is only useful for
+        // the round that read it; the screen has moved on by the next press.
+        // Keeping every one would blow the window on a navigation turn (and cost
+        // real tokens re-sending pictures of menus long gone). So keep only the
+        // MOST RECENT screen in full; every older one becomes a one-line note.
+        {
+            int lastScreen = -1;
+            for (int i = 1; i < messages.size(); ++i) {
+                const QJsonObject o = messages.at(i).toObject();
+                if (o.value(QStringLiteral("role")).toString() == QLatin1String("tool")
+                    && o.value(QStringLiteral("content")).toString()
+                          .contains(QLatin1String("\"screen\":"))) {
+                    lastScreen = i;
+                }
+            }
+            for (int i = 1; i < messages.size(); ++i) {
+                if (i == lastScreen) { continue; }
+                QJsonObject o = messages.at(i).toObject();
+                if (o.value(QStringLiteral("role")).toString() == QLatin1String("tool")
+                    && o.value(QStringLiteral("content")).toString()
+                          .contains(QLatin1String("\"screen\":"))) {
+                    o.insert(QStringLiteral("content"),
+                             QStringLiteral("{\"screen\":\"(an earlier screen, no longer current -- "
+                                            "call read_screen again to see the screen now)\"}"));
+                    messages[i] = o;
+                }
+            }
+        }
+
+        // The system message is index 0 and is not negotiable; everything after
+        // it is the primer plus the conversation window.
+        int convChars = 0;
+        for (int i = 1; i < messages.size(); ++i) { convChars += msgChars(messages.at(i)); }
+
+        const int budgetChars = NIKITA_CONV_TOKEN_BUDGET * 4;   // ~4 chars/token
+        // Never trim below the system message plus the last two: the message
+        // that started this turn, and whatever it is answering. Cutting those
+        // is cutting the question itself.
+        const int kFloor = 3;
+        int dropped = 0;
+        while (convChars > budgetChars && messages.size() > kFloor) {
+            convChars -= msgChars(messages.at(1));
+            messages.removeAt(1);
+            ++dropped;
+        }
+        // Whatever survived must still OPEN on a user turn, or the window can
+        // begin with an orphaned tool result whose assistant tool_calls message
+        // was just dropped -- which some templates render as a call that came
+        // from nowhere. Only ever run after a real trim, so an untouched window
+        // (which starts with the primer) is left exactly as it was built.
+        while (dropped > 0 && messages.size() > kFloor
+               && messages.at(1).toObject().value(QStringLiteral("role")).toString()
+                      != QLatin1String("user")) {
+            convChars -= msgChars(messages.at(1));
+            messages.removeAt(1);
+            ++dropped;
+        }
+
+        nikitaLogAs(assistantName(),
+            QStringLiteral("prompt: conversation=%1 msgs, %2 chars (~%3 tok)%4")
+                .arg(messages.size() - 1).arg(convChars).arg(convChars / 4)
+                .arg(dropped > 0 ? QStringLiteral(" (dropped %1 older msg(s) to fit)").arg(dropped)
+                                 : QString()));
+
+        // What the footer shows while the model is still thinking. A non-streamed
+        // API reply hands back its token usage only at the very end, so without
+        // this the counter sits empty for the whole wait -- which on a 30-second
+        // turn reads as "it is not counting". The system message is index 0 and
+        // the loop above summed only 1.. , so add it back for the estimate.
+        const int estChars = convChars + msgChars(messages.at(0));
+        m_turnPromptEstTok = estChars / 4;   // ~4 chars/token, same rule as the logs
+        emit turnStatusChanged();
+    }
+
     QJsonObject body;
-    body["model"] = m_model;
+    body["model"] = apiModel();
     body["messages"] = messages;
-    // Some models (e.g. Gemma) don't support tool-calling and Ollama 400s the whole
-    // request if `tools` is present -> we drop it for those (see onStreamFinished).
-    if (!m_noToolModels.contains(m_model)) {
+    {
         // Action turns get the full toolset; plain conversation still gets the
         // memory tools so the assistant can learn durable facts as you talk.
         const QSet<QString> allowed = allowedTools();
@@ -3477,18 +3592,22 @@ void NikitaBackend::dispatchToOllama()
                                      QStringLiteral("host_delete"), QStringLiteral("host_move"),
                                      QStringLiteral("host_copy"), QStringLiteral("host_run")};
             } else if (m_turnFocus == 1) {   // plainly the Flipper
-                wanted = QStringList{QStringLiteral("save_file"), QStringLiteral("make_dir"),
-                                     QStringLiteral("delete_file"), QStringLiteral("rename_file"),
-                                     QStringLiteral("run_cli")};
+                // Device control belongs here too, not just file writes: a
+                // "turn off the TV" retry that only offered save_file/run_cli
+                // could never reach ir_universal, which is THE tool for it.
+                wanted = QStringList{QStringLiteral("ir_universal"), QStringLiteral("run_cli"),
+                                     QStringLiteral("press_button"), QStringLiteral("read_screen"),
+                                     QStringLiteral("save_file"), QStringLiteral("make_dir"),
+                                     QStringLiteral("delete_file"), QStringLiteral("rename_file")};
             } else {
-                // Ambiguous. This used to fall through to the device list, which
-                // is how "open safari at andresnicolas.com" ended up calling
-                // run_cli and firing a macOS command at the Flipper's shell.
-                // Offer both, computer first: an unqualified request is far more
-                // often about the machine the user is sitting at.
-                wanted = QStringList{QStringLiteral("host_run"), QStringLiteral("host_write"),
-                                     QStringLiteral("host_mkdir"), QStringLiteral("host_delete"),
-                                     QStringLiteral("save_file"), QStringLiteral("run_cli")};
+                // Ambiguous. Offer the computer's action tools AND the Flipper's
+                // control tools, so a device request that was mis-classified as
+                // ambiguous (e.g. "turn off my tv") still has ir_universal to
+                // reach for instead of being stuck shelling out.
+                wanted = QStringList{QStringLiteral("ir_universal"), QStringLiteral("host_run"),
+                                     QStringLiteral("run_cli"), QStringLiteral("host_write"),
+                                     QStringLiteral("press_button"), QStringLiteral("read_screen"),
+                                     QStringLiteral("save_file")};
             }
             wanted.removeAll(first);
             wanted.prepend(first);
@@ -3518,44 +3637,75 @@ void NikitaBackend::dispatchToOllama()
                    // The model actually SENT, not the one equipped in the modal --
                    // with the dialogue/action split those differ, and a log that
                    // reports the wrong one makes the routing impossible to verify.
-                   QStringLiteral("turn: model=%1 computer=%2 focus=%3 tools=%4 [%5]")
+                   // Count only. The full list used to be printed here and read
+                   // as "it is calling 13 tools" -- it is the menu, not the
+                   // order. What was actually called is logged the moment it
+                   // happens, with its arguments, a few lines below.
+                   QStringLiteral("turn: model=%1 computer=%2 focus=%3 | %4 tools available")
                        .arg(body.value(QStringLiteral("model")).toString(),
                             agentReady() ? QStringLiteral("ON") : QStringLiteral("OFF"),
                             m_turnFocus == 1 ? QStringLiteral("flipper")
                                              : (m_turnFocus == 2 ? QStringLiteral("computer")
                                                                  : QStringLiteral("either")))
-                       .arg(names.size())
-                       .arg(names.join(QLatin1Char(' '))));
+                       .arg(names.size()));
     }
+    // NOTE: the streaming discussion below is kept because it explains a real
+    // failure, but it no longer decides anything -- see body["stream"] at the
+    // bottom of this function, which is false for every turn.
     // Streaming stays on for conversation and comes off whenever tools are
     // attached.
     //
     // The symptom it addresses: a turn reporting eval_count in the twenties --
     // tokens were generated -- coming back with content:"" and no tool_calls at
-    // all. The model emitted a call; Ollama's template parser consumed those
-    // tokens mid-stream and surfaced neither half. Nothing downstream can
+    // all. The model emitted a call and a stream parser consumed those tokens
+    // mid-flight, surfacing neither half. Nothing downstream can
     // recover a call that never arrives, which is why the retry failed
     // identically to the first attempt.
     //
     // The cost is that an action turn no longer types itself out live. Action
     // turns are short and mostly silent anyway.
-    body["stream"] = !body.contains(QStringLiteral("tools"));
-    body["keep_alive"] = -1;
-    // Qwen's own published sampling for qwen3 in thinking mode. The old values
-    // (temperature 0.2 / top_p 0.9) came from keeping phi3.5 on-task, but on a
-    // thinking model a temperature that low drives repetition loops inside the
-    // <think> block -- which costs exactly what we cannot afford here: tokens.
-    body["options"] = QJsonObject{
-        {"num_ctx", NIKITA_NUM_CTX},
-        {"num_predict", NIKITA_NUM_PREDICT},
-        {"temperature", 0.6},
-        {"top_p", 0.95},
-        {"top_k", 20}
-    };
+    // One reply, parsed whole. Streaming here would be Server-Sent Events with
+    // a different framing and per-chunk tool-call assembly, and getting a tool
+    // call half-built is exactly the failure this app spent a week chasing. The
+    // typing effect is worth less than a call that arrives.
+    body["stream"] = false;
+    body["max_tokens"] = NIKITA_API_MAX_TOKENS;
+    // No temperature, no top_p, no top_k. Sent explicitly, kimi-k3 answers
+    // "invalid temperature: only 1 is allowed for this model" and the turn dies
+    // before it starts -- it is a reasoning model and it fixes its own sampling,
+    // the way OpenAI's o-series does. Omitting the fields is better than pinning
+    // them to the one value it accepts today: a number we hardcode is a number
+    // that goes stale, and the server's default is by definition the value the
+    // model was tuned with.
 
-    QNetworkRequest request{QUrl(QString::fromUtf8(NIKITA_URL))};
+    const QString key = apiKey();
+    if (key.isEmpty()) {
+        // Refused here rather than sent and rejected: a 401 from the other end
+        // says "invalid api key", which reads as a wrong key rather than as no
+        // key at all, and sends the user hunting for a typo in something they
+        // never entered.
+        setThinking(false);
+        emit errorOccurred(QStringLiteral(
+            "No API key. Paste one into setup, or export %1 in your shell before launching.")
+            .arg(QLatin1String(NIKITA_API_KEY_ENV)));
+        return;
+    }
+
+    QNetworkRequest request{QUrl(QString::fromUtf8(NIKITA_API_URL))};
     request.setHeader(QNetworkRequest::ContentTypeHeader, QByteArrayLiteral("application/json"));
     request.setTransferTimeout(0);
+    request.setRawHeader(QByteArrayLiteral("Authorization"),
+                         QByteArrayLiteral("Bearer ") + key.toUtf8());
+
+    // The wire format is the last thing that happens to the messages, after
+    // every decision about what goes in them has already been made.
+    body["messages"] = toOpenAiMessages(body.value(QStringLiteral("messages")).toArray());
+
+    nikitaLogAs(assistantName(),
+        QStringLiteral("turn: model=%1 (key from %2) | %3 msgs, %4 tools")
+            .arg(apiModel(), apiKeySource())
+            .arg(body.value(QStringLiteral("messages")).toArray().size())
+            .arg(body.value(QStringLiteral("tools")).toArray().size()));
 
     m_streamBuf.clear();
     m_streamContent.clear();
@@ -3572,63 +3722,87 @@ void NikitaBackend::onStreamData(QNetworkReply *reply)
     if (reply != m_currentReply) { return; }
     m_streamBuf += reply->readAll();
 
-    // A non-streamed reply is a single JSON object with no trailing newline, so
-    // the line loop below would never see a terminator and the whole answer
-    // would sit in the buffer forever. Give it one.
-    if (!m_streamBuf.isEmpty() && !m_streamBuf.contains('\n')
-        && m_streamBuf.trimmed().endsWith('}')) {
-        m_streamBuf += '\n';
+    // Nothing to do until the transfer ends. The API answers with one JSON
+    // document, and a document that arrives in several TCP reads can end on a
+    // '}' that is merely the end of a nested object -- deciding it is complete
+    // here would parse a fragment. onStreamFinished() reads the whole body,
+    // where "complete" is a fact rather than a guess.
+}
+
+// One decoded reply, normalised into the shape the rest of this file reads.
+// Returns true when the turn is finished.
+bool NikitaBackend::consumeModelFrame(const QJsonObject &obj)
+{
+    const QJsonObject msg = obj.value("message").toObject();
+    if (obj.value("done").toBool()) {
+        m_lastRawFrame = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+        // Prompt + generated, summed across every round the turn takes --
+        // one turn can go back to the model three or four times, and the
+        // cost the user is waiting on is the total, not the last leg.
+        m_turnTokens += obj.value(QStringLiteral("prompt_eval_count")).toInt()
+                      + obj.value(QStringLiteral("eval_count")).toInt();
+        // The window budget, spelled out, because for a long time nobody
+        // could see it. The model needs thousands of tokens to think in; if
+        // prompt+reply is crowding num_ctx the oldest tokens are being
+        // dropped, and that shows up as a bad answer rather than as an
+        // error. Logged every round so the prompt trimming can be judged on
+        // numbers instead of impressions.
+        {
+            const int pin  = obj.value(QStringLiteral("prompt_eval_count")).toInt();
+            const int pout = obj.value(QStringLiteral("eval_count")).toInt();
+            const int used = pin + pout;
+            // The scarce thing is money, not window: kimi-k3 holds a million
+            // tokens, so a percentage of the context says nothing, and what
+            // the user actually wants to know is what this turn just cost.
+            // Published rates, per million tokens: $0.30 input on a cache hit,
+            // $3.00 on a miss, $15.00 output.
+            Q_UNUSED(used);
+            const int cached = obj.value(QStringLiteral("cached_tokens")).toInt();
+            const int fresh  = qMax(0, pin - cached);
+            const double usd = (cached * NIKITA_USD_IN_CACHED
+                              + fresh  * NIKITA_USD_IN_FRESH
+                              + pout   * NIKITA_USD_OUT) / 1000000.0;
+            m_turnCostUsd += usd;
+            nikitaLogAs(assistantName(),
+                QStringLiteral("cost: prompt=%1 (%2 cached) reply=%3 -> $%4 this round, "
+                               "$%5 this turn")
+                    .arg(pin).arg(cached).arg(pout)
+                    .arg(usd, 0, 'f', 4).arg(m_turnCostUsd, 0, 'f', 4));
+        }
+        // "length" means the reply hit max_tokens. Whatever prose
+        // survived is a fragment of an unfinished thought, and showing it as
+        // the answer is how "Which config do you mean?" ended up presented as
+        // the result of a file write. Remember it so the reply can say so.
+        m_turnTruncated = obj.value(QStringLiteral("done_reason")).toString()
+                          == QLatin1String("length");
+        emit turnStatusChanged();
     }
 
-    int nl;
-    while ((nl = m_streamBuf.indexOf('\n')) >= 0) {
-        const QByteArray line = m_streamBuf.left(nl).trimmed();
-        m_streamBuf.remove(0, nl + 1);
-        if (line.isEmpty()) { continue; }
-
-        const QJsonObject obj = QJsonDocument::fromJson(line).object();
-        const QJsonObject msg = obj.value("message").toObject();
-        if (obj.value("done").toBool()) {
-            m_lastRawFrame = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
-            // Prompt + generated, summed across every round the turn takes --
-            // one turn can go back to the model three or four times, and the
-            // cost the user is waiting on is the total, not the last leg.
-            m_turnTokens += obj.value(QStringLiteral("prompt_eval_count")).toInt()
-                          + obj.value(QStringLiteral("eval_count")).toInt();
-            // Ollama says "length" when the reply hit num_predict. Whatever prose
-            // survived is a fragment of an unfinished thought, and showing it as
-            // the answer is how "Which config do you mean?" ended up presented as
-            // the result of a file write. Remember it so the reply can say so.
-            m_turnTruncated = obj.value(QStringLiteral("done_reason")).toString()
-                              == QLatin1String("length");
-            emit turnStatusChanged();
-        }
-
-        const QString delta = msg.value("content").toString();
-        if (!delta.isEmpty()) {
-            m_streamContent += delta;
-            // Live typing, except on the first round of a turn that was asked to
-            // DO something and hasn't done it yet.
-            //
-            // That first round is where the model narrates a result it has not
-            // produced -- "The folder PAULA has been created" arrives on screen
-            // letter by letter while the folder does not exist, and only some
-            // seconds later does the retry run and the text get replaced. For
-            // those seconds the user has been told something false and may act
-            // on it. Once a tool has actually run, there is nothing left to
-            // invent and the typing resumes.
-            if (!m_turnWasFileAction || m_turnRanAnyTool) {
-                emit partialReceived(m_streamContent);
-            }
-        }
-        const QJsonArray tc = msg.value("tool_calls").toArray();
-        for (const QJsonValue &v : tc) { m_streamTools.append(v); }
-
-        if (obj.value("done").toBool()) {
-            finalizeStream();
-            return;
+    const QString delta = msg.value("content").toString();
+    if (!delta.isEmpty()) {
+        m_streamContent += delta;
+        // Live typing, except on the first round of a turn that was asked to
+        // DO something and hasn't done it yet.
+        //
+        // That first round is where the model narrates a result it has not
+        // produced -- "The folder PAULA has been created" arrives on screen
+        // letter by letter while the folder does not exist, and only some
+        // seconds later does the retry run and the text get replaced. For
+        // those seconds the user has been told something false and may act
+        // on it. Once a tool has actually run, there is nothing left to
+        // invent and the typing resumes.
+        if (!m_turnWasFileAction || m_turnRanAnyTool) {
+            emit partialReceived(m_streamContent);
         }
     }
+    const QJsonArray tc = msg.value("tool_calls").toArray();
+    for (const QJsonValue &v : tc) { m_streamTools.append(v); }
+
+    if (obj.value("done").toBool()) {
+        finalizeStream();
+        return true;
+    }
+    return false;
 }
 
 // The one tool a forced retry offers. Picked from the machine the turn is about,
@@ -3710,15 +3884,6 @@ QString NikitaBackend::forcedToolName() const
     return host ? QStringLiteral("host_write") : QStringLiteral("save_file");
 }
 
-// The tool trail (m_turnProgress, one "· <headline>" line per completed
-// call this turn) only ever reached the screen via partialReceived, which
-// QML treats as a live-typing preview: the moment the model's own text
-// starts streaming over the same bubble, or replyReceived finalizes it, the
-// trail is gone. Folding it into the text that actually gets saved and
-// re-shown means scrolling back still shows what ran, not just what Nikita
-// said about it -- the whole point of asking for this to read more like a
-// CLI transcript. A no-tool turn leaves m_turnProgress empty, so this is a
-// no-op for plain conversation.
 // The second factor. Everything else this class believes about a turn comes
 // from the model; this comes from the filesystem.
 //
@@ -3819,23 +3984,23 @@ void NikitaBackend::emitReply(const QString &text)
     // of relaying the fragment -- especially after tools ran, where the trail
     // above already reports what really happened.
     const QString body = m_turnTruncated
-        ? (m_turnProgress.isEmpty()
+        ? (m_turnToolsRan.isEmpty()
              ? QStringLiteral("I ran out of room before finishing that thought. "
                               "Ask me again, or in smaller steps.")
              : QStringLiteral("That is what ran. I hit my token limit before I could "
                               "write the summary."))
         : text;
 
-    if (m_turnProgress.isEmpty()) {
-        emit replyReceived(body.trimmed().isEmpty() ? done
-                                                    : body + QStringLiteral("\n") + done);
-        return;
-    }
-    // An empty body is the verified-close path: the trail already said it all,
-    // so there is nothing to hang under it.
-    emit replyReceived(body.trimmed().isEmpty()
-                           ? m_turnProgress + done
-                           : m_turnProgress + done + QStringLiteral("\n") + body);
+    // The trail is not folded in here any more. It used to be, because the only
+    // way it reached the screen was partialReceived -- a live preview that the
+    // model's own text overwrote the moment it started streaming. Now every call
+    // owns a real row in the chat that outlives the turn, so folding the same
+    // lines into the reply would print each of them twice.
+    //
+    // An empty body after tools ran is the verified-close path: the rows above
+    // already said it all, and there is nothing to hang under them.
+    emit replyReceived(body.trimmed().isEmpty() ? done
+                                                : body + QStringLiteral("\n") + done);
 }
 
 void NikitaBackend::finalizeStream()
@@ -3907,7 +4072,7 @@ void NikitaBackend::finalizeStream()
         });
         m_toolRounds++;
         m_currentReply = nullptr;     // this reply is done; ignore its finished()
-        runToolCalls(toolCalls, 0);   // -> dispatchToOllama() again (new reply)
+        runToolCalls(toolCalls, 0);   // -> dispatchTurn() again (new reply)
         return;
     }
 
@@ -4033,7 +4198,7 @@ void NikitaBackend::finalizeStream()
     //
     // falseClaim is the model describing something it did not do. saidNothing is
     // the model producing nothing whatsoever -- no words, no call -- which
-    // happens when Ollama's parser eats a malformed tool call, and used to reach
+    // happens when a malformed tool call is eaten in parsing, and used to reach
     // the user as the word "Done."
     //
     // saidNothing matters most because it needs no keyword list to detect. The
@@ -4054,16 +4219,13 @@ void NikitaBackend::finalizeStream()
         // without lifting this would hand it the same empty toolbox and get the
         // same answer.
         m_turnNeedsTools = true;
-        // The chat has shown nothing at all this turn (live typing was held
-        // back), so say what is happening rather than leaving a blank pane
-        // through a second round of inference.
-        // What the USER sees. The turn is not over and the next item is still
-        // outstanding -- that is a continuation, and phrasing it as a stumble
-        // just makes a working process look broken.
-        emit partialReceived(missingArtifacts.isEmpty()
-                             ? QStringLiteral("continuing...")
-                             : QStringLiteral("continuing -- %1 next...")
-                               .arg(missingArtifacts.first()));
+        // Nothing is pushed into the chat body between rounds any more. This
+        // used to emit a "continuing..." bubble to fill the pause before the
+        // next round, from back when a held-back turn left the pane blank. The
+        // footer now carries the live state -- elapsed, tokens, "thinking" --
+        // and every tool has its own row, so a placeholder line in the
+        // transcript is just noise the user asked to be rid of. The footer
+        // keeps moving; the conversation stays clean.
 
         // What the RETRY is told. Pointing at a guessed tool is what made this
         // loop six times: the request said "create a folder", so the guess was
@@ -4214,49 +4376,6 @@ void NikitaBackend::finalizeStream()
     emitReply(text);   // QML finalizes the live bubble
 }
 
-// Ollama puts the REAL reason for a failure in the body as {"error": "..."} --
-// even on a 500, where Qt only hands us "Internal Server Error", which tells the
-// user nothing. Dig the real message out and turn the common failures into
-// something actionable instead of a raw transfer error.
-static QString friendlyOllamaError(const QByteArray &body, const QString &model, const QString &fallback)
-{
-    QString raw;
-    // Body is either a bare error object or NDJSON with the error on some line.
-    const auto lines = body.split('\n');
-    for (const QByteArray &line : lines) {
-        const auto doc = QJsonDocument::fromJson(line.trimmed());
-        if (doc.isObject() && doc.object().contains(QStringLiteral("error"))) {
-            raw = doc.object().value(QStringLiteral("error")).toString();
-            break;
-        }
-    }
-    if (raw.isEmpty()) {
-        return fallback;  // nothing parseable -- keep Qt's own message
-    }
-
-    const QString low = raw.toLower();
-
-    // The common one on modest machines: the model doesn't fit in RAM/VRAM.
-    if (low.contains(QStringLiteral("system memory")) || low.contains(QStringLiteral("out of memory"))
-        || low.contains(QStringLiteral("insufficient memory")) || low.contains(QStringLiteral("cudamalloc"))) {
-        return QStringLiteral("%1 needs more memory than you have free. Close some apps and try again "
-                              "— qwen3:4b is the only model I run, so there's nothing smaller to switch to. "
-                              "(Ollama said: %2)")
-                .arg(model, raw);
-    }
-    // Model was never pulled.
-    if (low.contains(QStringLiteral("not found"))) {
-        return QStringLiteral("the model %1 isn't downloaded yet. Open the model manager (gear icon) and "
-                              "hit Install next to it, then poke me again.").arg(model);
-    }
-    // Tools: we already retry tools-less once; if we still land here, say so plainly.
-    if (low.contains(QStringLiteral("tool"))) {
-        return QStringLiteral("%1 can't use my Flipper tools. Chat still works. If this is a leftover "
-                              "model, open the model manager (gear icon) and install qwen3:4b. "
-                              "(Ollama said: %2)").arg(model, raw);
-    }
-    return QStringLiteral("Ollama said: %1").arg(raw);
-}
 
 void NikitaBackend::onStreamFinished(QNetworkReply *reply)
 {
@@ -4267,25 +4386,64 @@ void NikitaBackend::onStreamFinished(QNetworkReply *reply)
     m_currentReply = nullptr;
     const auto netErr = reply->error();
     const QString netErrStr = reply->errorString();
-    const QByteArray errBody = m_streamBuf + reply->readAll();  // Ollama's error JSON lands here on a 4xx
+    // The whole reply, accumulated by onStreamData without being parsed. On an
+    // error this is the API's own error document, which is where the useful
+    // reason lives -- Qt's status line only ever says "server replied: ...".
+    const QByteArray fullBody = m_streamBuf + reply->readAll();
+    // Read before the reply is retired: 401, 402 and 429 are three completely
+    // different things to tell someone, and errorString() does not reliably
+    // carry the number.
+    const int httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    // The server's own "wait this long" for a 429, in seconds. Preferred over a
+    // guessed backoff whenever it is present.
+    const QByteArray retryAfter = reply->rawHeader(QByteArrayLiteral("Retry-After"));
     reply->deleteLater();
 
-    // Non-tool models (Gemma, etc.) make Ollama 400 the whole request because we
-    // send a `tools` array. Remember it and retry once WITHOUT tools, so the model
-    // still works as a chat-only companion (it just can't drive the Flipper).
-    if (netErr != QNetworkReply::NoError && errBody.contains("does not support tools")
-        && !m_noToolModels.contains(m_model)) {
-        m_noToolModels << m_model;
-        dispatchToOllama();   // re-send tools-less (dispatch now skips them for this model)
+    // A 429 is a per-minute throttle, not a failure of this request -- the same
+    // bytes will go through once the window rolls over. So ride it out here
+    // instead of surfacing it: wait (the server's Retry-After if it gave one,
+    // otherwise a widening backoff) and send the exact same turn again. Bounded,
+    // because if the account's tier is simply too low no amount of waiting fixes
+    // it, and an unbounded retry would just hang forever looking busy.
+    if (httpStatus == 429 && netErr != QNetworkReply::NoError
+        && m_apiRateRetry < NIKITA_API_MAX_RATE_RETRIES) {
+        m_apiRateRetry++;
+        int waitMs = 0;
+        bool ok = false;
+        const int hinted = QString::fromLatin1(retryAfter).trimmed().toInt(&ok);
+        if (ok && hinted > 0) {
+            waitMs = hinted * 1000;
+        } else {
+            // 5s, 12s, 25s, 40s. The account's real ceiling is huge (Tier2:
+            // 3M TPM, 500 RPM), so a 429 here is not us exhausting a quota -- it
+            // is a short burst throttle, or the kimi-k3 preview's own tighter
+            // cap. Those clear in seconds, so lead with a short wait; the longer
+            // steps are only there for a rare stubborn stretch. Retry-After is
+            // honoured above whenever the server sends it. The footer shows
+            // "rate limited, waiting" with STOP available throughout.
+            static const int backoff[] = { 5000, 12000, 25000, 40000 };
+            const int idx = qBound(0, m_apiRateRetry - 1, 3);
+            waitMs = backoff[idx];
+        }
+        nikitaLogAs(assistantName(),
+            QStringLiteral("rate limited (429) -- retry %1/%2 in %3s%4")
+                .arg(m_apiRateRetry).arg(NIKITA_API_MAX_RATE_RETRIES).arg(waitMs / 1000)
+                .arg(ok ? QStringLiteral(" (server asked)") : QString()));
+        // Keep thinking true and the footer alive; say what is happening there
+        // rather than in the chat body.
+        setTurnStatus(QStringLiteral("rate limited, waiting"));
+        QTimer::singleShot(waitMs, this, [this]() {
+            if (m_thinking) { dispatchTurn(); }   // same turn, rebuilt from history
+        });
         return;
     }
 
     setThinking(false);
-    // stopThinking() aborted this reply on purpose -- that's a stop, not a
-    // network failure, and it gets its own path so the generic error message
-    // below never shows for it. Whatever the model had already streamed
-    // stays on screen, the same way interrupting a response works elsewhere:
-    // stopping mid-answer doesn't erase the part that already arrived.
+
+    // stopThinking() aborted this on purpose -- that is a stop, not a failure,
+    // and it is checked before anything else so the error paths below can never
+    // claim it. Whatever had already arrived stays on screen, the same way
+    // interrupting a response works everywhere else.
     if (m_userStoppedThinking) {
         m_userStoppedThinking = false;
         if (!m_streamContent.trimmed().isEmpty()) {
@@ -4298,23 +4456,59 @@ void NikitaBackend::onStreamFinished(QNetworkReply *reply)
         }
         return;
     }
-    if (netErr != QNetworkReply::NoError) {
-        QString msg;
-        if (netErr == QNetworkReply::ConnectionRefusedError || netErr == QNetworkReply::HostNotFoundError) {
-            msg = QStringLiteral("my brain (Ollama) isn't awake. Start the Ollama app, then try again.");
-        } else {
-            // Ollama's actual reason is in the body, not in Qt's status line.
-            msg = friendlyOllamaError(errBody, m_model, netErrStr);
+
+    if (netErr == QNetworkReply::NoError) {
+        const QJsonObject resp = QJsonDocument::fromJson(fullBody).object();
+        if (resp.value(QStringLiteral("choices")).toArray().isEmpty()) {
+            // 200 with no choices is not success. Say what came back rather
+            // than falling through to "lost the thread", which blames the model
+            // for something the endpoint did.
+            const QString why = resp.value(QStringLiteral("error")).toObject()
+                                    .value(QStringLiteral("message")).toString();
+            emit errorOccurred(QStringLiteral("The API answered with nothing usable%1")
+                                   .arg(why.isEmpty() ? QStringLiteral(".")
+                                                      : QStringLiteral(": ") + why));
+            return;
         }
-        emit errorOccurred(QStringLiteral("Hrm: %1").arg(msg));
-    } else if (!m_streamContent.isEmpty()) {
-        const QString text = stripNonEnglish(m_streamContent);
-        m_history.append(QJsonObject{{"role", "assistant"}, {"content", text}});
-        saveHistory();
-        emitReply(text);
-    } else {
-        emit errorOccurred(QStringLiteral("...(%1 lost the thread there. Say that again?)").arg(assistantName()));
+        // A clean round means the throttle has passed; the next 429 this turn
+        // gets its full retry budget again.
+        m_apiRateRetry = 0;
+        // setThinking(false) above is undone here: the turn is not over if the
+        // reply carried tool calls, and consumeModelFrame -> finalizeStream is
+        // what decides that.
+        consumeModelFrame(normaliseApiReply(resp));
+        return;
     }
+
+    // The ones that actually happen, named in the user's own terms. "invalid
+    // api key" on an account with no credit sends people off to regenerate a
+    // key that was never the problem.
+    const QString detail = QJsonDocument::fromJson(fullBody).object()
+                               .value(QStringLiteral("error")).toObject()
+                               .value(QStringLiteral("message")).toString();
+    QString msg;
+    if (httpStatus == 401 || httpStatus == 403 || fullBody.contains("invalid_api_key")
+        || fullBody.contains("Invalid Authentication")) {
+        msg = QStringLiteral("the API rejected the key (read from %1). Check it in setup.")
+                  .arg(apiKeySource().isEmpty() ? QStringLiteral("nowhere") : apiKeySource());
+    } else if (httpStatus == 402 || fullBody.contains("insufficient")
+               || fullBody.contains("quota")) {
+        msg = QStringLiteral("the account is out of credit.");
+    } else if (httpStatus == 429) {
+        msg = QStringLiteral("still rate limited after %1 retries. Your account's per-minute "
+                             "limit is the ceiling here, not your balance -- wait a minute, or "
+                             "raise the limit in the Kimi console.").arg(NIKITA_API_MAX_RATE_RETRIES);
+    } else if (netErr == QNetworkReply::HostNotFoundError
+               || netErr == QNetworkReply::ConnectionRefusedError
+               || netErr == QNetworkReply::TimeoutError) {
+        msg = QStringLiteral("can't reach the API -- check the network.");
+    } else {
+        // Whatever the endpoint said, verbatim. "invalid temperature: only 1 is
+        // allowed for this model" is a far better bug report than any sentence
+        // this function could invent for it.
+        msg = detail.isEmpty() ? netErrStr : detail;
+    }
+    emit errorOccurred(QStringLiteral("Hrm: %1").arg(msg));
 }
 
 // Which tool names actually count as having performed each kind of action. A
@@ -4360,6 +4554,17 @@ bool NikitaBackend::claimsUnrunAction(const QString &reply, QStringList *missing
         QStringLiteral("created"), QStringLiteral("wrote"), QStringLiteral("written"),
         QStringLiteral("saved"), QStringLiteral("added"), QStringLiteral("placed"),
         QStringLiteral("put "), QStringLiteral("generated"),
+        // Claims of EXISTENCE, not just of creation. The model dodged every one
+        // of the verbs above by writing "the BadUSB script is already at
+        // /ext/badusb/fib_alert.txt" -- asserting the file was there (from an
+        // earlier turn it imagined) without ever calling save_file this turn.
+        // A claim that the deliverable exists is as checkable as a claim that it
+        // was made, and the name-by-name test below catches the lie either way.
+        QStringLiteral("already at"), QStringLiteral("already exists"),
+        QStringLiteral("already there"), QStringLiteral("already on"),
+        QStringLiteral("is saved"), QStringLiteral("is ready"), QStringLiteral("is on the flipper"),
+        QStringLiteral("is on your flipper"), QStringLiteral("sitting at"),
+        QStringLiteral("lives at"), QStringLiteral("is in place"),
     };
     bool saysMade = false;
     for (const QString &w : madeWords) { if (low.contains(w)) { saysMade = true; break; } }
@@ -4551,11 +4756,16 @@ void NikitaBackend::runToolCalls(const QJsonArray &toolCalls, int index)
     // after, so the window changes the moment the work changes.
     setTurnStatus(nikitaToolStatus(name));
 
-    // And a line in the trail the moment it STARTS. Until now the trail only
-    // grew when a tool FINISHED, so a slow call (a shell command, a write over
-    // USB) left the chat showing nothing at all while it ran.
-    m_turnProgress += QStringLiteral("\u00b7 %1\u2026  \n").arg(nikitaToolStatus(name));
-    emit partialReceived(m_turnProgress);
+    // A line in the chat the moment it STARTS. Until this existed the trail
+    // only grew when a tool FINISHED, so a slow call (a shell command, a write
+    // over USB) left the chat showing nothing at all while it ran.
+    //
+    // Its own row, with its own id, and not text folded into the reply bubble:
+    // a step that is running and the same step once it is done are one event
+    // that changes, and the row is rewritten in place when the result lands.
+    m_activeToolSeq = ++m_toolSeq;
+    emit toolActivity(m_activeToolSeq, nikitaToolStatus(name),
+                      nikitaToolDetail(name, args), false, false);
 
     runOneTool(name, args, [this, toolCalls, index, name, args](const QString &result) {
         // Remember if a tool failed this turn. Small models cheerfully report
@@ -4725,6 +4935,115 @@ static QString nikitaToolHeadline(const QString &tool, const QString &result)
     return tool;
 }
 
+// Turn the Flipper's raw framebuffer into something the model can READ. The
+// screen is 1 bit per pixel, packed the way u8g2 packs it: byte index
+// (y/8)*width + x, bit y%8 (see ScreenCanvas::setFrame, the app's own decoder).
+//
+// Out comes an ASCII picture at real pixel scale -- a set pixel is '#', a clear
+// one a space -- so the model reads the menu text off the letter shapes with no
+// font atlas. Plus one structural note: the Flipper draws the SELECTED list row
+// as a filled bar with the text knocked out, so a band of near-full scan-lines
+// marks what is currently chosen.
+// Parse a Flipper .ir universal asset and build the `ir tx` command line for
+// every PARSED signal whose name matches the requested button. This is what
+// makes "fire the universal TV power" a single deterministic CLI action instead
+// of menu navigation: the asset is just named signals, and each parsed one maps
+// straight onto `ir tx <protocol> <address> <command>` (the safe CLI form).
+//
+// The .ir stores address/command as 4 little-endian hex bytes; the CLI wants the
+// value, so the bytes are folded LE into a number and printed as hex. Raw signals
+// are skipped -- txing raw over the CLI is a different, fiddly format -- and their
+// count is reported so the caller knows some codes were not sent.
+static QStringList nikitaIrTxCommandsFor(const QString &irFile, const QString &button,
+                                         int *rawSkipped)
+{
+    QStringList cmds;
+    if (rawSkipped) { *rawSkipped = 0; }
+    const QString want = button.trimmed().toLower();
+
+    QString name, type, protocol, address, command;
+    auto flush = [&]() {
+        const bool match = name.trimmed().toLower() == want
+                        || name.trimmed().toLower().replace(QLatin1Char(' '), QLatin1Char('_')) == want;
+        if (match && !type.isEmpty()) {
+            if (type.trimmed().toLower() == QLatin1String("parsed") && !protocol.isEmpty()) {
+                auto le = [](const QString &bytes) -> QString {
+                    const QStringList b = bytes.trimmed().split(QRegularExpression(QStringLiteral("\\s+")),
+                                                                Qt::SkipEmptyParts);
+                    quint32 v = 0; int sh = 0;
+                    for (const QString &one : b) { v |= (one.toUInt(nullptr, 16) & 0xFF) << sh; sh += 8; }
+                    return QStringLiteral("%1").arg(v, 0, 16);
+                };
+                cmds << QStringLiteral("ir tx %1 %2 %3")
+                            .arg(protocol.trimmed(), le(address), le(command));
+            } else if (rawSkipped) {
+                ++(*rawSkipped);
+            }
+        }
+        name.clear(); type.clear(); protocol.clear(); address.clear(); command.clear();
+    };
+
+    const QStringList lines = irFile.split(QLatin1Char('\n'));
+    for (const QString &raw : lines) {
+        const QString line = raw.trimmed();
+        if (line.startsWith(QLatin1Char('#'))) { flush(); continue; }
+        const int c = line.indexOf(QLatin1Char(':'));
+        if (c < 0) { continue; }
+        const QString k = line.left(c).trimmed().toLower();
+        const QString v = line.mid(c + 1).trimmed();
+        if (k == QLatin1String("name"))          { flush(); name = v; }
+        else if (k == QLatin1String("type"))     { type = v; }
+        else if (k == QLatin1String("protocol")) { protocol = v; }
+        else if (k == QLatin1String("address"))  { address = v; }
+        else if (k == QLatin1String("command"))  { command = v; }
+    }
+    flush();
+    return cmds;
+}
+
+static QString nikitaRenderScreen(const ScreenFrame &f)
+{
+    const int w = f.size.width();
+    const int h = f.size.height();
+    if (w <= 0 || h <= 0 || f.pixelData.isEmpty()) { return QString(); }
+
+    auto on = [&](int x, int y) -> bool {
+        const int i = (y / 8) * w + x;
+        if (i < 0 || i >= f.pixelData.size()) { return false; }
+        return (static_cast<unsigned char>(f.pixelData.at(i)) >> (y % 8)) & 1;
+    };
+
+    QVector<int> rowFill(h, 0);
+    for (int y = 0; y < h; ++y) {
+        int c = 0;
+        for (int x = 0; x < w; ++x) { if (on(x, y)) { ++c; } }
+        rowFill[y] = c;
+    }
+    int hlTop = -1, hlBot = -1;
+    for (int y = 0; y < h; ++y) {
+        if (rowFill[y] > w * 6 / 10) { if (hlTop < 0) { hlTop = y; } hlBot = y; }
+    }
+
+    QString ascii;
+    ascii.reserve((w + 1) * h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) { ascii += on(x, y) ? QLatin1Char('#') : QLatin1Char(' '); }
+        ascii += QLatin1Char('\n');
+    }
+
+    QString out = QStringLiteral("Flipper screen, %1x%2. Read the text from the block art below "
+                                 "('#' = a lit pixel). ").arg(w).arg(h);
+    if (hlTop >= 0) {
+        out += QStringLiteral("The SELECTED/highlighted item is inside the filled bar at vertical "
+                              "pixels %1-%2 -- its text shows as the letters knocked out (spaces) of "
+                              "that solid band. ").arg(hlTop).arg(hlBot);
+    } else {
+        out += QStringLiteral("No highlighted selection bar detected this frame. ");
+    }
+    out += QStringLiteral("\n\n") + ascii;
+    return out;
+}
+
 void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std::function<void(const QString &)> done)
 {
     // Every action the assistant takes is logged here rather than inside each
@@ -4825,8 +5144,15 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
     // disk reachable, "what did it look at" is as much a part of the trail as
     // "what did it change" -- and the trail is the only way to answer that
     // afterwards.
-    const bool isHost = name.startsWith(QLatin1String("host_"));
-    if (kLoggedTools.contains(name) || isHost) {
+    // EVERY call, not just the ones that change something. The log used to skip
+    // read-only lookups as noise, which meant the one question the log exists to
+    // answer -- what did it actually do, and with what -- had a hole in it for
+    // half the tool surface. Reads on this computer were already logged for that
+    // reason; the Flipper's reads deserve the same.
+    {
+        // Still needed after the log gate went away: the chat mirror below is
+        // for host actions only, not for every Flipper read.
+        const bool isHost = name.startsWith(QLatin1String("host_"));
         QStringList bits;
         for (auto it = args.begin(); it != args.end(); ++it) {
             QString v = it.value().toVariant().toString().simplified();
@@ -4834,27 +5160,30 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             if (v.size() > 60) { v = v.left(60) + QStringLiteral("...(%1 chars)").arg(it.value().toString().size()); }
             bits << QStringLiteral("%1=%2").arg(it.key(), v);
         }
-        const QString line = QStringLiteral("%1 %2").arg(name, bits.join(QLatin1String(", ")));
+        // Arrow in, arrow out: the call and its answer read as a pair even when
+        // several are interleaved in one turn.
+        const QString line = QStringLiteral("\u2192 %1(%2)").arg(name, bits.join(QLatin1String(", ")));
         nikitaLogAs(assistantName(), line);
         // Wrap the callback so the ANSWER is logged too. Knowing a write was
         // attempted is half the story; the other half is whether the tool came
         // back with a path or with an error, and that half was invisible.
         auto inner = done;
         const QJsonObject learnArgs = args;
-        done = [this, name, learnArgs, inner](const QString &result) {
+        // By value. This lambda runs when the tool answers, and by then the
+        // next call in the batch may already have opened a row of its own.
+        const int seq = m_activeToolSeq;
+        done = [this, name, learnArgs, inner, seq](const QString &result) {
             nikitaLogAs(assistantName(),
-                       QStringLiteral("  -> %1: %2").arg(name, result.left(300)));
-            // Into the chat before the model has written a word about it.
-            // Replace the "started" line rather than stacking a second one:
-            // the trail should read as a list of what happened, not as every
-            // state each step passed through.
-            const int lastNl = m_turnProgress.lastIndexOf(QLatin1Char('\n'),
-                                   m_turnProgress.size() - 2);
-            if (m_turnProgress.endsWith(QStringLiteral("\u2026  \n"))) {
-                m_turnProgress.truncate(lastNl < 0 ? 0 : lastNl + 1);
-            }
-            m_turnProgress += QStringLiteral("\u00b7 %1  \n").arg(nikitaToolHeadline(name, result));
-            emit partialReceived(m_turnProgress);
+                       QStringLiteral("\u2190 %1: %2").arg(name, result.left(300)));
+            // Into the chat before the model has written a word about it, and
+            // into the SAME row the start opened -- the trail reads as a list
+            // of what happened, not as every state each step passed through.
+            // Parsed, not substring-matched: a host_read of a log file full of
+            // the word "error" is a successful read.
+            const QJsonObject parsed = QJsonDocument::fromJson(result.toUtf8()).object();
+            const bool failed = parsed.contains(QStringLiteral("error"));
+            emit toolActivity(seq, nikitaToolHeadline(name, result),
+                              nikitaToolDetail(name, learnArgs), true, failed);
             // Learn only from proof -- but QUEUE the lesson, do not write it yet.
             //
             // Recording it here, between one tool and the next, broke multi-step
@@ -4870,7 +5199,18 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             // asked what to do next.
             //
             // Queued here, flushed once the turn is genuinely over.
-            if (nikitaResultProves(result)) { m_pendingMoves.append(qMakePair(name, learnArgs)); }
+            // press_button and read_screen are NEVER recorded as reusable moves.
+            // A button sequence only reproduces from the EXACT screen it started
+            // on -- replayed from anywhere else it lands somewhere random (the
+            // "ok on Sub-GHz instead of Infrared" failure). Storing it as "this
+            // works for that request" is worse than storing nothing: it teaches a
+            // sequence that will not repeat. Navigation is decided live from the
+            // screen, not from memory.
+            const bool positionDependent = (name == QLatin1String("press_button")
+                                          || name == QLatin1String("read_screen"));
+            if (nikitaResultProves(result) && !positionDependent) {
+                m_pendingMoves.append(qMakePair(name, learnArgs));
+            }
             if (inner) { inner(result); }
         };
         // Host actions also surface in the chat itself. The log panel is where
@@ -4996,13 +5336,117 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             done(QStringLiteral("{\"error\":\"CLI not available\"}"));
             return;
         }
+        // Refuse commands known to crash the firmware, BEFORE they reach the
+        // device. `ir universal ...` over the CLI faults stock firmware (NULL
+        // deref -> reboot), and a crash the user sees on the Flipper reads as
+        // "it didn't work" even when the intent was fine. Blocking it here means
+        // the device never crashes and the model falls back to the safe path
+        // (navigate the Infrared app by button, or `ir tx` a known code).
+        if (command.contains(QRegularExpression(QStringLiteral("^\\s*ir\\s+universal\\b"),
+                                                QRegularExpression::CaseInsensitiveOption))) {
+            done(QStringLiteral("{\"error\":\"`ir universal` crashes this firmware and reboots "
+                "the Flipper -- not run. Do NOT send it. To fire a universal TV remote, navigate the "
+                "Infrared app by button (Infrared -> Universal Remotes -> TVs), or send a known code "
+                "with `ir tx <protocol> <address> <command>`, or play a saved .ir file.\"}"));
+            return;
+        }
         // Isolated one-shot: pauses RPC, runs the command, hands RPC back.
-        m_cli->runOneShot(command, [done](bool ok, QString out) {
+        m_cli->runOneShot(command, [this, done](bool ok, QString out) {
             QJsonObject r;
-            if (ok) { r["output"] = out; }
-            else    { r["error"]  = out; }
+            if (ok) {
+                r["output"] = out;
+                // Same as host_run: remember a clean result so a later save can
+                // pull it in via {{LAST_RESULT}} rather than the model retyping.
+                const QString trimmed = out.trimmed();
+                m_lastRunOutput = (trimmed.size() <= 4096) ? trimmed : QString();
+            } else {
+                r["error"]  = out;
+            }
             done(QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
         });
+
+    } else if (name == QLatin1String("ir_universal")) {
+        const QString remote = args.value("remote").toString().trimmed().toLower();
+        QString button = args.value("button").toString().trimmed();
+        if (button.isEmpty()) { button = QStringLiteral("Power"); }
+        static const QStringList known = {QStringLiteral("tv"), QStringLiteral("ac"),
+            QStringLiteral("audio"), QStringLiteral("projector")};
+        if (!known.contains(remote)) {
+            done(QStringLiteral("{\"error\":\"unknown remote '%1' (use tv/ac/audio/projector)\"}").arg(remote));
+            return;
+        }
+        if (!m_cli) { done(QStringLiteral("{\"error\":\"CLI not available\"}")); return; }
+        const QByteArray irPath = QStringLiteral("/ext/infrared/assets/%1.ir").arg(remote).toUtf8();
+        QBuffer *buf = new QBuffer(this);
+        buf->open(QIODevice::ReadWrite);
+        auto *op = dev->rpc()->storageRead(irPath, buf);
+        connect(op, &AbstractOperation::finished, this, [this, op, buf, remote, button, done]() {
+            if (op->isError()) {
+                done(QStringLiteral("{\"error\":\"couldn't read the universal %1 remote: %2\"}")
+                         .arg(remote, op->errorString()));
+                buf->deleteLater();
+                return;
+            }
+            const QString content = QString::fromUtf8(buf->data());
+            buf->deleteLater();
+            int rawSkipped = 0;
+            auto cmds = std::make_shared<QStringList>(
+                nikitaIrTxCommandsFor(content, button, &rawSkipped));
+            if (cmds->isEmpty()) {
+                done(QStringLiteral("{\"error\":\"no sendable '%1' codes in the %2 universal remote "
+                     "(%3 raw-only codes skipped)\"}").arg(button, remote).arg(rawSkipped));
+                return;
+            }
+            // Chain the transmits: one ir tx at a time, next only after the last
+            // finished, so the CLI one-shot is never re-entered. This is the
+            // brute-force the universal remote does -- every brand's code, in turn.
+            auto idx = std::make_shared<int>(0);
+            auto sent = std::make_shared<int>(0);
+            auto total = cmds->size();
+            auto rawCount = std::make_shared<int>(rawSkipped);
+            std::shared_ptr<std::function<void()>> step = std::make_shared<std::function<void()>>();
+            *step = [this, cmds, idx, sent, total, rawCount, remote, button, done, step]() {
+                if (*idx >= cmds->size()) {
+                    done(QStringLiteral("{\"sent\":%1,\"button\":\"%2\",\"remote\":\"%3\","
+                         "\"note\":\"transmitted %1 %2 code(s) for %3 -- every brand in the "
+                         "universal set%4. If the TV did not respond, it may use a code not in the "
+                         "set.\"}")
+                        .arg(*sent).arg(button, remote)
+                        .arg(*rawCount > 0 ? QStringLiteral(" (%1 raw code(s) not sendable via CLI)")
+                                                 .arg(*rawCount) : QString()));
+                    return;
+                }
+                const QString cmd = cmds->at((*idx)++);
+                m_cli->runOneShot(cmd, [sent, step](bool ok, QString) {
+                    if (ok) { ++(*sent); }
+                    (*step)();
+                });
+            };
+            (*step)();
+        });
+
+    } else if (name == QLatin1String("read_screen")) {
+        auto *ss = m_appBackend ? m_appBackend->screenStreamer() : nullptr;
+        if (!ss) { done(QStringLiteral("{\"error\":\"no screen stream available\"}")); return; }
+        // Make sure the stream is live. It usually is (the app mirrors the
+        // screen), but if it was paused/stopped the frame is stale or empty --
+        // enable it and give it a beat to arrive before reading.
+        if (!ss->isEnabled()) { ss->setEnabled(true); }
+        auto grab = [this, ss, done]() {
+            const QString rendered = nikitaRenderScreen(ss->screenFrame());
+            if (rendered.isEmpty()) {
+                done(QStringLiteral("{\"error\":\"the screen is not readable right now -- the "
+                                    "stream may still be starting; try read_screen again in a moment\"}"));
+                return;
+            }
+            // The render is plain text with newlines; wrap it as a JSON string
+            // safely (paths/art can contain characters that break hand-built JSON).
+            const QJsonObject o{{QStringLiteral("screen"), rendered}};
+            done(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+        };
+        // A frame already in hand -> read now; otherwise wait briefly for one.
+        if (!ss->screenFrame().pixelData.isEmpty()) { grab(); }
+        else { QTimer::singleShot(350, this, grab); }
 
     } else if (name == QLatin1String("press_button")) {
         const QString b = args.value("button").toString().toLower();
@@ -5032,8 +5476,25 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             lastOp = rpc->guiSendInput(key, InputEvent::Release);
         }
         if (lastOp) {
-            connect(lastOp, &AbstractOperation::finished, this, [b, times, done]() {
-                done(QStringLiteral("{\"pressed\":\"%1\",\"times\":%2}").arg(b).arg(times));
+            connect(lastOp, &AbstractOperation::finished, this, [this, b, times, done]() {
+                // Hand back the RESULTING screen with the press. This is what
+                // makes navigation reliable without the model having to remember
+                // to call read_screen: it SEES where each press landed and picks
+                // the next move from that. A short wait lets the screen redraw
+                // after the input before we capture it. Old screens collapse to a
+                // placeholder in the window (see dispatchTurn), so this does not
+                // pile up.
+                QTimer::singleShot(300, this, [this, b, times, done]() {
+                    auto *ss = m_appBackend ? m_appBackend->screenStreamer() : nullptr;
+                    QString screen;
+                    if (ss) {
+                        if (!ss->isEnabled()) { ss->setEnabled(true); }
+                        screen = nikitaRenderScreen(ss->screenFrame());
+                    }
+                    QJsonObject o{{QStringLiteral("pressed"), b}, {QStringLiteral("times"), times}};
+                    if (!screen.isEmpty()) { o.insert(QStringLiteral("screen"), screen); }
+                    done(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+                });
             });
         } else {
             done(QStringLiteral("{\"error\":\"nothing pressed\"}"));
@@ -5041,7 +5502,7 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
 
     } else if (name == QLatin1String("save_file")) {
         QByteArray path = args.value("path").toString().toUtf8();
-        QString content = args.value("content").toString();
+        QString content = substituteRunResult(args.value("content").toString());
         if (path.isEmpty()) {
             done(QStringLiteral("{\"error\":\"no path given\"}"));
             return;
@@ -5059,29 +5520,10 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             path = p.toUtf8();
             content = sanitizeDuckyScript(content);
         }
-        // Make sure the parent folder exists (best-effort) so saving a script into
-        // a fresh path just works instead of failing on a missing directory.
-        const QByteArray parent = QString::fromUtf8(path).section('/', 0, -2).toUtf8();
-        QPointer<Flipper::FlipperZero> devRef(dev);
-        ensureFlipperDir(parent, [this, devRef, path, content, done]() {
-            Flipper::FlipperZero *dev = devRef.data();
-            if (!dev) { done(QStringLiteral("{\"error\":\"the Flipper was disconnected\"}")); return; }
-            QBuffer *buf = new QBuffer(this);
-            buf->setData(content.toUtf8());
-            buf->open(QIODevice::ReadOnly);
-            auto *op = dev->rpc()->storageWrite(path, buf);
-            connect(op, &AbstractOperation::finished, this, [this, op, buf, path, done]() {
-                QString result;
-                if (op->isError()) {
-                    result = QStringLiteral("{\"error\":\"%1\"}").arg(op->errorString());
-                } else {
-                    result = QStringLiteral("{\"saved\":\"%1\"}").arg(QString::fromUtf8(path));
-                    m_lastSavedPath = QString::fromUtf8(path);   // anchor for "edit the same file"
-                }
-                buf->deleteLater();
-                done(result);
-            });
-        });
+        // Overwrite guard lives in beginFlipperSave: it stats the path first and,
+        // if a file is already there, asks the user (Replace / Rename / Cancel)
+        // before anything is written.
+        beginFlipperSave(path, content, done);
 
     } else if (name == QLatin1String("make_dir")) {
         const QByteArray path = args.value("path").toString().toUtf8();
@@ -5150,6 +5592,107 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
     } else {
         done(QStringLiteral("{\"error\":\"unknown tool '%1'\"}").arg(name));
     }
+}
+
+// Stat the target first. If a file is already there, hand the choice to the
+// user (Replace / Rename / Cancel) instead of silently clobbering it -- the
+// Flipper's storageWrite overwrites without a word, which is fine for the
+// assistant's own working files but not for something the user may have named
+// deliberately. A missing file, a stat error, or a directory-in-the-way all
+// fall through to the normal write, which reports any real failure itself.
+void NikitaBackend::beginFlipperSave(const QByteArray &path, const QString &content,
+                                     std::function<void(const QString &)> done)
+{
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (!dev) { done(QStringLiteral("{\"error\":\"the Flipper was disconnected\"}")); return; }
+
+    auto *op = dev->rpc()->storageStat(path);
+    connect(op, &AbstractOperation::finished, this, [this, op, path, content, done]() {
+        const bool exists = !op->isError() && op->hasFile()
+                            && op->type() != Flipper::Zero::StorageStatOperation::Directory;
+        if (!exists) {
+            writeFlipperFile(path, content, done);
+            return;
+        }
+        // Hold everything until the user answers. A second save cannot start
+        // meanwhile: the model is waiting on this tool result.
+        m_pendingSavePath = path;
+        m_pendingSaveContent = content;
+        m_pendingSaveDone = done;
+        QString preview = content.left(400);
+        if (content.size() > 400) { preview += QStringLiteral("\n...(truncated)"); }
+        emit saveConflictRequested(QString::fromUtf8(path), preview);
+    });
+}
+
+// The actual write, once the path is settled. Shared by the no-conflict path
+// and by Replace/Rename.
+void NikitaBackend::writeFlipperFile(const QByteArray &path, const QString &content,
+                                     std::function<void(const QString &)> done)
+{
+    const QByteArray parent = QString::fromUtf8(path).section(QLatin1Char('/'), 0, -2).toUtf8();
+    ensureFlipperDir(parent, [this, path, content, done]() {
+        Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+        if (!dev) { done(QStringLiteral("{\"error\":\"the Flipper was disconnected\"}")); return; }
+        QBuffer *buf = new QBuffer(this);
+        buf->setData(content.toUtf8());
+        buf->open(QIODevice::ReadOnly);
+        auto *op = dev->rpc()->storageWrite(path, buf);
+        connect(op, &AbstractOperation::finished, this, [this, op, buf, path, done]() {
+            QString result;
+            if (op->isError()) {
+                result = QStringLiteral("{\"error\":\"%1\"}").arg(op->errorString());
+            } else {
+                result = QStringLiteral("{\"saved\":\"%1\"}").arg(QString::fromUtf8(path));
+                m_lastSavedPath = QString::fromUtf8(path);
+            }
+            buf->deleteLater();
+            done(result);
+        });
+    });
+}
+
+// The user answered the overwrite prompt.
+void NikitaBackend::answerSaveConflict(const QString &action, const QString &newName)
+{
+    if (!m_pendingSaveDone) { return; }
+    auto done = m_pendingSaveDone;
+    const QByteArray origPath = m_pendingSavePath;
+    const QString content = m_pendingSaveContent;
+    m_pendingSaveDone = nullptr;
+    m_pendingSavePath.clear();
+    m_pendingSaveContent.clear();
+
+    if (action == QLatin1String("cancel")) {
+        // Honest report, not a silent no-op: the model must know the file was
+        // NOT written so it does not claim success.
+        done(QStringLiteral("{\"cancelled\":true,\"note\":\"the user chose not to overwrite the "
+                             "existing file -- nothing was saved\"}"));
+        return;
+    }
+    if (action == QLatin1String("rename")) {
+        QString name = newName.trimmed();
+        if (name.isEmpty()) { done(QStringLiteral("{\"error\":\"no new name given\"}")); return; }
+        // Take just the filename the user typed and drop it into the same folder
+        // as the original, so a bare "myscript.txt" lands beside it. A .txt is
+        // forced for a badusb path, same rule as the save itself.
+        name = name.section(QLatin1Char('/'), -1);
+        const QString dir = QString::fromUtf8(origPath).section(QLatin1Char('/'), 0, -2);
+        QString newPath = dir + QLatin1Char('/') + name;
+        if (newPath.startsWith(QLatin1String("/ext/badusb/"), Qt::CaseInsensitive)
+            && !newPath.endsWith(QLatin1String(".txt"), Qt::CaseInsensitive)) {
+            const int dot = newPath.lastIndexOf(QLatin1Char('.'));
+            const int slash = newPath.lastIndexOf(QLatin1Char('/'));
+            newPath = (dot > slash) ? newPath.left(dot) + QStringLiteral(".txt")
+                                    : newPath + QStringLiteral(".txt");
+        }
+        // Re-run the guard on the NEW name: renaming onto another existing file
+        // should ask again, not clobber a second one.
+        beginFlipperSave(newPath.toUtf8(), content, done);
+        return;
+    }
+    // "replace" (default): write over the original path.
+    writeFlipperFile(origPath, content, done);
 }
 
 // Create a folder and all missing ancestors on the Flipper, shallowest first,
@@ -5318,6 +5861,161 @@ static bool cliIsProtectedHostPath(const QString &absPath)
     return false;
 }
 
+// ---- macOS protected folders (TCC) ---------------------------------------
+//
+// Desktop, Documents, Downloads, iCloud Drive and removable volumes are not
+// ordinary directories on macOS. They sit behind TCC ("Privacy & Security ->
+// Files and Folders"), and this app is signed with a Developer ID AND the
+// hardened runtime, which is the combination the system enforces strictly:
+// with no usage-description string in Info.plist macOS does not even prompt,
+// it denies -- and the refusal arrives as EPERM, "Operation not permitted", on
+// a folder whose Unix permissions are entirely normal. A folder the user once
+// declined behaves the same way forever afterwards.
+//
+// That string on its own is what produced "Desktop is read-only. Try
+// Documents?": handed a bare errno the model reaches for the only explanation
+// it knows, invents a property the folder does not have, and sends the user
+// chasing it. Everything below exists so the tool result names the real cause
+// and the real fix instead.
+//
+// The Info.plist keys are the actual repair (application/Info.plist.app); this
+// is what happens on the machines where the grant is still missing or was
+// refused once.
+
+// Empty unless the path is inside a folder macOS gates. The name it returns is
+// the one written on the switch in System Settings, so the instruction we hand
+// back matches what the user is looking at.
+static QString nikitaProtectedFolderName(const QString &absPath)
+{
+#ifdef Q_OS_MACOS
+    const QString p = QDir::cleanPath(absPath);
+    struct Guarded { QStandardPaths::StandardLocation loc; const char *label; };
+    static const Guarded kGuarded[] = {
+        { QStandardPaths::DesktopLocation,   "Desktop"   },
+        { QStandardPaths::DocumentsLocation, "Documents" },
+        { QStandardPaths::DownloadLocation,  "Downloads" },
+    };
+    for (const Guarded &g : kGuarded) {
+        const QString root = QDir::cleanPath(QStandardPaths::writableLocation(g.loc));
+        if (root.isEmpty()) { continue; }
+        if (p == root || p.startsWith(root + QLatin1Char('/'))) {
+            return QString::fromLatin1(g.label);
+        }
+    }
+    if (p.startsWith(QLatin1String("/Volumes/")))  { return QStringLiteral("Removable Volumes"); }
+    if (p.contains(QLatin1String("/Library/Mobile Documents"))) { return QStringLiteral("iCloud Drive"); }
+    return QString();
+#else
+    Q_UNUSED(absPath);
+    return QString();
+#endif
+}
+
+// Qt hands back the C library's wording, and which of these two strings you get
+// depends on the call, the filesystem and the locale of the process -- so match
+// on both rather than on one error enum.
+static bool nikitaLooksLikePermissionError(const QString &errorText)
+{
+    const QString e = errorText.toLower();
+    return e.contains(QLatin1String("not permitted"))
+        || e.contains(QLatin1String("permission denied"))
+        || e.contains(QLatin1String("access is denied"));
+}
+
+// Can this process actually read the folder's contents? opendir() is the call
+// Qt makes underneath entryInfoList(), so asking it directly is the same
+// question with the errno still attached -- which is the whole difference
+// between "the folder is empty" and "macOS said no".
+static QString g_lastDirError;
+
+static bool nikitaCanListDirectory(const QString &absPath)
+{
+    g_lastDirError.clear();
+#ifdef Q_OS_WIN
+    Q_UNUSED(absPath);
+    return true;
+#else
+    DIR *d = ::opendir(QFile::encodeName(absPath).constData());
+    if (!d) {
+        g_lastDirError = QString::fromLocal8Bit(::strerror(errno));
+        return false;
+    }
+    ::closedir(d);
+    return true;
+#endif
+}
+
+static QString nikitaLastDirectoryError()
+{
+    return g_lastDirError.isEmpty() ? QStringLiteral("couldn't read the folder") : g_lastDirError;
+}
+
+static void nikitaAddPermissionHint(QJsonObject &o, const QString &absPath,
+                                    const QString &errorText)
+{
+    const QString folder = nikitaProtectedFolderName(absPath);
+    if (!folder.isEmpty() && nikitaLooksLikePermissionError(errorText)) {
+        o.insert(QStringLiteral("cause"),
+                 QStringLiteral("macOS blocked this app from the %1 folder. This is a privacy "
+                                "permission, NOT a property of the folder or the file.").arg(folder));
+        o.insert(QStringLiteral("fix"),
+                 QStringLiteral("Open System Settings > Privacy & Security > Files and Folders, "
+                                "find qFlipper and switch on %1 -- or grant Full Disk Access -- "
+                                "then ask again.").arg(folder));
+        o.insert(QStringLiteral("tell_the_user"),
+                 QStringLiteral("Say exactly this: macOS is blocking access to %1, and it needs to "
+                                "be enabled for qFlipper in System Settings. Do NOT say the folder "
+                                "is read-only, locked, or full. Do NOT quietly write somewhere else "
+                                "and report that as done.").arg(folder));
+        // Into the LOGS panel as well. The model's reply is one sentence in a
+        // chat window and scrolls away; this is the line the user can still
+        // find afterwards when they go looking for why it failed.
+        nikitaLog(QStringLiteral(
+            "PERMISSION DENIED by macOS: %1 -- qFlipper is not allowed into the %2 folder. "
+            "Fix: System Settings > Privacy & Security > Files and Folders > qFlipper > %2. "
+            "If the switch is not listed there, the app was refused once and macOS cached it: "
+            "run  tccutil reset All com.yourcompany.qFlipper  and relaunch.")
+            .arg(absPath, folder));
+    }
+}
+
+// The one place a failed host file operation turns into a tool result. Built
+// with QJsonObject rather than string concatenation because a path can contain
+// a quote or a backslash, and a hand-assembled JSON string turns that into a
+// parse error the model reads as a crash.
+static QString nikitaHostErrorJson(const QString &what, const QString &absPath,
+                                   const QString &errorText)
+{
+    QJsonObject o;
+    o.insert(QStringLiteral("error"),
+             QStringLiteral("%1 %2: %3").arg(what, absPath, errorText));
+    nikitaAddPermissionHint(o, absPath, errorText);
+    return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
+}
+
+// Replace the {{LAST_RESULT}} token with the exact output of the most recent
+// command this turn. This is the deterministic half of "collect the result and
+// treat it in code, do not leave it to the model": when a script must carry a
+// value the model just computed, the model writes the token and the app pastes
+// the real bytes in, so a mis-transcribed digit cannot reach the saved file.
+// A no-op when the token is absent (the model wrote the value directly) or when
+// nothing has run yet, so it never harms an ordinary save.
+QString NikitaBackend::substituteRunResult(const QString &content) const
+{
+    if (!content.contains(QLatin1String("{{LAST_RESULT}}"))
+        && !content.contains(QLatin1String("{{RESULT}}"))) {
+        return content;
+    }
+    QString out = content;
+    out.replace(QLatin1String("{{LAST_RESULT}}"), m_lastRunOutput);
+    out.replace(QLatin1String("{{RESULT}}"), m_lastRunOutput);
+    nikitaLogAs(assistantName(),
+        QStringLiteral("filled {{LAST_RESULT}} with the command output (%1 chars) -- "
+                       "value set by code, not retyped by the model")
+            .arg(m_lastRunOutput.size()));
+    return out;
+}
+
 void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
                                std::function<void(const QString &)> done)
 {
@@ -5335,6 +6033,15 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
         QDir dir(abs);
         if (!dir.exists()) { done(QStringLiteral("{\"error\":\"not a folder\"}")); return; }
+        // A folder macOS has gated still stat()s fine -- it is only reading its
+        // CONTENTS that is refused, and Qt answers that with an empty list.
+        // "Your Desktop is empty" is a confident, wrong answer to a permission
+        // problem, so ask the OS directly and let it say no out loud.
+        if (!nikitaCanListDirectory(abs)) {
+            done(nikitaHostErrorJson(QStringLiteral("can't list"), abs,
+                                     nikitaLastDirectoryError()));
+            return;
+        }
         QJsonArray arr;
         const QFileInfoList entries = dir.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot,
                                                         QDir::DirsFirst | QDir::Name);
@@ -5358,7 +6065,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
         QFile f(abs);
         if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            done(QStringLiteral("{\"error\":\"can't open %1\"}").arg(f.errorString()));
+            done(nikitaHostErrorJson(QStringLiteral("can't read"), abs, f.errorString()));
             return;
         }
         QByteArray d = f.read(NIKITA_HOST_READ_CAP + 1);
@@ -5373,17 +6080,23 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
     } else if (name == QLatin1String("host_write")) {
         const QString abs = resolveAgentPath(args.value("path").toString(), false);
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
-        const QByteArray bytes = args.value("content").toString().toUtf8();
+        const QByteArray bytes = substituteRunResult(args.value("content").toString()).toUtf8();
         auto run = [abs, bytes, done]() {
             QDir().mkpath(QFileInfo(abs).absolutePath());
             QFile f(abs);
             if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                done(QStringLiteral("{\"error\":\"can't write %1\"}").arg(f.errorString()));
+                // errorString() carries the OS's own wording, including the
+                // "Operation not permitted" that means macOS refused the folder.
+                done(nikitaHostErrorJson(QStringLiteral("can't write"), abs, f.errorString()));
                 return;
             }
             const qint64 n = f.write(bytes);
+            const QString writeError = f.errorString();
             f.close();
-            if (n < 0) { done(QStringLiteral("{\"error\":\"write failed\"}")); return; }
+            if (n < 0) {
+                done(nikitaHostErrorJson(QStringLiteral("can't write"), abs, writeError));
+                return;
+            }
             // Read back what landed. n is what QFile claims it wrote; the file's
             // own size is what is actually on disk. A write that reports success
             // on bytes that never arrived is the same lie as a delete that
@@ -5469,7 +6182,13 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
             // told the model nothing about whether it had to be made or was
             // already sitting there.
             if (!QDir().mkpath(abs) || !QFileInfo(abs).isDir()) {
-                done(QStringLiteral("{\"error\":\"couldn't create %1\"}").arg(abs));
+                // mkpath gives no reason, so ask the filesystem for one: if the
+                // parent is a folder macOS gates, the refusal is a TCC grant
+                // and not a broken path.
+                const QString why = nikitaProtectedFolderName(abs).isEmpty()
+                                        ? QStringLiteral("couldn't create it")
+                                        : QStringLiteral("Operation not permitted");
+                done(nikitaHostErrorJson(QStringLiteral("can't create folder"), abs, why));
                 return;
             }
             done(QStringLiteral("{\"path\":\"%1\",\"created\":%2,\"exists\":true}")
@@ -5515,8 +6234,20 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
             // there.
             const bool gone = !QFileInfo::exists(canon);
             if (!ok || !gone) {
-                done(QStringLiteral("{\"deleted\":false,\"existed\":true,\"path\":\"%1\","
-                                    "\"error\":\"it is still there\"}").arg(canon));
+                // The deleted/existed pair is the contract the model reads, so
+                // it stays exactly as it was; the permission explanation is
+                // added alongside it rather than in place of it.
+                const QString why = nikitaProtectedFolderName(canon).isEmpty()
+                                        ? QStringLiteral("it is still there")
+                                        : QStringLiteral("Operation not permitted");
+                QJsonObject o{
+                    {QStringLiteral("deleted"), false},
+                    {QStringLiteral("existed"), true},
+                    {QStringLiteral("path"), canon},
+                    {QStringLiteral("error"), why}
+                };
+                nikitaAddPermissionHint(o, canon, why);
+                done(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
                 return;
             }
             done(QStringLiteral("{\"deleted\":true,\"existed\":true,\"path\":\"%1\"}").arg(canon));
@@ -5537,10 +6268,16 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
             // A destination that already exists would make both calls fail
             // silently in Qt, which reads as "nothing happened" to the model.
             if (QFileInfo::exists(to) && QFileInfo(to).isFile()) { QFile::remove(to); }
-            const bool ok = moving ? QFile::rename(from, to) : QFile::copy(from, to);
+            QFile src(from);
+            const bool ok = moving ? src.rename(to) : src.copy(to);
             if (!ok) {
-                done(QStringLiteral("{\"error\":\"couldn't %1 %2 -> %3\"}")
-                         .arg(moving ? QStringLiteral("move") : QStringLiteral("copy"), from, to));
+                // Reported against the DESTINATION: a copy into a gated folder
+                // fails on the side being written to, and pointing at the source
+                // sends the user to check a file that is perfectly fine.
+                done(nikitaHostErrorJson(
+                         QStringLiteral("couldn't %1 %2 ->")
+                             .arg(moving ? QStringLiteral("move") : QStringLiteral("copy"), from),
+                         to, src.errorString()));
                 return;
             }
             done(QStringLiteral("{\"%1\":\"%2\",\"to\":\"%3\"}")
@@ -5689,7 +6426,7 @@ void NikitaBackend::executeHostRun(const QString &cmd, const QString &cwd,
     guard->setSingleShot(true);
     guard->setInterval(NIKITA_HOST_RUN_TIMEOUT_MS);
 
-    // A command like `brew install ollama` can run for a minute-plus with
+    // A long install or build can run for a minute-plus with
     // nothing to show for it until this tool call resolves, which is
     // indistinguishable on screen from being stuck (see the model-install
     // LOGS fix above). Read incrementally and log complete lines as they
@@ -5735,7 +6472,7 @@ void NikitaBackend::executeHostRun(const QString &cmd, const QString &cwd,
     });
 
     connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-            [proc, guard, killed, done, outBuf](int code, QProcess::ExitStatus) {
+            [this, proc, guard, killed, done, outBuf](int code, QProcess::ExitStatus) {
         guard->stop();
         guard->deleteLater();
         if (*killed) {
@@ -5750,6 +6487,14 @@ void NikitaBackend::executeHostRun(const QString &cmd, const QString &cwd,
         QString out = QString::fromLocal8Bit(*outBuf);
         const bool truncated = out.size() > NIKITA_HOST_OUTPUT_CAP;
         if (truncated) { out = out.left(NIKITA_HOST_OUTPUT_CAP) + QStringLiteral("\n...(truncated)"); }
+        // Remember the result so a later save can use {{LAST_RESULT}} and get
+        // the exact bytes the command printed, not the model's retype of them.
+        // Kept only for a single clean scalar-ish result -- a multi-kilobyte or
+        // errored output is not something to paste into a script.
+        if (code == 0) {
+            const QString trimmed = out.trimmed();
+            m_lastRunOutput = (trimmed.size() <= 4096) ? trimmed : QString();
+        }
         const QJsonObject res{{"exit_code", code}, {"output", out}};
         done(QString::fromUtf8(QJsonDocument(res).toJson(QJsonDocument::Compact)));
         proc->deleteLater();
@@ -6552,6 +7297,36 @@ bool NikitaBackend::adoptMemoryIfMemoryFile(const QString &path, const QString &
     return true;
 }
 
+// The same contract for actions-memory.txt. What the user leaves in the file IS
+// the proven-moves list -- edits stick, and deleting everything really clears
+// it. Before this, m_skills was the source of truth and the card only a mirror
+// it wrote TO, so a hand-erase on the card was overwritten by the stale list on
+// the very next turn: "I deleted it and it came back."
+bool NikitaBackend::adoptSkillsIfSkillsFile(const QString &path, const QString &content)
+{
+    if (QDir::cleanPath(path).compare(QLatin1String("/ext/nikita/actions-memory.txt"),
+                                      Qt::CaseInsensitive) != 0) {
+        return false;
+    }
+    m_skills = content.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    while (m_skills.size() > 24) { m_skills.removeFirst(); }
+
+    // Persist the local copy directly, allowing empty -- saveProvenMoves()
+    // refuses to truncate to nothing (a guard against an unloaded list wiping a
+    // real one), but here empty is a deliberate choice the user just made.
+    QFile lf(nikitaSkillsPath());
+    if (lf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        lf.write(m_skills.join(QLatin1Char('\n')).toUtf8());
+        lf.close();
+    }
+    // Mark this exact content as already synced so the card-mirror sees no
+    // change and does not write the list back over what the user just saved.
+    m_syncedSkills = m_skills.join(QLatin1Char('\n'));
+    nikitaLog(QStringLiteral("actions-memory.txt edited by hand: %1 proven move(s)")
+                  .arg(m_skills.size()));
+    return true;
+}
+
 void NikitaBackend::rememberFact(const QString &fact)
 {
     refreshMemoryFromDisk();
@@ -6794,6 +7569,7 @@ void NikitaBackend::writeFile(const QString &path, const QString &content)
         } else {
             nikitaLog(QStringLiteral("write %1 -- done").arg(path));
             adoptMemoryIfMemoryFile(path, content);
+            adoptSkillsIfSkillsFile(path, content);
             emit fileSaved(path);
         }
         buf->deleteLater();
@@ -7867,10 +8643,29 @@ bool cliRoutesByPath(CliVerb id)
     case CliVerb::Wc:   case CliVerb::Grep: case CliVerb::Head: case CliVerb::Tail:
     case CliVerb::Find: case CliVerb::Diff: case CliVerb::Mkdir:
     case CliVerb::Touch: case CliVerb::Rm:  case CliVerb::Mv:   case CliVerb::FileType:
+    // md5 and sed were missing, so both always went to the Flipper: "md5 a.txt"
+    // in a host folder answered "Storage error: file/dir not exist", and
+    // "sed s/x/y/ a.txt" tried to read /ext/a.txt. They have f-aliases like
+    // every other entry here, which is exactly what makes the bare spelling
+    // mean this computer.
+    case CliVerb::Md5:  case CliVerb::Sed:
         return true;
     default:
         return false;
     }
+}
+
+// The real program name on THIS operating system. The table stores the name the
+// user types, and for almost everything that is also the binary -- but md5 is
+// Apple's spelling and Linux ships the same job as md5sum. Routing md5 to the
+// host without this turns a command that used to work on Linux (by going to the
+// Flipper) into "command not found".
+static QString cliHostProgramFor(const CliCommandDef *def)
+{
+#ifndef Q_OS_MACOS
+    if (def->id == CliVerb::Md5) { return QStringLiteral("md5sum"); }
+#endif
+    return QString::fromLatin1(def->name);
 }
 
 // What a typed word resolves to: the row, and which machine the spelling asked
@@ -9035,6 +9830,15 @@ void FlipperCli::runOneShot(const QString &cmd, std::function<void(bool, QString
     m_runBusy = true;
     m_runBuf.clear();
     m_runDone = std::move(done);
+    // A reboot/power/shutdown drops the USB link on purpose; anything else that
+    // makes the link vanish mid-command is the firmware crashing.
+    {
+        const QString low = cmd.toLower();
+        m_runRebootExpected = low.contains(QLatin1String("reboot"))
+                           || low.contains(QLatin1String("shutdown"))
+                           || low.contains(QLatin1String("power off"))
+                           || low.contains(QLatin1String("power reboot"));
+    }
 
     // Idle timer: once output stops arriving for a beat, the command is done.
     if (!m_runIdle) {
@@ -9067,6 +9871,16 @@ void FlipperCli::runOneShot(const QString &cmd, std::function<void(bool, QString
             finishOneShot(false, QStringLiteral("Couldn't open the port: %1").arg(err));
             return;
         }
+        // The link dropping mid-command (device rebooted) is a crash unless we
+        // asked it to reboot. QSerialPort reports it as ResourceError.
+        connect(m_runPort, &QSerialPort::errorOccurred, this,
+                [this](QSerialPort::SerialPortError e) {
+            if (e == QSerialPort::ResourceError && m_runBusy && !m_runRebootExpected) {
+                finishOneShot(false, QStringLiteral("The Flipper crashed running this command and "
+                    "rebooted. The command did not complete -- do not report success. Try "
+                    "navigating by button or a safer command instead."));
+            }
+        });
         connect(m_runPort, &QSerialPort::readyRead, this, [this]() {
             if (!m_runPort) { return; }
             QString chunk = QString::fromUtf8(m_runPort->readAll());
@@ -9101,6 +9915,25 @@ void FlipperCli::finishOneShot(bool ok, const QString &out)
     QString text = out;
     text.remove(QRegularExpression(QStringLiteral("(^|\\n)>: *")));   // prompt lines
     text = text.trimmed();
+
+    // A firmware fault printed to the console before the reboot. If any of these
+    // are in the output, the command crashed the Flipper -- report failure even
+    // though the CLI "returned", so the assistant does not claim success on a
+    // command that just rebooted the device. "Rebooting" alone is NOT here: a
+    // deliberate `reboot` prints it and is not a crash.
+    static const QRegularExpression faultRe(QStringLiteral(
+        "furi_crash|NULL pointer dereference|HardFault|MemManage|BusFault|"
+        "UsageFault|assert(ion)? failed|\\[CRASH\\]|stack overflow|fault_handler"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (ok && faultRe.match(text).hasMatch()) {
+        ok = false;
+        // Clean, single line -- the captured framebuffer/banner is noise here,
+        // and the user watching should read a plain "it crashed", not a wall of
+        // ASCII art. The model needs the fact, not the dump.
+        text = QStringLiteral("The Flipper crashed running this command and rebooted. The command "
+                              "did not complete -- do not report success. Try navigating by button "
+                              "or a safer command instead.");
+    }
 
     auto cb = m_runDone;
     m_runDone = nullptr;
@@ -9871,9 +10704,23 @@ void FlipperCli::dispatch(const QString &line, const QStringList &tokens)
                 }
             }
         }
+        // grep and sed take a PATTERN as their first positional, not a path.
+        // Expanding it turned "grep linha a.txt" into
+        // "grep /Users/you/Desktop/linha /Users/you/Desktop/a.txt": the search
+        // term became a directory that does not exist, and the command could
+        // never match anything.
+        const bool firstIsPattern = (def->id == CliVerb::Grep || def->id == CliVerb::Sed);
+        bool tookFirstPositional = false;
+
         QStringList hostArgs;
         for (const QString &t : args.rawTokens) {
             if (t.startsWith(QLatin1Char('-'))) { hostArgs += t; continue; }
+            if (firstIsPattern && !tookFirstPositional) {
+                tookFirstPositional = true;
+                hostArgs += t;               // verbatim: it is the pattern
+                continue;
+            }
+            tookFirstPositional = true;
             if (cliIsDevicePath(t)) {
                 // A Flipper path handed to the computer's half. Almost always a
                 // missing f rather than a real intention, and running it would
@@ -9887,7 +10734,7 @@ void FlipperCli::dispatch(const QString &line, const QStringList &tokens)
             hostArgs += cliExpandHostPath(t, m_hostCwd);   // execve does not expand ~
         }
         appendOutput(echo(line));
-        runHostCommand(QStringList{ QLatin1String(def->name) } + hostArgs);
+        runHostCommand(QStringList{ cliHostProgramFor(def) } + hostArgs);
         return;
     }
 

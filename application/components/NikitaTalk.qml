@@ -260,8 +260,36 @@ Rectangle {
         return lines.join("\n");
     }
 
+    // seq -> index in chatModel, for the tool rows. Never cleared: the ids come
+    // from a counter that only goes up, so a stale entry can never collide with
+    // a live one, and clearing it would strand rows from an earlier turn.
+    property var toolRows: ({})
+
+    // Has the current assistant turn already printed its "Nikita" header? The
+    // first assistant-side row of a turn -- whether that is a tool line or the
+    // reply text -- carries the label; everything after it in the same turn does
+    // not, so a turn that runs three tools and then answers shows ONE "Nikita:"
+    // above the lot, the way Claude Code groups a turn. Reset when the user
+    // speaks. Without this the tool lines hung under the "you" block with no
+    // header, reading as if the user had typed them.
+    property bool turnLabelShown: false
+
+    // Records who owns a new row and whether it should carry the name label.
+    // Every append goes through here so the rule lives in one place.
+    function pushRow(role, text, toolDone, toolFailed) {
+        var isUser = (role === "you");
+        if (isUser) { root.turnLabelShown = false; }
+        var show = isUser ? true : !root.turnLabelShown;
+        if (!isUser) { root.turnLabelShown = true; }
+        chatModel.append({ "role": role, "text": text,
+                           "toolDone": toolDone === true, "toolFailed": toolFailed === true,
+                           "toolDetail": "", "toolExpanded": false,
+                           "showName": show });
+        return chatModel.count - 1;
+    }
+
     function appendMessage(role, text) {
-        chatModel.append({ "role": role, "text": text });
+        pushRow(role, text, false, false);
         listView.positionViewAtEnd();
     }
 
@@ -301,6 +329,12 @@ Rectangle {
         parent: root.parent ? root.parent : root
     }
 
+    SaveConflictDialog {
+        id: saveConflictDialog
+        radius: root.radius
+        parent: root.parent ? root.parent : root
+    }
+
     Connections {
         target: Nikita
         // host_run is waiting on screen: nothing runs on this computer until
@@ -317,11 +351,60 @@ Rectangle {
                 Nikita.answerHostActionConfirm(allow, always);
             }, kind, summary, detail);
         }
+        // A Flipper save_file would overwrite an existing file: ask first.
+        function onSaveConflictRequested(path, preview) {
+            saveConflictDialog.openWithConflict(function(action, newName) {
+                Nikita.answerSaveConflict(action, newName);
+            }, path, preview);
+        }
+        // The turn status ticks once a second (turnStatusChanged). While a turn
+        // is running and the user is parked at the bottom, ride that tick to keep
+        // the live footer -- the pulsing dot, the climbing seconds -- in view.
+        // Without this the footer scrolls off during the long "thinking" stretch
+        // between tool lines, and a working turn looks stopped.
+        function onTurnStatusChanged() {
+            if (Nikita.thinking && listView.stickToBottom) {
+                Qt.callLater(listView.positionViewAtEnd);
+            }
+        }
+        // Snap to the bottom the instant a turn starts, so the footer is on
+        // screen from the first second rather than only after the first scroll.
+        function onThinkingChanged() {
+            if (Nikita.thinking) {
+                listView.stickToBottom = true;
+                Qt.callLater(listView.positionViewAtEnd);
+            }
+        }
+        // One row per tool call, rewritten in place when it answers.
+        //
+        // Keyed by the backend's seq rather than by "the last row", because a
+        // turn can have several calls in flight in one batch and the one that
+        // answers first is not necessarily the one that started last.
+        function onToolActivity(seq, text, detail, finished, failed) {
+            var idx = root.toolRows[seq];
+            if (idx === undefined) {
+                // A tool line interrupts the streaming bubble: whatever prose
+                // was being typed is finished where it stands, and the model's
+                // next words open a new one underneath. That is what makes the
+                // transcript read in the order things actually happened.
+                root.streamIdx = -1;
+                idx = root.pushRow("tool", text, finished, failed);
+                root.toolRows[seq] = idx;
+            } else {
+                chatModel.setProperty(idx, "text", text);
+                chatModel.setProperty(idx, "toolDone", finished);
+                chatModel.setProperty(idx, "toolFailed", failed);
+            }
+            // The exact call, kept on the row so it can be expanded to show what
+            // actually ran. Set every update so the finished detail (with any
+            // late-filled args) wins.
+            chatModel.setProperty(idx, "toolDetail", detail);
+            if (listView.stickToBottom) { listView.positionViewAtEnd(); }
+        }
         // live typing: grow one bubble as tokens arrive
         function onPartialReceived(text) {
             if(root.streamIdx < 0) {
-                chatModel.append({ "role": "nikita", "text": text });
-                root.streamIdx = chatModel.count - 1;
+                root.streamIdx = root.pushRow("nikita", text, false, false);
             } else {
                 chatModel.setProperty(root.streamIdx, "text", text);
             }
@@ -673,25 +756,43 @@ Rectangle {
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar { }
 
-            // The live wait. Not a fixed "is thinking" any more: the phrase is
-            // whatever the backend is actually doing this second (writing the
-            // file, running the command, wrapping up), and the seconds counter
-            // keeps moving even when the phrase does not -- so a slow turn
-            // still reads as working rather than as hung.
+            // Keep the newest line in view as the answer grows -- but only when
+            // the user was already at the bottom. Yanking the view down while
+            // someone is reading back through the conversation is worse than
+            // not following at all.
+            property bool stickToBottom: true
+            onContentYChanged: {
+                if (!moving && !flicking) { return; }   // programmatic scroll, not the user
+                stickToBottom = (contentY + height) >= (contentHeight - 24);
+            }
+            onCountChanged: if (stickToBottom) Qt.callLater(positionViewAtEnd)
+            onContentHeightChanged: if (stickToBottom) Qt.callLater(positionViewAtEnd)
+
+            // ---- live turn status, as the list's footer ------------------
+            // Directly under the last message, flowing with the conversation --
+            // not pinned to the bottom edge of the panel. It sits where the next
+            // line of the transcript would go, which is where the eye already
+            // is while an answer streams in. The stickToBottom auto-scroll above
+            // keeps it in view on a long turn, so it no longer drifts off the
+            // top the way the old footer did.
+            //
+            // The phrase is whatever the backend is doing this second (writing
+            // the file, running the command, wrapping up); the seconds keep
+            // moving even when the phrase does not, so a slow turn still reads
+            // as working rather than as hung.
             footer: Item {
                 width: ListView.view ? ListView.view.width : 0
-                height: Nikita.thinking ? 20 : 0
+                height: Nikita.thinking ? 24 : 0
                 visible: Nikita.thinking
                 Row {
+                    x: 0
+                    anchors.verticalCenter: parent.verticalCenter
                     spacing: 0
-                    // A pulsing dot, so the line reads as live even in the
-                    // stretch where neither the phrase nor the second changes.
                     Text {
                         id: liveDot
                         text: "\u25cf  "
                         color: Theme.color.lightorange2
-                        font.family: "Share Tech Mono"
-                        font.pixelSize: 12
+                        font.family: "Share Tech Mono"; font.pixelSize: 12
                         SequentialAnimation on opacity {
                             running: Nikita.thinking
                             loops: Animation.Infinite
@@ -699,32 +800,34 @@ Rectangle {
                             NumberAnimation { from: 0.25; to: 1.0; duration: 700 }
                         }
                     }
-                    // elapsed · tokens · what it is doing
+                    // elapsed · tokens · cost · what it is doing
                     Text {
                         text: Nikita.turnElapsedText
                         color: Theme.color.mediumorange2
-                        font.family: "Share Tech Mono"
-                        font.pixelSize: 12
+                        font.family: "Share Tech Mono"; font.pixelSize: 12
                     }
                     Text {
                         visible: Nikita.turnTokensText.length > 0
                         text: " \u00b7 " + Nikita.turnTokensText
                         color: Theme.color.mediumorange2
-                        font.family: "Share Tech Mono"
-                        font.pixelSize: 12
+                        font.family: "Share Tech Mono"; font.pixelSize: 12
+                    }
+                    Text {
+                        visible: Nikita.turnCostText.length > 0
+                        text: " \u00b7 " + Nikita.turnCostText
+                        color: Theme.color.mediumorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 12
                     }
                     Text {
                         text: " \u00b7 " + (Nikita.turnStatus.length > 0
                                             ? Nikita.turnStatus : "thinking")
                         color: Theme.color.mediumorange4
-                        font.family: "Share Tech Mono"
-                        font.pixelSize: 12
+                        font.family: "Share Tech Mono"; font.pixelSize: 12
                     }
                     Text {
                         id: thinkDots
                         color: Theme.color.mediumorange4
-                        font.family: "Share Tech Mono"
-                        font.pixelSize: 12
+                        font.family: "Share Tech Mono"; font.pixelSize: 12
                         property int step: 0
                         text: ["   ", ".  ", ".. ", "..."][step]
                     }
@@ -748,10 +851,102 @@ Rectangle {
 
                 HoverHandler { id: msgHover }
 
+                // The turn's "Nikita" header, when the first thing in the turn
+                // is a tool line rather than prose. Without this the tool lines
+                // sit directly under the user's message and read as the user's.
+                Text {
+                    visible: model.role === "tool" && model.showName === true
+                    text: root.aiName
+                    color: Theme.color.lightorange2
+                    font.family: "Share Tech Mono"
+                    font.pixelSize: 11
+                    bottomPadding: 2
+                }
+
+                // ---- a tool call, as its own line ------------------------
+                // Not a message: no role label, no bubble, no markdown. One
+                // dim line that says what is happening and then what happened,
+                // rewritten in place, so the transcript reads in the order the
+                // work actually occurred instead of as a summary written after
+                // the fact.
+                Item {
+                    visible: model.role === "tool"
+                    width: msgCol.width
+                    // Item (not Column) so the MouseArea can anchors.fill it --
+                    // a Column refuses anchored children and silently breaks.
+                    implicitHeight: toolCol.implicitHeight
+                    height: model.role === "tool" ? implicitHeight : 0
+                    Column {
+                        id: toolCol
+                        width: parent.width
+                        spacing: 1
+                    Row {
+                        spacing: 6
+                        // Pulses while the call is in flight and stops when it
+                        // lands, so a slow tool is visibly alive rather than stuck.
+                        Text {
+                            text: model.toolFailed ? "\u2717" : (model.toolDone ? "\u00b7" : "\u25cf")
+                            color: model.toolFailed ? "#ff6a6a" : Theme.color.mediumorange4
+                            font.family: "Share Tech Mono"
+                            font.pixelSize: 12
+                            SequentialAnimation on opacity {
+                                running: model.role === "tool" && !model.toolDone
+                                loops: Animation.Infinite
+                                NumberAnimation { from: 1.0; to: 0.25; duration: 700 }
+                                NumberAnimation { from: 0.25; to: 1.0; duration: 700 }
+                            }
+                        }
+                        Text {
+                            text: model.text
+                            color: model.toolFailed ? "#ff6a6a" : Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"
+                            font.pixelSize: 12
+                            elide: Text.ElideRight
+                            width: Math.min(implicitWidth, msgCol.width - 60)
+                        }
+                        // The chevron turns to point down when expanded; the
+                        // whole row is the click target. Only shown when there
+                        // is a detail to reveal.
+                        Text {
+                            visible: (model.toolDetail || "").length > 0
+                            text: model.toolExpanded ? "\u2304" : "\u203a"
+                            color: toolRowHover.containsMouse ? Theme.color.lightorange2
+                                                             : Theme.color.mediumorange4
+                            font.family: "Share Tech Mono"
+                            font.pixelSize: 12
+                        }
+                    }
+                    // The exact call, revealed on click. Monospace, dim, indented
+                    // under the line it belongs to.
+                    Text {
+                        visible: model.toolExpanded && (model.toolDetail || "").length > 0
+                        text: "    " + (model.toolDetail || "")
+                        color: model.toolFailed ? "#ff6a6a" : Theme.color.mediumorange2
+                        font.family: "Share Tech Mono"
+                        font.pixelSize: 11
+                        width: msgCol.width
+                        wrapMode: Text.WrapAnywhere
+                    }
+                    }   // end inner Column
+                    MouseArea {
+                        id: toolRowHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: (model.toolDetail || "").length > 0
+                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        onClicked: chatModel.setProperty(index, "toolExpanded", !model.toolExpanded)
+                    }
+                }
+
                 Row {
+                    visible: model.role !== "tool"
                     spacing: 8
                     Rectangle {
-                        width: roleLabel.implicitWidth + 4
+                        // Hidden (and zero-width, so the Row skips it) on a row
+                        // that continues a turn whose header already showed --
+                        // e.g. the reply text after a run of tool lines.
+                        visible: model.showName === true
+                        width: visible ? roleLabel.implicitWidth + 4 : 0
                         height: roleLabel.implicitHeight
                         color: root.indexInSelection(index) ? roleLabel.selectionColor : "transparent"
                         Text {
@@ -798,6 +993,7 @@ Rectangle {
                 }
                 TextEdit {
                     id: bodyText
+                    visible: model.role !== "tool"
                     width: parent.width
                     text: model.text
                     readOnly: true
@@ -1134,21 +1330,29 @@ Rectangle {
                 }
             }
 
+            // While a turn runs the primary control is STOP, so an interrupt is
+            // always one click away. SEND only appears once something is typed:
+            // outside a turn it sends normally, and DURING a turn it drops the
+            // text into the queue to run after this one. So a running turn shows
+            // just STOP until the user starts typing, then STOP + SEND together.
             Button {
-                // Becomes the interrupt control the instant a turn starts --
-                // same idea as Claude Code's own stop-mid-response button.
-                // Three states, not two. While a turn runs the button is Stop
-                // -- unless something has been typed, in which case stopping is
-                // almost certainly not what that text was for.
-                text: !Nikita.thinking ? "Send"
-                     : (input.text.length > 0 ? "Queue" : "Stop")
-                enabled: Nikita.thinking || (root.hasModel && input.text.length > 0)
+                text: "Stop"
+                visible: Nikita.thinking
+                onClicked: Nikita.stopThinking()
+            }
+            Button {
+                text: "Send"
+                // Outside a turn: the normal send button. During a turn: only
+                // once there is something to queue.
+                visible: !Nikita.thinking || input.text.length > 0
+                enabled: root.hasModel && input.text.length > 0
                 onClicked: {
-                    if (!Nikita.thinking) { root.sendCurrent(); }
-                    else if (input.text.length > 0) {
+                    if (!Nikita.thinking) {
+                        root.sendCurrent();
+                    } else {
                         Nikita.queueMessage(input.text);
                         input.text = "";
-                    } else { Nikita.stopThinking(); }
+                    }
                 }
             }
         }
@@ -1373,7 +1577,7 @@ Rectangle {
                         color: "#eaffea"
                         font.family: "Share Tech Mono"; font.pixelSize: 11
                         text: consent.turningOn
-                            ? "Local AI model. Nothing is sent anywhere."
+                            ? "Kimi API handles the task and everything else stays local:"
                             : "Erases everything NIKITA stored about you:"
                     }
 
@@ -1503,11 +1707,7 @@ Rectangle {
         opacity: open ? 1 : 0
         Behavior on opacity { NumberAnimation { duration: 120; easing.type: Easing.InOutQuad } }
 
-        // Model list is only pulled fresh when the panel opens, not polled --
-        // it changes only in response to actions this same panel drives.
         function openManager() {
-            catalogModel.refresh();
-            Nikita.detectOllama();
             modelManager.open = true;
         }
         function close() { modelManager.open = false; }
@@ -1521,76 +1721,6 @@ Rectangle {
         }
 
         Keys.onEscapePressed: modelManager.close()
-
-
-        // Backing list model for the catalog. A plain ListModel refreshed from
-        // Nikita.modelCatalog(): simplest option here since the catalog is
-        // small (a handful of curated entries), not something worth a C++
-        // QAbstractListModel for.
-        ListModel { id: catalogModel
-            function refresh() {
-                // Update rows in place rather than clear()+append(): clearing
-                // drops the list to zero items for a frame, which snaps
-                // catalogView's scroll position back to the top on every
-                // refresh, annoying if you'd scrolled down and an install
-                // finishes, or Ollama comes online, mid-scroll.
-                var rows = Nikita.modelCatalog();
-                for (var i = 0; i < rows.length; i++) {
-                    if (i < count) { set(i, rows[i]); } else { append(rows[i]); }
-                }
-                while (count > rows.length) { remove(count - 1); }
-            }
-        }
-
-        // modelOpKind/Name/Status/Progress all share one NOTIFY (modelOpChanged),
-        // which fires on every chunk of `ollama pull` output, many times a
-        // second while a download is running. The busy row's progress bar and
-        // status text already bind straight to Nikita.modelOpProgress/modelOpStatus
-        // below, so they don't need a list rebuild to update. Only rebuild when
-        // a row actually needs to flip into/out of "busy", i.e. when the op
-        // kind itself changes; otherwise every tick was tearing down and
-        // recreating all the delegates, which is what caused the flicker/glitch
-        // during a pull.
-        QtObject {
-            id: modelOpTracker
-            property string kind: ""
-            // What the result line at the bottom shows. A plain binding to
-            // Nikita.modelOpStatus left "Ollama installed." (or any other
-            // finished-op message) sitting there indefinitely -- nothing
-            // ever set it back to empty, since the backend property is only
-            // ever overwritten by the NEXT operation, which might be
-            // minutes or never. Fading it out on a timer instead means it
-            // read as a toast, not a stuck label.
-            property string fadingStatus: ""
-        }
-
-        Timer {
-            id: fadingStatusTimer
-            interval: 4000
-            onTriggered: modelOpTracker.fadingStatus = ""
-        }
-
-        Connections {
-            target: Nikita
-            function onModelOpChanged() {
-                if (Nikita.modelOpKind !== modelOpTracker.kind) {
-                    const wasRunning = modelOpTracker.kind !== "";
-                    modelOpTracker.kind = Nikita.modelOpKind;
-                    catalogModel.refresh();
-                    // Just finished (kind went back to ""): show the result,
-                    // then fade it.
-                    if (wasRunning && Nikita.modelOpKind === "" && Nikita.modelOpStatus.length > 0) {
-                        modelOpTracker.fadingStatus = Nikita.modelOpStatus;
-                        fadingStatusTimer.restart();
-                    }
-                }
-            }
-            function onModelInstallFinished()     { catalogModel.refresh(); }
-            function onModelUninstallFinished()   { catalogModel.refresh(); }
-            function onOllamaInstallFinished()    { catalogModel.refresh(); }
-            function onOllamaInstalledChanged()   { catalogModel.refresh(); }
-            function onModelChanged()             { if (modelManager.visible) { catalogModel.refresh(); } }
-        }
 
         // Same panel chrome as the CLI: filled card on the content box, one
         // border, title in the header row, close on the right.
@@ -1610,7 +1740,7 @@ Rectangle {
             RowLayout {
                 Layout.fillWidth: true
                 Text {
-                    text: "CHOOSE A MODEL"
+                    text: "SETUP"
                     color: Theme.color.lightorange2
                     font.family: "Share Tech Mono"; font.pixelSize: 20; font.bold: true
                     Layout.fillWidth: true
@@ -1630,326 +1760,385 @@ Rectangle {
                 }
             }
 
-            // ---- "Ollama itself isn't installed" banner ----
+            // ---- BRAIN -------------------------------------------------
+            // Which Kimi model answers. k2.6 is the default -- GA, full account
+            // rate limit; k3 is newer with a 1M window but is throttled in
+            // preview, which stalls multi-round tool turns. One tap switches.
             Rectangle {
-                visible: !Nikita.ollamaInstalled
                 Layout.fillWidth: true
-                Layout.preferredHeight: ollamaBannerCol.implicitHeight + 16
-                radius: 5
-                color: "#2a0a0a"
-                border.width: 1
-                border.color: "#ff5a5a"
+                Layout.preferredHeight: 1
+                color: Theme.color.mediumorange2
+                opacity: 0.4
+            }
 
-                ColumnLayout {
-                    id: ollamaBannerCol
-                    x: 10; y: 8
-                    width: parent.width - 20
-                    spacing: 6
+            Text {
+                text: "BRAIN"
+                color: Theme.color.lightorange2
+                font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
+            }
 
-                    Text {
-                        text: "Ollama isn't installed on this machine."
-                        color: "#ffb3b3"
-                        wrapMode: Text.WordWrap
-                        Layout.fillWidth: true
-                        font.family: "Share Tech Mono"; font.pixelSize: 11
+            Repeater {
+                model: Nikita.apiModelChoices()
+                Rectangle {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 38
+                    radius: 3
+                    color: "transparent"
+                    border.width: 1
+                    border.color: Nikita.apiModel === modelData.id
+                                  ? Theme.color.lightorange2
+                                  : (brainHover.containsMouse ? Theme.color.mediumorange1
+                                                              : Theme.color.mediumorange2)
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 8
+                        anchors.rightMargin: 8
+                        spacing: 8
+                        // A filled dot marks the active model.
+                        Text {
+                            text: Nikita.apiModel === modelData.id ? "\u25cf" : "\u25cb"
+                            color: Nikita.apiModel === modelData.id
+                                   ? Theme.color.lightorange2 : Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 12
+                        }
+                        ColumnLayout {
+                            spacing: 0
+                            Layout.fillWidth: true
+                            Text {
+                                text: modelData.label
+                                color: Nikita.apiModel === modelData.id
+                                       ? Theme.color.lightorange2 : Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                            }
+                            Text {
+                                text: modelData.note
+                                color: Theme.color.mediumorange1
+                                opacity: 0.7
+                                font.family: "Share Tech Mono"; font.pixelSize: 9
+                                Layout.fillWidth: true
+                                elide: Text.ElideRight
+                            }
+                        }
+                    }
+                    MouseArea {
+                        id: brainHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: Nikita.apiModel = modelData.id
                     }
                 }
             }
 
-            // ---- Ollama missing: one big themed button instead of a list of
-            // models that can't be installed anyway. Laypeople land here with
-            // no idea what Ollama even is, so this has to be the one obvious
-            // thing to click, not a link that assumes they know to look for it.
-            Item {
-                visible: !Nikita.ollamaInstalled
+
+            // Two states, and the resting one is what tells you a key is there:
+            // a stored key shows as a fixed row of dots you cannot edit, the
+            // way a saved password looks in any settings panel. Clicking it
+            // opens an EMPTY field to type a replacement into -- the real
+            // characters are never put back on screen, because the backend has
+            // no getter for them at all and this panel could not read them if
+            // it wanted to. The dots are a marker, not the key.
+            ColumnLayout {
+                id: apiKeyBox
                 Layout.fillWidth: true
-                Layout.fillHeight: true
+                spacing: 6
 
-                ColumnLayout {
-                    anchors.centerIn: parent
-                    spacing: 12
+                // Typing a new key over a saved one. Reset whenever the stored
+                // key changes underneath, so saving drops straight back to dots.
+                property bool editing: false
+                // The eye. Never sticks: a Timer puts it back, and saving,
+                // clearing or starting to type all close it.
+                property bool revealed: false
 
-                    // The same big pill button "UP TO DATE"/"Install"/"Update"
-                    // use elsewhere (HomeOverlay's updateButton) -- this is the
-                    // one call-to-action on the whole screen, so it reads as
-                    // one of THIS app's buttons, not a generic Qt one dropped in.
-                    MainButton {
-                        Layout.alignment: Qt.AlignHCenter
-                        // Wider than the 280 default, at the same full-size
-                        // font ("UP TO DATE" uses) -- "Install Ollama" is a
-                        // longer string, not a reason to shrink the text.
-                        width: 440
-                        height: 72
-                        enabled: Nikita.modelOpKind !== "ollama"
-                        text: Nikita.modelOpKind === "ollama" ? qsTr("Installing…") : qsTr("Install Ollama")
-                        onClicked: Nikita.installOllama()
-                    }
+                // Clicking the key opens it for editing WITH the key still in
+                // it, rather than handing back an empty box. Blanking the field
+                // on a click reads as having destroyed something -- and if you
+                // only wanted to look, or to fix one character, an empty field
+                // means fetching the key from wherever you keep it all over
+                // again. The consequence to know about: the dots now count the
+                // real key, so the field's width gives its length away, where
+                // the resting state deliberately showed a fixed 28.
+                function beginEditing() {
+                    if (fromEnv) { return; }   // the environment wins; nothing to edit
+                    apiKeyField.text = Nikita.revealApiKey();
+                    editing = true;
+                    apiKeyField.forceActiveFocus();
+                    apiKeyField.selectAll();
+                }
+                property bool fromEnv: Nikita.apiKeySource === "environment"
+                onFromEnvChanged: { editing = false; revealed = false; }
 
-                    Text {
-                        visible: Nikita.modelOpKind === "ollama"
-                        Layout.alignment: Qt.AlignHCenter
-                        Layout.maximumWidth: 320
-                        horizontalAlignment: Text.AlignHCenter
-                        wrapMode: Text.WordWrap
-                        text: Nikita.modelOpStatus
-                        color: Theme.color.mediumorange1
-                        font.family: "Share Tech Mono"; font.pixelSize: 11
-                    }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: apiKeyBox.fromEnv
+                          ? "Key found in MOONSHOT_API_KEY. The environment wins over anything saved here."
+                          : (Nikita.apiKeyPresent
+                             // The model name, not a sentence about storage.
+                             // Where the key lives is answered by the field
+                             // right below it being full.
+                             ? Nikita.modelName
+                             : "No kimi API key Found.")
+                    color: Nikita.apiKeyPresent ? Theme.color.mediumorange1 : "#ff6a6a"
+                    font.family: "Share Tech Mono"; font.pixelSize: 11
+                }
 
-                    // Same "cancel" link/behavior as a model row mid-download --
-                    // the button turning into "Installing..." shouldn't also
-                    // mean committed-to-waiting; kill()ing partway through a
-                    // curl/hdiutil/cp sequence leaves nothing worse behind than
-                    // a partial temp download, which cleanup() already removes.
-                    Text {
-                        visible: Nikita.modelOpKind === "ollama"
-                        Layout.alignment: Qt.AlignHCenter
-                        text: "cancel"
-                        color: cancelOllamaInstallMouse.containsMouse ? "#ff6a6a" : Theme.color.mediumorange1
-                        font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+
+                    // ---- eye: reveal the key ---------------------------
+                    // Drawn, not typed, for the same reason as the gear above:
+                    // Share Tech Mono has no glyph for an eye, and letting Qt
+                    // substitute a system symbol font puts it on a different
+                    // baseline at a different size.
+                    Item {
+                        Layout.preferredWidth: 20
+                        Layout.preferredHeight: 20
+                        Layout.alignment: Qt.AlignVCenter
+                        visible: Nikita.apiKeyPresent && !apiKeyBox.fromEnv
+                        Canvas {
+                            id: eyeIcon
+                            anchors.centerIn: parent
+                            width: 18; height: 18
+                            property color tint: eyeMouse.containsMouse || apiKeyBox.revealed
+                                                 ? Theme.color.lightorange2
+                                                 : Theme.color.mediumorange1
+                            property bool open: apiKeyBox.revealed
+                            onTintChanged: requestPaint()
+                            onOpenChanged: requestPaint()
+                            Component.onCompleted: requestPaint()
+                            onPaint: {
+                                var ctx = getContext("2d");
+                                ctx.reset();
+                                ctx.clearRect(0, 0, width, height);
+                                ctx.strokeStyle = eyeIcon.tint;
+                                ctx.fillStyle = eyeIcon.tint;
+                                ctx.lineWidth = 1.4;
+                                var w = width, h = height, cy = h / 2;
+                                // The almond, as two mirrored quadratic curves.
+                                ctx.beginPath();
+                                ctx.moveTo(w * 0.10, cy);
+                                ctx.quadraticCurveTo(w * 0.50, cy - h * 0.34, w * 0.90, cy);
+                                ctx.quadraticCurveTo(w * 0.50, cy + h * 0.34, w * 0.10, cy);
+                                ctx.stroke();
+                                ctx.beginPath();
+                                ctx.arc(w * 0.50, cy, w * 0.13, 0, Math.PI * 2);
+                                ctx.fill();
+                                // Struck through when hidden, so the two states
+                                // differ in shape and not only in brightness --
+                                // a colour-only difference is no difference at
+                                // all to a lot of people.
+                                if (!eyeIcon.open) {
+                                    ctx.beginPath();
+                                    ctx.moveTo(w * 0.14, h * 0.82);
+                                    ctx.lineTo(w * 0.86, h * 0.18);
+                                    ctx.stroke();
+                                }
+                            }
+                        }
                         MouseArea {
-                            id: cancelOllamaInstallMouse
+                            id: eyeMouse
+                            anchors.fill: parent
+                            anchors.margins: -3
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                apiKeyBox.revealed = !apiKeyBox.revealed;
+                                if (apiKeyBox.revealed) { hideAgain.restart(); }
+                            }
+                        }
+                    }
+                    // Never left showing. Walking away from a revealed key is
+                    // the whole risk of having this control at all.
+                    Timer {
+                        id: hideAgain
+                        interval: 15000
+                        onTriggered: apiKeyBox.revealed = false
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 30
+                        radius: 3
+                        color: "transparent"
+                        border.width: 1
+                        border.color: Nikita.apiKeyPresent && !apiKeyBox.editing
+                                      ? Theme.color.mediumorange1
+                                      : Theme.color.mediumorange2
+
+                        // RESTING: a key is stored and nothing is being typed.
+                        // Masked, unless the eye is open -- and only then is the
+                        // real key asked for, one call, at the moment it is
+                        // needed. A fixed count of dots otherwise: the key's
+                        // real length is nobody's business.
+                        Text {
+                            anchors.left: parent.left
+                            anchors.right: apiCopyBtn.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.leftMargin: 8
+                            anchors.rightMargin: 8
+                            visible: Nikita.apiKeyPresent && !apiKeyBox.editing
+                            elide: Text.ElideRight
+                            text: apiKeyBox.revealed ? Nikita.revealApiKey()
+                                                     : "•".repeat(28)
+                            color: Theme.color.lightorange2
+                            font.family: "Share Tech Mono"; font.pixelSize: 12
+                        }
+                        MouseArea {
+                            anchors.left: parent.left
+                            anchors.right: apiCopyBtn.left
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+                            hoverEnabled: true
+                            enabled: Nikita.apiKeyPresent && !apiKeyBox.editing && !apiKeyBox.fromEnv
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: apiKeyBox.beginEditing()
+                        }
+
+                        // EDITING, or nothing stored yet.
+                        TextInput {
+                            id: apiKeyField
+                            anchors.left: parent.left
+                            anchors.right: apiCopyBtn.left
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+                            anchors.leftMargin: 8
+                            anchors.rightMargin: 8
+                            verticalAlignment: TextInput.AlignVCenter
+                            visible: !Nikita.apiKeyPresent || apiKeyBox.editing
+                            enabled: visible && !apiKeyBox.fromEnv
+                            echoMode: apiKeyBox.revealed ? TextInput.Normal : TextInput.Password
+                            clip: true
+                            color: Theme.color.lightorange2
+                            font.family: "Share Tech Mono"; font.pixelSize: 12
+                            selectByMouse: true
+                            onAccepted: saveApiKey()
+                            Keys.onEscapePressed: {
+                                text = "";
+                                apiKeyBox.editing = false;
+                                apiKeyBox.revealed = false;
+                            }
+                            function saveApiKey() {
+                                if (text.length === 0) {
+                                    // Emptying the field and saving IS the
+                                    // delete. It is the only way the key goes
+                                    // away, which is the point: nothing about
+                                    // opening, looking at or clicking the field
+                                    // can lose it, and the one gesture that
+                                    // removes it is a thing you have to do on
+                                    // purpose and then confirm with Save.
+                                    //
+                                    // Guarded on a key existing, so Save on an
+                                    // empty field during first setup stays the
+                                    // harmless no-op it was.
+                                    if (Nikita.apiKeyPresent) { Nikita.clearApiKey(); }
+                                    apiKeyBox.editing = false;
+                                    apiKeyBox.revealed = false;
+                                    return;
+                                }
+                                Nikita.setApiKey(text);
+                                text = "";
+                                apiKeyBox.editing = false;
+                                apiKeyBox.revealed = false;
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: apiKeyField.text.length === 0
+                                text: Nikita.apiKeyPresent ? "paste a new key to replace the saved one"
+                                                           : "paste your Kimi API key"
+                                color: Theme.color.mediumorange1
+                                opacity: 0.5
+                                font.family: "Share Tech Mono"; font.pixelSize: 12
+                            }
+                        }
+
+                        // ---- copy, inside the field's right edge -----------
+                        // The key never reaches QML for this: copyApiKeyToClipboard()
+                        // reads it and puts it on the clipboard entirely in C++.
+                        Item {
+                            id: apiCopyBtn
+                            width: 26; height: parent.height
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: Nikita.apiKeyPresent
+                            Canvas {
+                                id: copyIcon
+                                anchors.centerIn: parent
+                                width: 14; height: 14
+                                property color tint: copiedFlash.running
+                                                     ? Theme.color.lightorange2
+                                                     : (copyMouse.containsMouse ? Theme.color.lightorange2
+                                                                                : Theme.color.mediumorange1)
+                                onTintChanged: requestPaint()
+                                Component.onCompleted: requestPaint()
+                                onPaint: {
+                                    var ctx = getContext("2d");
+                                    ctx.reset();
+                                    ctx.clearRect(0, 0, width, height);
+                                    ctx.strokeStyle = copyIcon.tint;
+                                    ctx.lineWidth = 1.3;
+                                    var w = width, h = height;
+                                    // Two offset sheets: the back one peeking
+                                    // out top-right, the front one solid.
+                                    ctx.strokeRect(w * 0.30, h * 0.06, w * 0.62, h * 0.62);
+                                    ctx.clearRect(w * 0.06, h * 0.30, w * 0.62, h * 0.64);
+                                    ctx.strokeRect(w * 0.06, h * 0.30, w * 0.62, h * 0.62);
+                                }
+                            }
+                            // Confirmation, because a copy is invisible: nothing
+                            // else on screen changes, and without some feedback
+                            // there is no way to tell a click that worked from
+                            // one that missed the button. The icon itself is
+                            // the whole acknowledgement -- it brightens and
+                            // pops for a moment. No word beside it: a label
+                            // that appears and vanishes next to a button draws
+                            // more attention than the thing it is confirming.
+                            Timer { id: copiedFlash; interval: 450 }
+                            SequentialAnimation {
+                                id: copyPop
+                                NumberAnimation { target: copyIcon; property: "scale"
+                                                  to: 1.35; duration: 90
+                                                  easing.type: Easing.OutQuad }
+                                NumberAnimation { target: copyIcon; property: "scale"
+                                                  to: 1.0; duration: 160
+                                                  easing.type: Easing.OutQuad }
+                            }
+                            MouseArea {
+                                id: copyMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: if (Nikita.copyApiKeyToClipboard()) {
+                                    copiedFlash.restart();
+                                    copyPop.restart();
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        visible: !apiKeyBox.fromEnv
+                        text: "Save"
+                        color: saveKeyMouse.containsMouse ? Theme.color.lightorange2
+                                                          : Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                        MouseArea {
+                            id: saveKeyMouse
                             anchors.fill: parent
                             anchors.margins: -6
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: Nikita.cancelModelOp()
-                        }
-                    }
-                }
-            }
-
-            // ---- catalog list ----
-            ListView {
-                id: catalogView
-                visible: Nikita.ollamaInstalled
-                Layout.fillWidth: true
-                // Was fillHeight, back when this list had six models. With a
-                // single model that left half the panel empty -- now the list
-                // takes what it needs and the rest goes to the filters.
-                Layout.preferredHeight: Math.min(contentHeight, 260)
-                clip: true
-                model: catalogModel
-                spacing: 6
-
-                delegate: Rectangle {
-                    width: catalogView.width
-                    height: rowCol.implicitHeight + 16
-                    radius: 5
-                    color: model.active ? "#1a0d24" : "#120818"
-                    border.width: 1
-                    border.color: model.active ? Theme.color.lightorange2 : Theme.color.mediumorange2
-
-                    ColumnLayout {
-                        id: rowCol
-                        x: 10; y: 8
-                        width: parent.width - 20
-                        spacing: 4
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            Text {
-                                text: model.label + "  ·  " + model.size
-                                color: "#eaffea"
-                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
-                                Layout.fillWidth: true
-                            }
-                            Text {
-                                visible: model.active
-                                text: "active"
-                                color: "#39ff14"
-                                font.family: "Share Tech Mono"; font.pixelSize: 10
-                            }
-                            Rectangle {
-                                visible: model.installed && !model.active
-                                Layout.preferredWidth: equipLabel.implicitWidth + 14
-                                Layout.preferredHeight: 16
-                                radius: 3
-                                color: equipMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
-                                border.width: 1
-                                border.color: Theme.color.lightorange2
-                                Text {
-                                    id: equipLabel
-                                    anchors.centerIn: parent
-                                    text: "EQUIP"
-                                    color: equipMouse.containsMouse ? "#0b0410" : Theme.color.lightorange2
-                                    font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
-                                }
-                                MouseArea {
-                                    id: equipMouse
-                                    anchors.fill: parent
-                                    anchors.margins: -4
-                                    hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    enabled: Nikita.modelOpKind === ""
-                                    onClicked: Nikita.setModel(model.tag)
-                                }
-                            }
-                        }
-
-                        Text {
-                            text: model.blurb
-                            color: Theme.color.mediumorange1
-                            font.family: "Share Tech Mono"; font.pixelSize: 10
-                            wrapMode: Text.WordWrap
-                            Layout.fillWidth: true
-                        }
-
-                        // Busy row: progress bar + status line instead of the buttons.
-                        ColumnLayout {
-                            visible: model.busy
-                            Layout.fillWidth: true
-                            spacing: 4
-
-                            // Deliberately NOT a ProgressBar. The DefaultAmber
-                            // style's ProgressBar is built for the full-screen
-                            // firmware update: its contentItem centres a 48px
-                            // "HaxrCorp 4089" percentage label, and that label is
-                            // `Math.round(control.value) + "%"`, i.e. it assumes
-                            // value runs 0..100, while ProgressBar's default range
-                            // (and modelOpProgress) is 0..1. Two consequences, both
-                            // visible in the screenshots: the control's implicit
-                            // height collapses to zero, so the 48px label escapes
-                            // and floats unclipped over the row as that pixelated
-                            // blob; and Math.round(0.63) is 1, so it reads "0%"
-                            // until the download passes halfway and then "1%" for
-                            // the entire rest of it. That is the stuck 1%.
-                            Item {
-                                id: barTrack
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: 6
-                                clip: true
-
-                                Rectangle {
-                                    anchors.fill: parent
-                                    radius: 3
-                                    color: "transparent"
-                                    border.width: 1
-                                    border.color: Theme.color.mediumorange2
-                                }
-
-                                // Determinate fill.
-                                Rectangle {
-                                    visible: Nikita.modelOpProgress >= 0
-                                    x: 1; y: 1
-                                    height: parent.height - 2
-                                    radius: 2
-                                    color: Theme.color.lightorange2
-                                    width: Math.max(0, (barTrack.width - 2) * Math.min(1, Nikita.modelOpProgress))
-                                    Behavior on width { NumberAnimation { duration: 150 } }
-                                }
-
-                                // Indeterminate sweep, for the stages that report
-                                // no percentage ("pulling manifest", "verifying").
-                                Rectangle {
-                                    id: barSweep
-                                    visible: Nikita.modelOpProgress < 0
-                                    y: 1
-                                    height: parent.height - 2
-                                    width: Math.max(12, barTrack.width * 0.25)
-                                    radius: 2
-                                    color: Theme.color.mediumorange1
-                                    SequentialAnimation on x {
-                                        running: barSweep.visible && modelManager.visible
-                                        loops: Animation.Infinite
-                                        NumberAnimation {
-                                            from: 1; to: Math.max(1, barTrack.width - barSweep.width - 1)
-                                            duration: 850; easing.type: Easing.InOutQuad
-                                        }
-                                        NumberAnimation {
-                                            from: Math.max(1, barTrack.width - barSweep.width - 1); to: 1
-                                            duration: 850; easing.type: Easing.InOutQuad
-                                        }
-                                    }
-                                }
-                            }
-
-                            RowLayout {
-                                Layout.fillWidth: true
-                                spacing: 8
-                                Text {
-                                    text: Nikita.modelOpStatus
-                                    color: Theme.color.mediumorange1
-                                    font.family: "Share Tech Mono"; font.pixelSize: 9
-                                    elide: Text.ElideRight
-                                    maximumLineCount: 1
-                                    Layout.fillWidth: true
-                                }
-                                Text {
-                                    visible: Nikita.modelOpProgress >= 0
-                                    text: Math.round(Nikita.modelOpProgress * 100) + "%"
-                                    color: Theme.color.lightorange2
-                                    font.family: "Share Tech Mono"; font.pixelSize: 9; font.bold: true
-                                }
-                                Text {
-                                    text: "cancel"
-                                    color: cancelOpMouse.containsMouse ? "#ff6a6a" : Theme.color.mediumorange1
-                                    font.family: "Share Tech Mono"; font.pixelSize: 9; font.bold: true
-                                    MouseArea {
-                                        id: cancelOpMouse
-                                        anchors.fill: parent
-                                        anchors.margins: -4
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: Nikita.cancelModelOp()
-                                    }
-                                }
-                            }
-                        }
-
-                        // Idle row: status pill + action button.
-                        RowLayout {
-                            visible: !model.busy
-                            Layout.fillWidth: true
-                            spacing: 8
-
-                            Rectangle {
-                                Layout.preferredWidth: installedPill.implicitWidth + 12
-                                Layout.preferredHeight: 18
-                                radius: 3
-                                color: model.installed ? "#0f3d1f" : "transparent"
-                                border.width: model.installed ? 0 : 1
-                                border.color: Theme.color.mediumorange2
-                                Text {
-                                    id: installedPill
-                                    anchors.centerIn: parent
-                                    text: model.installed ? "installed" : "not installed"
-                                    color: model.installed ? "#39ff14" : Theme.color.mediumorange1
-                                    font.family: "Share Tech Mono"; font.pixelSize: 10
-                                }
-                            }
-
-                            Item { Layout.fillWidth: true }
-
-                            Text {
-                                visible: !model.installed
-                                text: "install"
-                                color: installMouse.containsMouse ? Theme.color.lightgreen : Theme.color.lightorange2
-                                font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
-                                MouseArea {
-                                    id: installMouse
-                                    anchors.fill: parent
-                                    anchors.margins: -4
-                                    hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    enabled: Nikita.modelOpKind === ""
-                                    onClicked: Nikita.installModel(model.tag)
-                                }
-                            }
-                            Text {
-                                visible: model.installed
-                                text: "uninstall"
-                                color: uninstallMouse.containsMouse ? "#ff6a6a" : Theme.color.mediumorange1
-                                font.family: "Share Tech Mono"; font.pixelSize: 11
-                                MouseArea {
-                                    id: uninstallMouse
-                                    anchors.fill: parent
-                                    anchors.margins: -4
-                                    hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    enabled: Nikita.modelOpKind === ""
-                                    onClicked: Nikita.uninstallModel(model.tag)
+                            onClicked: {
+                                // Save on a field nobody has typed into means
+                                // "let me type": the alternative is a button
+                                // that silently does nothing, which reads as
+                                // broken.
+                                if (!apiKeyBox.editing && Nikita.apiKeyPresent) {
+                                    apiKeyBox.beginEditing();
+                                } else {
+                                    apiKeyField.saveApiKey();
                                 }
                             }
                         }
@@ -1964,7 +2153,6 @@ Rectangle {
             // backend (runOneTool), never here: a control that only hides a
             // tool from the list is decoration, not a gate.
             Rectangle {
-                visible: Nikita.ollamaInstalled
                 Layout.fillWidth: true
                 Layout.preferredHeight: 1
                 color: Theme.color.mediumorange2
@@ -1972,7 +2160,6 @@ Rectangle {
             }
 
             RowLayout {
-                visible: Nikita.ollamaInstalled
                 Layout.fillWidth: true
                 spacing: 8
 
@@ -2047,7 +2234,6 @@ Rectangle {
 
             ListView {
                 id: filterView
-                visible: Nikita.ollamaInstalled
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
@@ -2113,21 +2299,6 @@ Rectangle {
                 }
             }
 
-            // Result line for the op that just finished. Until now the only
-            // places modelOpStatus was shown were bound to an op being *in
-            // flight* (modelOpKind === "ollama", or a row's busy state), so a
-            // fast failure (start, fail, finish, kind back to "") left no
-            // trace anywhere in the UI and read as "the button does nothing".
-            Text {
-                visible: modelOpTracker.fadingStatus.length > 0
-                text: modelOpTracker.fadingStatus
-                color: Theme.color.mediumorange1
-                font.family: "Share Tech Mono"; font.pixelSize: 10
-                wrapMode: Text.WordWrap
-                maximumLineCount: 3
-                elide: Text.ElideRight
-                Layout.fillWidth: true
-            }
         }
     }
 }

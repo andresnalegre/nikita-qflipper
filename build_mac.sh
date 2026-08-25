@@ -66,6 +66,23 @@ make qmake_all;
 make "-j$(sysctl -n hw.ncpu)";
 make install;
 
+# Bundle the Qt frameworks and QML plugins INTO the .app. Without this the app
+# links to Qt at /opt/homebrew (the build machine's Homebrew), which is absent
+# on any other Mac AND, under the hardened runtime, is refused even here because
+# the Homebrew Qt is signed by a different Team ID than the app -- dyld aborts
+# at launch with "Library not loaded ... different Team IDs". macdeployqt copies
+# the frameworks in and rewrites the load paths to @executable_path/../Frameworks.
+# -qmldir lets it discover which QML modules the UI imports so their plugins come
+# too. Its own trailing ad-hoc codesign is expected to fail on a synced folder
+# (detritus xattrs); the real signing happens below, so that failure is ignored.
+MACDEPLOYQT="$(brew --prefix qt)/bin/macdeployqt";
+[ -x "$MACDEPLOYQT" ] || MACDEPLOYQT="$(command -v macdeployqt)";
+"$MACDEPLOYQT" "$PROJECT.app" -qmldir="$PWD/../application" -no-strip || true;
+# The virtual-keyboard input-context plugin references QtVirtualKeyboard, which
+# is not part of this build, so it is dropped -- left in, it is dead weight and
+# a signing/notarization snag. The app uses the normal text input.
+rm -rf "$PROJECT.app/Contents/PlugIns/platforminputcontexts";
+
 # bundle libusb
 mkdir -p "$PROJECT.app/Contents/Frameworks";
 cp "$(brew --prefix libusb_universal)/lib/libusb-1.0.0.dylib" "$PROJECT.app/Contents/Frameworks";
@@ -117,10 +134,24 @@ if [ -n "${RELEASE:-}" ]; then
     mkdir -p "$STAGE";
     /usr/bin/ditto --noextattr --norsrc "$PROJECT.app" "$STAGE/$PROJECT.app";
 
-    # --timestamp is required for notarization; without it the submission is
-    # accepted and then rejected minutes later with no useful message.
+    # Sign bottom-up: every bundled framework and dylib first, then the
+    # executables, then the app itself. `--deep` alone is unreliable across the
+    # ~48 Qt frameworks macdeployqt brings in -- it silently leaves some nested
+    # code unsigned and notarization rejects the lot. Signing each nested Mach-O
+    # explicitly, deepest first, is the sequence Apple actually wants.
+    # --timestamp is required for notarization (without it the submission is
+    # accepted, then rejected minutes later with no useful message).
+    while IFS= read -r fw; do
+        codesign --force --options=runtime --timestamp -s "$SIGN_ID" "$fw";
+    done < <(find "$STAGE/$PROJECT.app/Contents/Frameworks" -maxdepth 1 -name "*.framework" -type d);
+    while IFS= read -r dl; do
+        codesign --force --options=runtime --timestamp -s "$SIGN_ID" "$dl";
+    done < <(find "$STAGE/$PROJECT.app" -name "*.dylib");
+    codesign --force --options=runtime --timestamp -s "$SIGN_ID" \
+        "$STAGE/$PROJECT.app/Contents/MacOS/$PROJECT-cli";
     codesign --force --deep --options=runtime --timestamp \
         -s "$SIGN_ID" -v "$STAGE/$PROJECT.app";
+    codesign --verify --deep --strict "$STAGE/$PROJECT.app";
 
     /usr/bin/ditto -c -k --keepParent "$STAGE/$PROJECT.app" "$STAGE/$PROJECT.zip";
     xcrun notarytool submit --keychain-profile "$PROFILE" --wait "$STAGE/$PROJECT.zip";

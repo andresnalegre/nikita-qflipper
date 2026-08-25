@@ -151,5 +151,6 @@
         <file>components/MessageDialog.qml</file>
         <file>components/HostRunConfirmDialog.qml</file>
         <file>components/HostActionConfirmDialog.qml</file>
+        <file>components/SaveConflictDialog.qml</file>
     </qresource>
 </RCC>

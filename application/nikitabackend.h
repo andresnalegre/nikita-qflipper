@@ -23,7 +23,7 @@ class ApplicationBackend;
 class QNetworkReply;
 class QProcess;
 
-// Nikita - a local-AI (Ollama) chat assistant inside qFlipper, with tool access
+// Nikita - an AI chat assistant inside qFlipper, with tool access to the
 // to live-query the connected Flipper Zero over qFlipper's RPC link.
 class FlipperCli;   // defined below; NikitaBackend holds a pointer for run_cli
 
@@ -41,12 +41,68 @@ class NikitaBackend : public QObject
     bool assistantEnabled() const;
     void setAssistantEnabled(bool on);
 
+    // ---- The API ----------------------------------------------------------
+    // Moonshot's kimi-k3, over the OpenAI wire format, and the only brain there
+    // is. The local Ollama path was removed once this one worked -- with it went
+    // the model catalog, the pull/remove machinery, the runtime installer and
+    // the context-window arithmetic that came with running a 4B on an 8 GB Mac.
+    // Whether a key is available at all, WITHOUT exposing it. QML needs to know
+    // if it can send a turn; it never needs the characters, and a key readable
+    // from QML is a key that ends up in a screenshot.
+    Q_PROPERTY(bool apiKeyPresent READ apiKeyPresent NOTIFY apiKeyChanged)
+    bool apiKeyPresent() const;
+    // Where the key came from, for the settings panel to explain itself:
+    // "environment" (MOONSHOT_API_KEY), "settings", or "" when there is none.
+    Q_PROPERTY(QString apiKeySource READ apiKeySource NOTIFY apiKeyChanged)
+    QString apiKeySource() const;
+    // Which Kimi model answers. kimi-k3 is the newest flagship but is rate-limited
+    // in preview; kimi-k2.6 / k2.7 are GA and run at the account's full tier. A
+    // property so the setup panel can offer the choice, persisted in settings.
+    Q_PROPERTY(QString apiModel READ apiModel WRITE setApiModel NOTIFY modelChanged)
+    void setApiModel(const QString &id);
+    // The selectable Kimi models, each as {id, label, note} for the picker.
+    Q_INVOKABLE QVariantList apiModelChoices() const;
+
+    // Set from the password field in setup. Write-only on purpose: there is no
+    // getter, so nothing in QML can read it back out.
+    //
+    // The explicit public: is load-bearing and not style. Everything from the
+    // top of this class down to the first public: below is implicitly PRIVATE,
+    // which is harmless for the Q_PROPERTY accessors around here -- moc's
+    // generated code is a class member and reaches them regardless -- but a
+    // private Q_INVOKABLE is a different story: it compiles, it appears in the
+    // meta-object, and then QML refuses to call it at runtime with
+    // "Property 'setApiKey' ... is not a function". Every other Q_INVOKABLE in
+    // this file happens to sit after that public:, so nothing had ever caught
+    // it. Restored to private straight after, so the declarations below keep
+    // the access they were written with.
+public:
+    Q_INVOKABLE void setApiKey(const QString &key);
+    Q_INVOKABLE void clearApiKey();
+    // Hands the key back in the clear, for the eye control in setup.
+    //
+    // This is a deliberate reversal: the field was built write-only, with no
+    // getter at all, so that nothing in QML could read the characters even by
+    // accident. Revealing your own key on your own machine is what every
+    // password manager does and is a reasonable thing to want -- but it does
+    // mean the key can now reach a screen, and a key on a screen is a key in
+    // whatever is recording the screen. Named revealApiKey() rather than
+    // apiKey() so a call site can never look like an innocent read, and NOT a
+    // Q_PROPERTY, so no binding can pull it in without asking.
+    Q_INVOKABLE QString revealApiKey() const;
+    // Copy without exposing. The key goes from settings straight onto the
+    // clipboard inside C++ and is never handed to QML, so the copy button --
+    // unlike the eye -- costs nothing in reach. Answers false when there is
+    // nothing to copy, so the UI can stay quiet instead of flashing "copied".
+    Q_INVOKABLE bool copyApiKeyToClipboard() const;
+private:
+
     Q_PROPERTY(bool thinking READ thinking NOTIFY thinkingChanged)
     // ---- Live turn status --------------------------------------------------
     // What is happening RIGHT NOW, in the user's words: "thinking", "writing
     // the file", "running the command", "wrapping up". A turn on a local 4B
     // takes a minute or more and the reply cannot stream while tools are
-    // attached (see dispatchToOllama), so without this the window sits dead
+    // attached (see dispatchTurn), so without this the window sits dead
     // and a working assistant is indistinguishable from a hung one.
     // Every value is set at a real transition -- never a decorative cycle.
     Q_PROPERTY(QString turnStatus READ turnStatus NOTIFY turnStatusChanged)
@@ -62,10 +118,15 @@ class NikitaBackend : public QObject
     // round trip it takes. "2.1k tokens" past a thousand.
     Q_PROPERTY(QString turnTokensText READ turnTokensText NOTIFY turnStatusChanged)
     QString turnTokensText() const;
+    // What the turn has cost so far, as "$0.0123". Empty until the first round
+    // reports usage. Tokens alone stopped being the interesting number the
+    // moment the brain moved to an API: the same 8k tokens is a rounding error
+    // as input and real money as output, and only the dollars say which.
+    Q_PROPERTY(QString turnCostText READ turnCostText NOTIFY turnStatusChanged)
+    QString turnCostText() const;
     Q_PROPERTY(bool configured READ configured CONSTANT)
     Q_PROPERTY(bool hasBle READ hasBle CONSTANT)   // true wherever HZUI_BLE is compiled in
     Q_PROPERTY(QString modelName READ modelName NOTIFY modelChanged)
-    Q_PROPERTY(bool ollamaOnline READ ollamaOnline NOTIFY modelChanged)
     Q_PROPERTY(bool agentEnabled READ agentEnabled WRITE setAgentEnabled NOTIFY agentChanged)
     Q_PROPERTY(QString agentDir READ agentDir WRITE setAgentDir NOTIFY agentChanged)
 
@@ -90,7 +151,6 @@ public:
     bool configured() const;
     bool hasBle() const;   // true only where Qt Bluetooth is compiled in
     QString modelName() const;
-    bool ollamaOnline() const;
     bool agentEnabled() const;                       // host-workspace (self-edit) tools on?
     QString agentDir() const;                        // workspace root Nikita may touch
     void setAgentEnabled(bool on);
@@ -108,6 +168,9 @@ public:
     // Same idea for the other mutating host_* tools (write/mkdir/move/copy/
     // delete); one shared dialog gates all of them. See requestHostActionConfirm().
     Q_INVOKABLE void answerHostActionConfirm(bool allow, bool alwaysAllow);
+    // The user's choice when a Flipper save would overwrite an existing file:
+    // action is "replace", "rename" (with newName), or "cancel".
+    Q_INVOKABLE void answerSaveConflict(const QString &action, const QString &newName);
 
     Q_INVOKABLE void send(const QString &userText, const QString &deviceContext);
     // Typed while a turn is still running. Held, not dropped, and delivered as
@@ -119,7 +182,7 @@ public:
     int queuedCount() const;
     Q_PROPERTY(QString queuedPreview READ queuedPreview NOTIFY queuedChanged)
     QString queuedPreview() const;
-    // Interrupts the reply being waited on: aborts the Ollama HTTP request.
+    // Interrupts the reply being waited on: aborts the HTTP request.
     // Does not reach into an in-flight tool call -- only the dispatch path.
     Q_INVOKABLE void stopThinking();
     // Called from the chat when the user says whether the last action actually
@@ -136,26 +199,11 @@ public:
     Q_PROPERTY(bool canRate READ canRate NOTIFY canRateChanged)
     bool canRate() const;
     Q_INVOKABLE void reset();
-    Q_INVOKABLE void cycleModel();                    // switch to the next installed Ollama model
-    Q_INVOKABLE void setModel(const QString &model);  // pick a specific model
-    Q_INVOKABLE QStringList availableModels() const;  // models installed in Ollama
 
     // ---- Model manager (gear icon) ----------------------------------------
-    // Curated catalog of downloadable Ollama models, each tagged with whether
     // it's currently installed. QML renders this as the model-manager list.
-    Q_INVOKABLE QVariantList modelCatalog() const;
-    Q_INVOKABLE void installModel(const QString &name);    // `ollama pull <name>`
-    Q_INVOKABLE void uninstallModel(const QString &name);  // `ollama rm <name>`
-    // Kills whatever install/uninstall/Ollama-install is currently running.
-    // Works for all three since they share m_modelOpProc.
-    Q_INVOKABLE void cancelModelOp();
 
-    // Whether the Ollama binary itself was found on this machine (independent
     // of whether the server is currently answering /api/tags).
-    Q_PROPERTY(bool ollamaInstalled READ ollamaInstalled NOTIFY ollamaInstalledChanged)
-    bool ollamaInstalled() const;
-    Q_INVOKABLE void installOllama();       // platform install script/package manager
-    Q_INVOKABLE void detectOllama();        // re-check whether the binary is on PATH
 
     // ---- Access filters ----------------------------------------------------
     // What the assistant is allowed to touch. Each list item is a QVariantMap
@@ -170,18 +218,8 @@ public:
     Q_INVOKABLE void setFilter(const QString &id, bool on);
     Q_INVOKABLE void setAllFilters(bool on);   // the two presets: all / none
 
-    // Progress of whatever model pull/remove/Ollama-install is currently running.
     // One op at a time; op == "" when idle.
-    Q_PROPERTY(QString modelOpName READ modelOpName NOTIFY modelOpChanged)
-    Q_PROPERTY(QString modelOpKind READ modelOpKind NOTIFY modelOpChanged)      // "install" | "uninstall" | "ollama" | ""
-    Q_PROPERTY(QString modelOpStatus READ modelOpStatus NOTIFY modelOpChanged)  // human-readable line
-    Q_PROPERTY(double  modelOpProgress READ modelOpProgress NOTIFY modelOpChanged) // 0..1, or -1 = indeterminate
-    QString modelOpName() const     { return m_modelOpName; }
-    QString modelOpKind() const     { return m_modelOpKind; }
-    QString modelOpStatus() const   { return m_modelOpStatus; }
-    double  modelOpProgress() const { return m_modelOpProgress; }
 
-    Q_INVOKABLE void recheckOllama();                    // re-query /api/tags (AI step)
     Q_INVOKABLE QStringList personalityPresets() const;  // preset persona names
     Q_INVOKABLE void applyPreset(const QString &name);   // set persona to a preset
     Q_INVOKABLE void applyNamePersonality();             // persona built from the Flipper's name
@@ -242,17 +280,24 @@ signals:
     void errorOccurred(const QString &text);
     void thinkingChanged();
     void assistantEnabledChanged();
+    void apiKeyChanged();
     void canRateChanged();
     void queuedChanged();
     void turnStatusChanged();
+    // One tool call, as its own line in the chat rather than as part of the
+    // reply text. `seq` identifies the call for the whole of its life, so the
+    // line the UI drew when it STARTED is the same line that gets rewritten
+    // when it finishes -- a running step and its result are one event, not two.
+    // `detail` is the exact call -- tool name and arguments, e.g.
+    // "press_button(button=up, times=2)" -- so the row can be expanded in the
+    // chat to show what was actually executed.
+    void toolActivity(int seq, const QString &text, const QString &detail,
+                      bool finished, bool failed);
     void modelChanged();
     void agentChanged();
-    void ollamaInstalledChanged();
     void filtersChanged();
-    void modelOpChanged();                                  // progress tick, any op
     void modelInstallFinished(const QString &name, bool ok, const QString &message);
     void modelUninstallFinished(const QString &name, bool ok, const QString &message);
-    void ollamaInstallFinished(bool ok, const QString &message);
     void scriptSaved(const QString &path);        // manual save succeeded
     void scriptSaveError(const QString &message);  // manual save failed
     void fileOpened(const QString &path, const QString &content); // editor: file read
@@ -270,6 +315,9 @@ signals:
     // ("write"/"mkdir"/"move"/"copy"/"delete"), `summary` is a one-line
     // description for the dialog title, `detail` is optional extra context
     // (a content preview for a write, empty for the rest).
+    // A save_file to the Flipper found a file already at that path. QML shows
+    // Replace / Rename / Cancel; the answer comes back via answerSaveConflict.
+    void saveConflictRequested(const QString &path, const QString &preview);
     void hostActionConfirmRequested(const QString &kind, const QString &summary,
                                     const QString &detail);
 
@@ -280,6 +328,11 @@ private:
     void refreshMemoryFromDisk();
     void writeMemoryCache() const;
     bool adoptMemoryIfMemoryFile(const QString &path, const QString &content);
+    // The twin for actions-memory.txt: a hand-edit of the proven-moves file is
+    // authoritative, including deleting it down to nothing. Without this the
+    // stale in-memory list was written straight back on the next turn, so an
+    // erase on the card reverted itself.
+    bool adoptSkillsIfSkillsFile(const QString &path, const QString &content);
 
     // Filters: stored as the OFF set (the .cpp explains why that way round).
     void loadFilters();
@@ -294,30 +347,25 @@ private:
     // a command that no longer exists.
     static QString cliReferenceForPrompt();
     QString assistantName() const;   // device name -> who the log credits
-    void refreshModels();   // query Ollama /api/tags for installed models
-
-    // Model manager internals.
-    void runModelOp(const QString &kind, const QString &name, const QStringList &args);
-    void appendModelOpOutput(const QByteArray &chunk); // parse a QProcess output chunk
-    void finishModelOp(bool ok, const QString &message);
-    void setModelOp(const QString &kind, const QString &name,
-                    const QString &status, double progress);
 
     void loadHistory();   // restore past conversation from disk
     void saveHistory();   // persist conversation (user + final replies only)
 
-    void dispatchToOllama();                                   // POST history + tools
+    void dispatchTurn();                                   // POST history + tools
     void onStreamData(QNetworkReply *reply);      // parse streamed NDJSON chunks
     void onStreamFinished(QNetworkReply *reply);
     void finalizeStream();                        // a full response arrived
+    // One decoded reply, normalised out of the OpenAI shape into the one the
+    // rest of this file reads. Returns true when the turn is finished.
+    bool consumeModelFrame(const QJsonObject &obj);
     void runToolCalls(const QJsonArray &toolCalls, int index); // execute tools sequentially
     // Every exit point that ends a turn with a user-visible reply calls this
-    // instead of `emit replyReceived` directly, so the tool trail (m_turnProgress)
+    // instead of `emit replyReceived` directly, so the closing "done in" line
     // rides along with the text it produced rather than vanishing once the
     // streaming bubble in QML is overwritten by the model's own words.
     void emitReply(const QString &text);
 
-    // There is one path only (dispatchToOllama). Every continuation point in
+    // There is one path only (dispatchTurn). Every continuation point in
     // finalizeStream()/runToolCalls() calls THIS, never the backend directly,
     // so a mid-turn retry and a tool-result round trip go the same way.
     void redispatch();
@@ -359,6 +407,16 @@ private:
     // host_delete. Unlike host_run's always-allow list (one exact command
     // string), this remembers by KIND, since paths differ on every call.
     // `run` is the already-resolved mutation; `done` reports back on decline.
+    // Flipper save with an overwrite guard: stat the path, and if a file is
+    // already there hand the choice to the user before writing.
+    void beginFlipperSave(const QByteArray &path, const QString &content,
+                          std::function<void(const QString &)> done);
+    void writeFlipperFile(const QByteArray &path, const QString &content,
+                          std::function<void(const QString &)> done);
+    QString    m_pendingSaveContent;
+    QByteArray m_pendingSavePath;
+    std::function<void(const QString &)> m_pendingSaveDone;
+
     void requestHostActionConfirm(const QString &kind, const QString &summary,
                                   const QString &detail,
                                   std::function<void()> run,
@@ -382,9 +440,12 @@ private:
     QString    m_deviceContext;  // latest diagnostics snapshot from QML
     int        m_toolRounds = 0;
     bool       m_turnNeedsTools = false;   // set per turn by the intent router
+    // Does this turn concern the Flipper at all? Decides whether the radio /
+    // NFC / IR / BadUSB manual is worth its ~2000 tokens of window this turn.
+    bool       m_turnIsDevice = false;
     // Which machine the turn is about (0 both / 1 Flipper / 2 this computer).
     // Decided when the message arrives, used later when the request is built --
-    // dispatchToOllama() no longer has the message in hand by then.
+    // dispatchTurn() no longer has the message in hand by then.
     int        m_turnFocus = 0;
     // A turn gets one forced retry: when the model answers a write request in
     // prose instead of calling anything, it is asked again with a single tool.
@@ -453,14 +514,14 @@ private:
     int        m_toolTurnCooldown = 0;
     bool       m_lastTurnWasAction = false;  // the PREVIOUS turn did a file/device action
                                              // -> keep read tools on for the follow-up question
+    // Sticky, for the same reason: "now add a delay to it" is still about the
+    // script on the Flipper even though the word never appears in the message.
+    bool       m_lastTurnWasDevice = false;
     QString    m_lastSavedPath;              // path of the most recent save_file this session,
                                              // injected into the prompt so "make it fancy" edits
                                              // the SAME file instead of spawning a new one
     bool       m_thinking = false;
-    QString     m_model;    // selected Ollama model (persisted)
     QStringList m_models;   // models discovered via /api/tags
-    QStringList m_noToolModels;  // models Ollama rejects tools for (e.g. Gemma) -> chat-only
-    bool        m_ollamaOnline = false;
     bool        m_agentEnabled = true;   // computer tools; on unless explicitly turned off
     QString     m_agentRoot;             // absolute workspace folder Nikita may edit
     // SD-card backup. Entries are copied one at a time so the device is never
@@ -501,19 +562,51 @@ private:
     bool        m_portableLoaded = false; // loaded memory from the Flipper this session
 
     QByteArray m_streamBuf;       // buffer for partial streamed lines
+    // The key is never held in a member: it is read from the environment or
+    // QSettings at the moment a request is built and goes straight into the
+    // header. Nothing keeps a copy that could be logged or dumped with the
+    // rest of the object's state.
+    QString    apiKey() const;
+    QString    apiModel() const;  // the model id sent to the API
+    // The app builds messages in a loose shape: a tool call whose arguments are
+    // a JSON object, and a tool result that just follows it. The
+    // OpenAI wire format does not: a tool call needs an id and its arguments
+    // as a STRING, and every tool result has to name the call it answers.
+    // Converted per request rather than stored, so the history on disk stays
+    // in the shape everything else in this file reads.
+    static QJsonArray toOpenAiMessages(const QJsonArray &msgs);
+    static QJsonObject normaliseApiReply(const QJsonObject &resp);
     QString    m_streamContent;   // accumulated reply text this response (one round)
     QString    m_turnText;        // best prose across all rounds of the turn (survives round resets)
     QJsonArray m_streamTools;
-    // Ollama's final frame, kept only so an empty answer can be explained
+    // The final frame, kept only so an empty answer can be explained
     // rather than guessed at (eval_count tells us whether tokens were made).
     QString    m_lastRawFrame;
     // Tool results shown in the chat as they land, so the pane isn't blank
     // during the round trip that turns them into a sentence.
-    QString    m_turnProgress;     // accumulated tool calls this response
+     // accumulated tool calls this response
     void setTurnStatus(const QString &s);
     QString    m_turnStatus;
     qint64     m_turnStartedMs = 0;
     int        m_turnTokens = 0;
+    int        m_toolSeq = 0;       // ids handed to toolActivity(), unique per session
+    // Estimated prompt tokens for the round in flight, shown in the footer while
+    // the model is thinking. The API reports real usage only when the whole
+    // reply lands, so without this the counter is blank for the entire wait.
+    int        m_turnPromptEstTok = 0;
+    int        m_apiRateRetry = 0;  // 429 retries used this turn (see NIKITA_API_MAX_RATE_RETRIES)
+    int        m_activeToolSeq = 0; // the call currently running, so its result
+                                    // rewrites the row its start opened
+    // Trimmed stdout of the most recent command this turn (host_run or run_cli),
+    // so a script that must contain a command's result can be filled in by the
+    // code -- via the {{LAST_RESULT}} token -- instead of the model retyping the
+    // number by hand and risking a transcription error.
+    QString    m_lastRunOutput;
+    QString    substituteRunResult(const QString &content) const;
+    // What this turn has cost in dollars so far, summed across its rounds. Only
+    // ever non-zero on the API path; a local turn costs electricity, which this
+    // has no way to price and no reason to pretend it can.
+    double     m_turnCostUsd = 0.0;
     bool       m_turnTruncated = false;
     QString    m_lastTurnCost;     // "8m 36s · 4.8k tokens", frozen when the turn ends
     QTimer     m_turnTicker;
@@ -523,25 +616,10 @@ private:
     bool m_userStoppedThinking = false;
 
     // ---- Model manager --------------------------------------------------
-    bool m_ollamaInstalled = false;
-    bool m_ollamaChecked = false;
-    // Absolute path to the CLI, resolved by detectOllama(). Empty == not found.
     // Used to launch pull/rm so they don't rely on the inherited PATH either.
-    QString m_ollamaPath;
 
-    QProcess   *m_modelOpProc = nullptr;   // pull / rm / install-ollama, one at a time
-    QString     m_modelOpKind;             // "install" | "uninstall" | "ollama" | ""
-    QString     m_modelOpName;             // model name, or "" for the Ollama install itself
-    QString     m_modelOpStatus;
-    double      m_modelOpProgress = -1.0;
-    QByteArray  m_modelOpBuf;              // partial line buffer (pull output uses \r a lot)
-    QByteArray  m_modelOpLine;             // bytes since the last line break, carried between reads
-    bool        m_modelOpCancelled = false;  // user hit cancel, so report "cancelled", not exit code noise
-    // Dedupe state for the LOGS-panel progress line in appendModelOpOutput():
     // logs once per phase change, then once per 10% within a phase, instead
     // of once per '\r' redraw.
-    QString     m_modelOpLastLoggedTopic;
-    int         m_modelOpLastLoggedBucket = -1;
 };
 
 // Tracks community Flipper firmwares (Official, Momentum, Unleashed, RogueMaster),
@@ -1102,4 +1180,8 @@ private:
     QTimer *m_runIdle = nullptr;
     QTimer *m_runGuard = nullptr;
     std::function<void(bool, QString)> m_runDone;
+    // Whether the command being run is expected to drop the USB link (reboot,
+    // power off, shutdown). Used so a disconnect during those is not misread as
+    // a crash -- for everything else, the link vanishing mid-command IS a crash.
+    bool m_runRebootExpected = false;
 };
