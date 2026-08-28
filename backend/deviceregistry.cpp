@@ -239,7 +239,17 @@ void DeviceRegistry::processDevice()
         if(arg->deviceState()->isPersistent() && !arg->deviceState()->isOnline()) {
             return true;
         }
-        return info.usbInfo.serialNumber() == arg->deviceState()->deviceInfo().usbInfo.serialNumber();
+        // Never let a cable arriving alongside a wireless device be mistaken
+        // for that device coming back: a BLE entry has no USB identity at all,
+        // so its serial is empty, and an empty-serial USB device would have
+        // matched it and overwritten the BLE device in place instead of
+        // registering as the second, preferred connection.
+        const auto &known = arg->deviceState()->deviceInfo();
+        if(info.isBle != known.isBle) {
+            return false;
+        }
+        return !info.usbInfo.serialNumber().isEmpty() &&
+                info.usbInfo.serialNumber() == known.usbInfo.serialNumber();
     });
 
     if(it != m_devices.end()) {
@@ -251,7 +261,22 @@ void DeviceRegistry::processDevice()
         qCDebug(LOG_DEVREG) << "Registering the device";
 
         auto *device = new FlipperZero(info, this);
-        m_devices.append(device);
+
+        // A cable plugged in while a wireless link is up takes over as the
+        // active device, without the BLE one being dropped: both stay
+        // registered, and unplugging falls straight back to Bluetooth. The
+        // cable is faster and is what someone reaches for when they want to
+        // do real work, so it goes to the front of the list -- currentDevice()
+        // is simply the first entry -- instead of the user having to
+        // disconnect BLE and reconnect over USB to be heard.
+        const bool cableTakesOver = !info.isBle && !m_devices.isEmpty() &&
+                                     m_devices.first()->deviceState()->deviceInfo().isBle;
+        if(cableTakesOver) {
+            qCDebug(LOG_DEVREG) << "Cable connected while on BLE -- the cable takes over";
+            m_devices.prepend(device);
+        } else {
+            m_devices.append(device);
+        }
 
         if(info.isBle) {
             // BLE has no USB-unplug event, so watch the device's own session:
@@ -271,7 +296,7 @@ void DeviceRegistry::processDevice()
 
         emit deviceCountChanged();
 
-        if(m_devices.size() == 1) {
+        if(m_devices.size() == 1 || cableTakesOver) {
             emit currentDeviceChanged();
         }
     }

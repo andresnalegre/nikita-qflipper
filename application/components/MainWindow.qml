@@ -475,6 +475,13 @@ Item {
     Item {
         id: bleOverlay
         property bool open: false
+        // Two jobs, decided by whether a Flipper is already in hand. With none
+        // connected this panel is the way in -- it hunts for Flippers and shows
+        // what it found as buttons to press. With one already connected there is
+        // nothing left to find, so the same button becomes a look at the radio
+        // neighbourhood, which is a reading, not a list of things to click.
+        readonly property bool flipperHunt:
+            Backend.backendState === ApplicationBackend.WaitingForDevices
         anchors.left: mainContent.left
         anchors.right: mainContent.right
         anchors.top: mainContent.top
@@ -512,11 +519,15 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true; spacing: 10
                     Rectangle {
-                        Layout.preferredWidth: 110; Layout.preferredHeight: 30; radius: 6
+                        Layout.preferredWidth: 130; Layout.preferredHeight: 30; radius: 6
                         border.width: 1; border.color: Theme.color.mediumorange2
                         color: scanMouse.containsMouse && !Ble.scanning ? Theme.color.mediumorange2 : "transparent"
-                        Text { anchors.centerIn: parent; text: Ble.scanning ? "SCANNING…" : "SCAN"; color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true }
-                        MouseArea { id: scanMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: if (!Ble.scanning) Ble.scan() }
+                        // The first press is the Flipper hunt -- that is what
+                        // this panel is opened for. Once that has run, the
+                        // button becomes the neighbourhood view: every LE
+                        // device the radio can hear, Flipper or not.
+                        Text { anchors.centerIn: parent; text: Ble.scanning ? "SCANNING…" : (bleOverlay.flipperHunt ? "FIND FLIPPER" : "SCAN NETWORK"); color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true }
+                        MouseArea { id: scanMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: if (!Ble.scanning) { if (bleOverlay.flipperHunt) Ble.scan(); else Ble.scanAll(); } }
                     }
                     Rectangle {
                         visible: Ble.connected
@@ -536,6 +547,12 @@ Item {
                     }
                     Item { Layout.fillWidth: true }
                     Text {
+                        // Only while this panel is the way in. Once a Flipper is
+                        // connected the home screen states the link -- cable or
+                        // Bluetooth -- and a second, narrower verdict here (which
+                        // only ever knew about the BLE side) contradicted it: the
+                        // panel said "not connected" over a live wireless device.
+                        visible: bleOverlay.flipperHunt
                         text: Ble.sessionActive ? "● RPC Connected" : (Ble.connected ? "● spike link" : "○ not connected")
                         color: Ble.sessionActive ? Theme.color.lightgreen : (Ble.connected ? Theme.color.lightorange2 : Theme.color.mediumorange1)
                         font.family: "Share Tech Mono"; font.pixelSize: 12
@@ -546,13 +563,25 @@ Item {
                     Layout.fillWidth: true; spacing: 8
                     Repeater {
                         model: Ble.devices
-                        // Every entry here already passed the Flipper filter
-                        // in onDeviceDiscovered (name or service UUID) -- so
-                        // this reads as "found it", not just "here's a
-                        // button": the same green the rest of the app uses
-                        // for active/connected, not the neutral chrome pink.
+                        // A Flipper entry (name or service UUID, decided in
+                        // onDeviceDiscovered) reads as "found it": the same
+                        // green the rest of the app uses for active/connected,
+                        // not the neutral chrome pink.
                         delegate: Rectangle {
-                            radius: 6; height: 30; width: dtxt.width + 24
+                            // A "scan all" run lists the whole neighbourhood,
+                            // and only a Flipper can actually be connected to.
+                            // Green + clickable still means "found it"; the
+                            // rest are muted chrome that does nothing when
+                            // pressed, rather than a button that fails.
+                            readonly property bool isFlipper: modelData.isFlipper === undefined || modelData.isFlipper
+                            // A button here means "press this to connect", so
+                            // only something connectable gets one. A network
+                            // sweep turns up a screenful of nameless earbuds and
+                            // TVs; those belong in the log, which is a reading of
+                            // what is in range, and not in a grid of buttons that
+                            // do nothing when pressed.
+                            visible: isFlipper
+                            radius: 6; height: visible ? 30 : 0; width: visible ? dtxt.width + 24 : 0
                             border.width: 2; border.color: Theme.color.lightgreen
                             color: dMouse.containsMouse ? Qt.rgba(Theme.color.lightgreen.r, Theme.color.lightgreen.g, Theme.color.lightgreen.b, 0.18) : "#0f2a14"
                             Text { id: dtxt; anchors.centerIn: parent; text: modelData.name; color: Theme.color.lightgreen; font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true }

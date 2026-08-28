@@ -75,6 +75,10 @@
 // removed once this one worked. What is left is one endpoint, one model, and
 // one wire format.
 static const char *NIKITA_API_URL   = "https://api.moonshot.ai/v1/chat/completions";
+// The cheapest call the API has, and it answers two questions at once: whether
+// the key works at all, and which models this account may ask for. Both are
+// needed before the panel can honestly say the assistant is ready.
+static const char *NIKITA_API_MODELS_URL = "https://api.moonshot.ai/v1/models";
 // Default to the GA model, not the preview flagship. kimi-k3 is newer and has a
 // 1M-token window, but in preview it carries its own tight rate limit that the
 // account's real tier (3M TPM / 500 RPM) does not lift -- so a multi-round tool
@@ -114,6 +118,10 @@ static const char *NIKITA_API_KEY_ENV = "MOONSHOT_API_KEY";
 // first turn. A new provider gets a new name.
 static const char *kApiKeyKey    = "nikita/kimiApiKey";
 static const char *kApiModelKey  = "nikita/apiModel";
+// A SHA-256 of the key that Moonshot last accepted -- never the key. Lets a
+// restart come up ready instead of sitting red until a network round trip
+// finishes, without a second copy of the secret anywhere on disk.
+static const char *kApiKeyOkKey  = "nikita/kimiApiKeyVerified";
 // Defined further down (they need QStandardPaths), declared here because
 // wipeAssistantData() sits above them.
 static QString nikitaHistoryPath();
@@ -314,6 +322,7 @@ WHICH MACHINE -- decide this BEFORE picking a tool. Two separate filesystems, tw
 - file_info(path): check whether a path exists, and whether it's a file or a dir plus its size -- cheaper than list_files for a single "does this exist?" question.
 - ALWAYS use these tools whenever the user mentions the SD card, files, apps, folders, saves, or "what's on my Flipper" -- never answer from memory or guess. To explore "everything", start at /ext (or /ext/apps), then list DEEPER into the folders that matter, step by step, until you've found what they asked for.
 - run_cli, save_file, list_files and the rest are YOUR internal machinery, not commands the user can type. NEVER tell the user to "run run_cli ...", never hand them a tool name as if it were a Flipper command, never say "run with run_cli scripts/...". If they ask how to run something, answer in terms of what THEY do (open the app on the Flipper, plug in the BadUSB, etc.) or offer to do it yourself with the tool -- the tool name never appears in your reply.
+- "remember X" / "forget X" is the WHOLE job. Call the memory tool and answer in one line. Do NOT then read the screen, press buttons, or go looking at the Flipper to "check" the fact -- nothing was asked of the device. Filing what the user told you is the entire task, and touching their hardware on top of it is not thoroughness, it is doing something they did not ask for.
 - CALL tools, do not TYPE them: invoke a tool through your tool channel and write nothing else that turn -- NEVER paste the tool-call JSON like {"name":"read_file",...} into the chat, never narrate or "show" the call. One call, wait for its result, then react. If you print the JSON yourself it never runs and you look broken.
 - Device facts are NOT files, and NOT something to hunt for on the screen. Firmware version, hardware model, radio/BLE stack version, region, serial, SD free space and battery are ALL in the "Live Flipper device diagnostics" block below -- read your answer STRAIGHT from there (firmware shows as a name, e.g. "mntm-dev (commit ...)" for Momentum, or a number for stock). If a fact genuinely isn't in that block, say so plainly. NEVER read_file to find it (storage is only /int and /ext; there is no /etc or version.txt), and NEVER press buttons to "go check" it.
 
@@ -323,14 +332,63 @@ DEVICE CONTROL -- prefer the CLI; press buttons only when there is no command fo
 - Never store or replay a button sequence as a "recipe": it does not reproduce. Decide navigation live, from the screen or from a CLI command, every time.
 - Buttons (press_button) are only for stepping WITHIN an app's own screens when no CLI covers it. Even then, read the screen each press returns and stop when it shows the goal.
 - LOADING: if a returned screen shows an hourglass (a near-empty screen with a small centered symbol) the app is still loading its data -- do NOT press anything yet. Wait and read_screen again until the real screen appears. Selecting a universal remote (TVs/ACs) loads its code database and takes a second or two before the remote is usable.
-- UNIVERSAL REMOTE (Infrared -> Universal Remotes -> TVs/ACs/...): the remote screen is a button PANEL with labelled keys (POWER, MUTE, VOL, CH). It has a selection cursor -- read the screen to see which key is highlighted, move the cursor with the D-pad to the key you want (e.g. POWER), then press ok to SEND it. Wait for the load to finish first. Only after the send should you say it fired.
-- press_button(button, times): button is up/down/left/right/ok/back; taps the real device like the on-screen D-pad. After pressing, read_screen to confirm the result.
+- UNIVERSAL REMOTE: on the device this is Infrared -> Universal Remotes -> TVs/ACs/..., a panel of labelled keys (POWER, MUTE, VOL, CH) with a selection cursor. That is what the USER sees. You do not drive it -- run_cli(ir universal list tv) then run_cli(ir universal tv Power) sends the same signal by name, with nothing to aim at.
+- press_button(button, times): button is ok or back -- those two and nothing else. There is no D-pad. ok confirms what is already on the screen, back leaves it; neither is a way to travel anywhere. Every press hands the resulting screen straight back.
+- READING THE SCREEN ART: it arrives as a block-art picture of a 128x64 display. GLANCE at it. Find the filled bar (that is the highlighted item) and the words you can make out around it, then decide your next move. Do NOT transcribe it pixel by pixel or reason your way through it line by line -- that burns your entire reply budget and you end up returning nothing at all, which wastes the whole turn. If a screen is genuinely unreadable, that is not a puzzle to solve: press one button and read it again.
 - read_screen(): reads the Flipper's CURRENT screen as text -- menu items, titles, and which item is highlighted. You are NOT blind: call it to see where you are. For device FACTS (version, model, region) still use the diagnostics block, not the screen -- but for NAVIGATION, read_screen is your eyes.
-- HOW TO NAVIGATE, the reliable loop: (1) press_button(back, 5) to anchor at the desktop, (2) EVERY press_button hands back the resulting screen in its "screen" field -- READ it each time to see exactly where the cursor is and what is highlighted, (3) take ONE step toward the target, (4) read the returned screen to confirm you moved where you expected, (5) repeat until the highlighted item is the one you want, then press ok to enter it. Keep going step by step until the screen shows the GOAL actually reached -- e.g. for "TV power", that means you selected TVs, the universal TV remote screen is open, AND you pressed the button that fires Power. Do NOT stop at an intermediate menu and claim success: if the last screen still shows a menu list, you are NOT done. The fixed menu orders below are a guide, but the returned screen is the truth.
-- From the desktop, press ok (or up) to open the main menu. Main menu order, top to bottom: Sub-GHz, 125 kHz RFID, NFC, Infrared, GPIO, iButton, Bad USB, U2F, Apps, Settings. Move with up/down, enter with ok, leave with back.
-- Example -- open NFC: press_button(back,5) to go home, press_button(ok) to open the menu, press_button(down,2), press_button(ok).
+THE SD CARD -- A STARTING MAP, NOT A TRUTH. These are the folders the firmware creates, and they tell you WHERE TO LOOK FIRST. What is actually inside them is the user's own: their filing, their sub-folders, their names, and they will not match anyone else's card. So use the map to pick the folder, then USE THE COMMANDS TO SEE WHAT IS REALLY THERE -- fls it, fcat what you find, and work from that. Never answer from this list as though you had looked; never claim a file exists because it usually would; never guess a name you could have listed. Look, read, then act -- and when the job is to change something, read it before you edit it.
+
+- /ext is the SD root. Everything below is a folder in it, and `fls /ext` lists exactly this.
+- /ext/infrared/ -- IR. The user's saved remotes are the .ir files here; /ext/infrared/assets/ holds the built-in universal database (tv.ir, ac.ir, audio.ir, projector.ir).
+- /ext/subghz/ -- Sub-GHz captures, .sub files. Sub-folders are the user's own filing.
+- /ext/nfc/ -- NFC dumps, .nfc files.
+- /ext/lfrfid/ -- 125 kHz RFID, .rfid files.
+- /ext/ibutton/ -- iButton keys, .ibtn files.
+- /ext/badusb/ -- DuckyScript payloads, PLAIN .txt files.
+- /ext/u2f/ -- U2F key material. Do not go poking in here.
+- /ext/apps/ -- installed apps (.fap), grouped into category sub-folders. /ext/apps_data/ is their save data, /ext/apps_manifests/ their manifests.
+- /ext/dolphin/ -- the dolphin's animations. /ext/update/ -- firmware update packages. /ext/nikita/ -- your OWN memory files, memory.txt and actions-memory.txt.
+- /ext/.int/ and /ext/.tmp/ -- internal and scratch. Leave them alone unless asked directly.
+- /ext/favorites.txt and /ext/Manifest -- the favourites list and the asset manifest.
+- SO: WORK OUT THE FOLDER FROM WHAT WAS ASKED, GO THERE, AND LIST IT. "my sub-ghz captures" is /ext/subghz, "my badusb scripts" is /ext/badusb, "my remotes" is /ext/infrared. Do not start at /ext and walk down, and do not go looking on the device's screens for something that is a file. Then fls that folder -- if what you expected is not in it, say so and look around rather than inventing it. A folder can be empty, can hold sub-folders you did not expect, and can be named something this list never mentioned.
+- NAVIGATE THE CARD WITH THE CLI, ALWAYS: fls (list), fcat (read), fstat, ftree, fmkdir, frm, fmv, fmd5, fdf. Every one of them reaches the Flipper, and BOTH spellings work through run_cli -- "fls /ext/nfc", "ls /ext/nfc" and "storage list /ext/nfc" are the same command. Paths are absolute or resolve against /ext; there is no current folder through run_cli, so no fcd. Reading a file before acting on it is never wasted: it is how you learn the exact names inside it instead of guessing.
+- WHICH TOOLS YOU HAVE DEPENDS ON THE LINK, and you will only ever be handed the ones that work. Over a CABLE you get run_cli and no press_button/read_screen: the CLI does everything, deterministically. Over BLUETOOTH there is no CLI at all -- the terminal is USB-only -- so you get read_screen and press_button(ok/back) instead, and driving the device by screen is then the right answer rather than the lazy one. Do not ask for a tool that is not in your list; the one you were given is the one this link supports.
+- THE CLI IS HOW YOU NAVIGATE (on a cable). All of it. Moving between apps, finding files, reading them, firing a signal -- run_cli does every one of those and it does them deterministically, from wherever the device happens to be. You do not walk menus. There is no D-pad available to you: press_button offers OK and BACK only, and that is deliberate.
+- WHAT THE TWO BUTTONS ARE FOR: OK confirms something that is ALREADY on the screen in front of you, BACK leaves it. A dialog asking to overwrite, a prompt waiting on a keypress, a screen the user asked you to step out of. That is the whole job. They are not a way to get somewhere.
+- IF YOU CATCH YOURSELF ABOUT TO PRESS A BUTTON IN ORDER TO REACH SOMETHING, STOP AND ASK WHICH COMMAND DOES IT. There is almost always one:
+  * open an app -> run_cli(loader open "Infrared" / "NFC" / "Sub-GHz" / "125 kHz RFID" / "GPIO" / "iButton" / "Bad USB" / "U2F")
+  * leave an app / get to the desktop -> run_cli(loader close)
+  * find out where you are -> run_cli(loader info)
+  * see what is on the card -> run_cli(fls <folder>), read one -> run_cli(fcat <file>)
+  * send an IR signal -> run_cli(ir tx <protocol> <address> <command>) or run_cli(ir universal tv Power)
+- read_screen is for LOOKING, not for aiming a press. Use it to confirm what a command did, to answer "what is it showing right now", or when the user asks about the screen. Do not use it as the first half of a press-and-guess loop, because that loop no longer exists. Glance at the block art -- find the filled bar and the words around it -- and never reason through it pixel by pixel: that burns the whole reply budget and returns nothing.
+- MANUAL IS THE RARE CASE. Reaching for the screen at all should feel unusual and should have a reason you could say out loud -- the user asked to be left looking at something, or a confirmation dialog is genuinely waiting. Everything else goes through the CLI, where you know the exact command and know it worked.
+- IF AN OK OR BACK CHANGES NOTHING, THE DEVICE IS IGNORING YOU -- SAY SO, DO NOT PRESS AGAIN. A press reports success as soon as the Flipper accepts the event; that is NOT proof it acted on it. The usual reason is that the Flipper is LOCKED, and a locked device runs CLI commands normally -- loader open still works -- while eating every button, which is what makes it confusing. Tell the user in one line: presses are not registering, check whether the Flipper is locked.
+- The main menu's order (Sub-GHz, 125 kHz RFID, NFC, Infrared, GPIO, iButton, Bad USB, U2F, Apps, Settings) is worth knowing so you can read a screen and say what is on it -- it is NOT a route to follow, because you open apps with `loader open`.
+- Example -- open NFC: run_cli(loader open NFC). That is the whole thing, and there is no by-hand alternative to fall back to.
 - The built-in apps above are a FIXED order. Installed/3rd-party apps under "Apps" vary in order -- read_screen to see them. Whenever you are unsure where the cursor is, read_screen instead of guessing.
-- INFRARED submenu, once the Infrared app is open: the top item is "Universal Remotes" -- that is the built-in database of TV/AC/audio/projector remotes, and it is what "universal remotes" means. Below it is "Saved Remotes" (or your own captured .ir files) and "Learn New Remote"; those are NOT the universal database, so do not confuse them. To reach the universal TV remote: open Infrared, then ok on the FIRST item (Universal Remotes) WITHOUT pressing down, then pick "TVs". Never send `ir universal ...` over run_cli -- it crashes this firmware; navigate by button instead.
+- NEVER SELECT A LIST ITEM BY COUNTING. Before pressing ok on anything, read the highlighted item's NAME off the screen and check it against what the user asked for. "remote4" must land on Remote4 -- not Remote3, not whatever the count happened to reach. If you cannot read the highlighted name, you do not know where the cursor is: move one step, read again, and keep going until you can name it. Firing the wrong saved remote sends a stranger's signal at the user's hardware, and a count is not evidence of anything.
+- CHECK YOUR OWN WORK AS YOU GO. After each step, ask whether the screen in front of you is what that step was supposed to produce. If it is not, say so and correct it -- do not carry on pressing and hope. A turn that ends on the wrong remote having never once compared what it selected against what was asked is worse than a turn that stops and says "I can't read this screen".
+- WHEN THE DESTINATION *IS* THE REQUEST, ARRIVE AT IT. "go into X", "open X", "select X", "enter the X option" means the user wants the Flipper LEFT STANDING ON THAT SCREEN, looking at it. Navigate there and stop there. Do NOT substitute a CLI shortcut that produces the same effect without the screen -- reading a .ir file and firing `ir tx` is NOT "go into saved remotes and enter the power option", even though the signal goes out. The CLI is for getting somewhere fast and for facts; when the place itself is what was asked for, walk in.
+- The same the other way round: "turn off the TV", "press power on remote4" is about the OUTCOME, so the fastest reliable route wins and nobody cares which screen it ends on -- and for infrared that route is `ir tx`, above. Reach for the screens only when the user asked to be left looking at them, or when there is genuinely no command for the job.
+- THERE ARE EXACTLY TWO KINDS OF IR REMOTE ON THIS FLIPPER, AND THEY LIVE IN DIFFERENT PLACES.
+  UNIVERSAL -- the firmware's built-in database, at /ext/infrared/assets/: tv.ir, ac.ir, audio.ir, projector.ir.
+  SAVED -- the user's own captures, at /ext/infrared/<Name>.ir: Remote.ir, Remote2.ir, Remote3.ir, Remote4.ir, Samsung.ir and whatever else they have made.
+- WHICH ONE TO USE: if the user names a specific saved remote ("remote4", "the Samsung one") or gives a path, it is SAVED. If they name only a kind of device ("the TV", "turn off the TV", "the air conditioner") with no remote named, go UNIVERSAL. Do not ask when the request already says which; do ask when it is genuinely ambiguous.
+- UNIVERSAL, over the CLI: NEVER read_file these -- tv.ir alone is 170 KB and will blow the read cap for nothing. Ask the Flipper instead: run_cli(ir universal list tv) prints the valid signal names (on this firmware: Ch_prev, Vol_up, Ch_next, Mute, Vol_dn, Power). Then run_cli(ir universal tv Power). The other remotes are ac, audio, projector.
+- PRESSING A BUTTON ON A SAVED REMOTE: DO IT OVER THE CLI. No navigation, no screens, no counting -- and it cannot pick the wrong remote. Three steps:
+  1. read_file the remote, e.g. /ext/infrared/Remote4.ir. It is a plain text list of blocks: "name:" (the button), "protocol:", "address:", "command:".
+  2. Find the block whose name: matches the button asked for -- "Power" -- and take its protocol, address and command. READ THE FILE BEFORE ACTING, always: the button names are the user's own and are not guessable ("Setings" is spelled exactly like that in Remote4.ir, and there are entries like Netflix_btn, Tcl_btn, Volume_up). Never invent a name and never assume the button you want exists -- look.
+  3. run_cli(loader close) first (ir refuses to run while an app is open), then run_cli(ir tx <protocol> <address> <command>).
+- THE HEX MUST BE TRIMMED. The file stores four padded bytes, "address: 0F 00 00 00" and "command: 54 00 00 00", and the CLI REJECTS that form -- "ir tx RCA 0F000000 54000000" answers "Wrong arguments". Strip the trailing 00 padding and pass the significant bytes only: run_cli(ir tx RCA 0F 54). That is the whole of pressing Power on Remote4.
+- `ir` will not run while an application is open -- it answers "this command cannot be run while an application is open". run_cli(loader close) first, every time.
+- THE SAVED-REMOTE SCREENS ARE NOT A ROUTE YOU CAN TAKE. Infrared -> Saved Remotes -> the remote -> its button list is what the USER sees doing it by hand, and it is worth understanding so you can describe it to them. You do not walk it: picking the right remote there means counting rows off a picture, which is exactly how "remote4" became Remote3. Use the file plus `ir tx` above -- it names the remote and the button explicitly and cannot mis-select.
+- Saved remote FILES are capitalised on disk: /ext/infrared/Remote.ir, Remote2.ir, Remote3.ir, Remote4.ir, Samsung.ir and so on. "remote4" means Remote4.ir. Match names case-insensitively and never tell the user a remote is missing because the capitalisation differed.
+- INFRARED HAS TWO SEPARATE PLACES AND THEY ARE NOT INTERCHANGEABLE. "Universal Remotes" is the firmware's own built-in code database (TVs, ACs, audio, projectors) -- it is for a KIND of device the user has no capture of: "turn off the TV", "the air conditioner". "Saved Remotes" is the user's OWN captured .ir files -- it is for a NAMED remote: "remote4", "my soundbar one", "my saved remotes". Pick by which of those the request actually names.
+- If the request does not make it clear which of the two, ASK -- one short question, "universal remote, or one of your saved ones?" -- and act on the answer. This is exactly the case the ACT-DON'T-EXPLAIN rule carves out: a decision only they can make. Guessing wrong here either fires a stranger's code at their hardware or sends you wandering through a menu that never contained what they asked for.
+- SAVED REMOTES are FILES, so stop guessing at them: every one is a .ir file in /ext/infrared/. list_files that folder to see exactly which remotes exist (remote4.ir and so on), and read_file one to see its buttons -- each "name:" line in the file is a button on that remote, in the order the app lists them. Do that BEFORE you navigate: then you know the remote is really there, what it is called, whether it even HAS a Power button, and how far down the list it sits. Walking into the Infrared app to find out is the slow way and it is where the button-mashing starts.
+- To use a saved remote: open Infrared (run_cli(loader open Infrared)), read_screen, move to "Saved Remotes" and ok, then pick the remote by name from the list you already read off the SD, then move to the button you want and ok to fire it. Read the screen at each of those steps -- the lists are yours, not a fixed order anyone can memorise.
+- INFRARED submenu (what the user sees inside the Infrared app): "Universal Remotes" is the built-in TV/AC/audio/projector database, "Saved Remotes" is their own captured .ir files, "Learn New Remote" captures a new one. Know the difference so you can talk about them and so you route a request correctly -- not so you can walk in there. Both are reachable by command: `ir universal list <remote>` / `ir universal <remote> <signal>` for the database, and read the .ir file plus `ir tx` for a saved one. The signal name is the one thing never to guess: list it first.
 
 LIMITS (be honest, never pretend):
 - You canNOT read a NEW physical card live (NFC/RFID scanning of a card in hand) -- that is not exposed here. You CAN see the screen (read_screen), press buttons, run the CLI, and read/write the SD. Offer those.
@@ -794,8 +852,14 @@ static int nikitaMessageFocus(const QString &text)
 // Tool COUNT is the biggest lever on whether a small model calls a tool at
 // all -- at 22 entries a 3B stopped calling anything. Narrowing to one
 // machine's family also removes the mistake of picking the wrong one.
+// overBle picks which half of the device toolbox is real. Over USB the CLI does
+// everything and does it deterministically, so the screen and the buttons are
+// only a slower way to get the same job wrong. Over BLE there IS no CLI -- the
+// in-app terminal is USB-only ("CLI is USB only.") -- so the screen and OK/BACK
+// are the only way to touch the device at all, and they earn their place.
 static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
-                              const QSet<QString> *allowed = nullptr)
+                              const QSet<QString> *allowed = nullptr,
+                              bool overBle = false)
 {
     const QJsonObject listFiles{
         {"type", "function"},
@@ -852,12 +916,12 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         {"type", "function"},
         {"function", QJsonObject{
             {"name", "press_button"},
-            {"description", "Press a button on the connected Flipper Zero to navigate its menus -- like tapping the on-screen D-pad. The RESULTING screen comes back WITH the press (in the \"screen\" field), so you always see where you landed -- read it and choose the next move from it. Press one small step at a time and keep going until the screen shows the goal reached. Do not fire a long blind sequence, and do not say you are done until the screen confirms it."},
+            {"description", "Tap OK or BACK on the connected Flipper Zero. These two only -- there is deliberately no D-pad here. Walking menus by up/down/left/right is guesswork that lands on the wrong item, and everything it was used for is done properly through run_cli instead (loader open/close/info to move between apps, storage/fls/fcat for files, ir tx to fire a signal). Use OK to confirm a prompt that is already on screen and BACK to leave one. The RESULTING screen comes back with the press, in the \"screen\" field. If you are reaching for this to NAVIGATE somewhere, stop: the CLI knows the way and this does not."},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
-                    {"button", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"up", "down", "left", "right", "ok", "back"}}, {"description", "Which button to tap"}}},
-                    {"times", QJsonObject{{"type", "integer"}, {"description", "How many times to tap it (default 1)"}}}
+                    {"button", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"ok", "back"}}, {"description", "Which button to tap -- ok to confirm what is on screen, back to leave it"}}},
+                    {"times", QJsonObject{{"type", "integer"}, {"description", "How many times to tap it (default 1). Leave it at 1 unless you have a screen-confirmed reason not to."}}}
                 }},
                 {"required", QJsonArray{"button"}}
             }}
@@ -867,7 +931,7 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         {"type", "function"},
         {"function", QJsonObject{
             {"name", "run_cli"},
-            {"description", "Run a command on the FLIPPER ZERO over USB and get its text output back. You always have this -- it is the full Flipper CLI. Use it for anything the storage tools don't cover: device_info, gpio (mode/read/set), subghz (tx/rx/decode), nfc, rfid, ir (tx), led, vibro, power (off/reboot), i2c, onewire, ikey, loader, log, free, uptime, js, top. Unix-style shortcuts are translated for you and BOTH spellings work here -- 'fls /ext/nfc', 'ls /ext/nfc' and 'storage list /ext/nfc' all do the same thing, because this tool only ever reaches the Flipper. Available: ls/fls, cat/fcat, tree/ftree, stat/fstat, md5/fmd5, mkdir/fmkdir, rm/frm, mv/fmv, df/fdf, touch/ftouch, echo/fecho, whoami/fwhoami, open/fopen, close/fclose, vibro/fvibro, reboot/freboot, shutdown/fshutdown. Relative paths resolve against /ext; there is no current folder here, so no cd. NOT available: cp between the two machines, find, locate, grep, head, tail, wc, sed, diff, edit and rm -r -- those need the interactive panel, so use the file tools instead. To run something on THIS COMPUTER use host_run, never this tool. One command per call. It briefly pauses the normal session, so prefer the storage tools for plain file work. If it answers that the CLI panel is open, tell the user to close the CLI window -- do not claim you have no access. SAFETY: a malformed or unknown firmware subcommand does not just print an error here -- it can crash the Flipper and force a reboot (e.g. `ir universal tv power` did exactly that). Send only commands whose EXACT syntax you are sure of; if a command returns its own help/usage banner, that means it did NOT run -- read the usage and correct it, do not report success. When unsure, run the bare command (e.g. `ir`) to see its help first, then use the precise form it shows."},
+            {"description", "Run a command on the FLIPPER ZERO over USB and get its text output back. You always have this -- it is the full Flipper CLI. Use it for anything the storage tools don't cover: device_info, gpio (mode/read/set), subghz (tx/rx/decode), nfc, rfid, ir (tx), led, vibro, power (off/reboot), i2c, onewire, ikey, loader, log, free, uptime, js, top. Unix-style shortcuts are translated for you and BOTH spellings work here -- 'fls /ext/nfc', 'ls /ext/nfc' and 'storage list /ext/nfc' all do the same thing, because this tool only ever reaches the Flipper. Available: ls/fls, cat/fcat, tree/ftree, stat/fstat, md5/fmd5, mkdir/fmkdir, rm/frm, mv/fmv, df/fdf, touch/ftouch, echo/fecho, whoami/fwhoami, open/fopen, close/fclose, vibro/fvibro, reboot/freboot, shutdown/fshutdown. Relative paths resolve against /ext; there is no current folder here, so no cd. NOT available: cp between the two machines, find, locate, grep, head, tail, wc, sed, diff, edit and rm -r -- those need the interactive panel, so use the file tools instead. To run something on THIS COMPUTER use host_run, never this tool. One command per call. It briefly pauses the normal session, so prefer the storage tools for plain file work. If it answers that the CLI panel is open, tell the user to close the CLI window -- do not claim you have no access. SAFETY: a malformed or unknown firmware subcommand does not just print an error here -- it can crash the Flipper and force a reboot. `ir universal tv power` did exactly that, and the reason was the SIGNAL NAME: the valid one is `Power`, capitalised, and a name that is not in the list can take the device down. Run `ir universal list tv` first and copy the name from its output. Send only commands whose EXACT syntax you are sure of; if a command returns its own help/usage banner, that means it did NOT run -- read the usage and correct it, do not report success. When unsure, run the bare command (e.g. `ir`) to see its help first, then use the precise form it shows."},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
@@ -1180,6 +1244,27 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         tools.append(hostFind);
     }
 
+    // Transport filter, before the access filter. Offering a tool that cannot
+    // work on the current link is worse than not having it: run_cli over BLE
+    // fails every time, and press_button/read_screen over USB is the manual
+    // route that kept losing to the CLI sitting right next to it.
+    {
+        QJsonArray kept;
+        for (const QJsonValue &v : std::as_const(tools)) {
+            const QString n = v.toObject().value(QStringLiteral("function"))
+                               .toObject().value(QStringLiteral("name")).toString();
+            const bool manual = (n == QLatin1String("press_button")
+                              || n == QLatin1String("read_screen"));
+            if (overBle) {
+                if (n == QLatin1String("run_cli")) { continue; }
+            } else if (manual) {
+                continue;
+            }
+            kept.append(v);
+        }
+        tools = kept;
+    }
+
     // Access filter, applied last: building the whole list and pruning after
     // keeps the blocks above untouched and the filtering in one place.
     // allowed == nullptr means "no filter" -- the full list, as before.
@@ -1347,6 +1432,46 @@ static bool nikitaIsTvPowerCommand(const QString &text)
         "\\b(liga|desliga|ligar|desligar|ligue|desligue)\\b"),
         QRegularExpression::CaseInsensitiveOption);
     return powerRe.match(t).hasMatch();
+}
+
+// "remember that remote4 is my tv remote" is a note to self, not a job on the
+// Flipper -- and it was answered with a remember() followed by a read_screen and
+// three button presses on a device nobody had asked it to touch. The words that
+// open the sentence say plainly that filing the fact IS the whole task; when
+// they do, and nothing in the rest of it asks for an action, the turn is handed
+// the memory tools alone so there is no device tool available to wander into.
+static bool nikitaIsMemoryOnly(const QString &text)
+{
+    const QString t = text.trimmed().toLower();
+    if (t.isEmpty()) { return false; }
+
+    static const QStringList openers = {
+        QStringLiteral("remember"), QStringLiteral("note that"), QStringLiteral("keep in mind"),
+        QStringLiteral("don't forget"), QStringLiteral("dont forget"), QStringLiteral("forget"),
+        QStringLiteral("lembre"), QStringLiteral("lembra"), QStringLiteral("lembrar"),
+        QStringLiteral("anota"), QStringLiteral("anote"), QStringLiteral("esquece"),
+        QStringLiteral("esque\u00e7a"), QStringLiteral("guarda que"), QStringLiteral("guarde que")
+    };
+    bool opens = false;
+    for (const QString &w : openers) { if (t.startsWith(w)) { opens = true; break; } }
+    if (!opens) { return false; }
+
+    // ...unless the same sentence also asks for something to be DONE. "remember
+    // remote4 is the tv one and turn it on" is two requests, and the second one
+    // needs every tool it would normally get.
+    static const QStringList actionWords = {
+        QStringLiteral("open"), QStringLiteral("press"), QStringLiteral("run"),
+        QStringLiteral("save"), QStringLiteral("write"), QStringLiteral("create"),
+        QStringLiteral("make"), QStringLiteral("delete"), QStringLiteral("remove"),
+        QStringLiteral("list"), QStringLiteral("show"), QStringLiteral("read"),
+        QStringLiteral("send"), QStringLiteral("turn on"), QStringLiteral("turn off"),
+        QStringLiteral("go into"), QStringLiteral("go to"), QStringLiteral("navigate"),
+        QStringLiteral("abre"), QStringLiteral("abrir"), QStringLiteral("liga"),
+        QStringLiteral("desliga"), QStringLiteral("roda"), QStringLiteral("executa"),
+        QStringLiteral("mostra"), QStringLiteral("apaga"), QStringLiteral("cria")
+    };
+    for (const QString &w : actionWords) { if (nikitaHasWord(t, w)) { return false; } }
+    return true;
 }
 
 static bool messageNeedsTools(const QString &text)
@@ -1548,6 +1673,10 @@ NikitaBackend::NikitaBackend(QObject *parent)
     // discover already running -- and plenty of people want this app without
     // any AI at all.
     m_assistantEnabled = QSettings().value(QLatin1String(kAssistantEnabledKey), false).toBool();
+    // A stored key is only ever trusted because the API said so once. Re-ask on
+    // every start: it costs one small GET, it refreshes the model list, and it
+    // is the difference between "a key is set" and "the assistant works".
+    if (!apiKey().isEmpty()) { checkApiKey(); }
     // Leftovers from the local-model era. Harmless where they sit, but a stale
     // "provider=local" or an equipped local model tag in a settings file is a thing a
     // future reader has to work out the meaning of, and the meaning is "nothing".
@@ -1860,12 +1989,22 @@ void NikitaBackend::wipeAssistantData()
     // goes too: erase means disconnect, and a key left in settings would let the
     // next session reach the API without the user re-entering it.
     QSettings st;
+    // kApiModelKey included: a model picked by the erased assistant is one of
+    // its settings, and leaving it behind meant a fresh start silently came up
+    // on whatever was last clicked instead of the default.
     for (const char *key : { "nikita/memory", "nikita/personality",
                              "nikita/hostRunAllowed", "nikita/hostActionAllowed",
-                             kApiKeyKey }) {
+                             kApiKeyKey, kApiKeyOkKey, kApiModelKey }) {
         st.remove(QLatin1String(key));
     }
+    m_apiKeyStatus.clear();
+    m_apiKeyMessage.clear();
+    emit modelChanged();    // the pick is back to the default
     emit apiKeyChanged();   // the BRAIN panel drops back to "No kimi API key Found."
+    // Erase means erase: the panel is holding its own copy of the conversation
+    // in a ListModel, and clearing only the files left those bubbles on screen
+    // to be re-shown the next time the assistant was switched on.
+    emit historyCleared();
 
     // Every access filter OFF, and it persists. A fresh connection has to be
     // granted access deliberately -- the user turns each one back on by hand --
@@ -1911,7 +2050,15 @@ bool NikitaBackend::assistantEnabled() const { return m_assistantEnabled; }
 QString NikitaBackend::apiModel() const
 {
     const QString saved = QSettings().value(QLatin1String(kApiModelKey)).toString().trimmed();
-    return saved.isEmpty() ? QString::fromUtf8(NIKITA_API_MODEL) : saved;
+    if (saved.isEmpty()) { return QString::fromUtf8(NIKITA_API_MODEL); }
+    // A stored id the picker no longer offers -- left over from a build that
+    // listed the account's whole catalog -- would leave all three rows drawn
+    // unselected, with no way to tell what was actually answering. The default
+    // is the honest answer in that case.
+    for (const QVariant &v : apiModelChoices()) {
+        if (v.toMap().value(QStringLiteral("id")).toString() == saved) { return saved; }
+    }
+    return QString::fromUtf8(NIKITA_API_MODEL);
 }
 
 void NikitaBackend::setApiModel(const QString &id)
@@ -1923,27 +2070,94 @@ void NikitaBackend::setApiModel(const QString &id)
     emit modelChanged();     // header pill + this property
 }
 
-// The Kimi models worth offering. k3 is the newest but is throttled in preview
-// regardless of the account tier; the k2 line is GA and runs at the account's
-// full rate limit, which is why a heavy multi-round turn should prefer it.
+// A human label for a raw model id. The API hands back ids only, and
+// "kimi-k2.7-code-highspeed" in a list of radio buttons is not a name anyone
+// picked -- so known families get a real name and the id stays visible in the
+// note underneath, which is what a person reads when two entries look alike.
+static QString nikitaModelLabel(const QString &id)
+{
+    // Every id gets its OWN name. The account really does serve both
+    // kimi-k2.7-code and kimi-k2.7-code-highspeed, and calling them both
+    // "Kimi K2.7 Code" made the picker look like it had listed one model
+    // twice -- two rows, same name, same note, one of them selected for no
+    // visible reason. They are different models and they say so now.
+    static const QMap<QString, QString> known {
+        { QStringLiteral("kimi-k2.6"),                 QStringLiteral("Kimi K2.6") },
+        { QStringLiteral("kimi-k2.7"),                 QStringLiteral("Kimi K2.7") },
+        { QStringLiteral("kimi-k2.7-code"),            QStringLiteral("Kimi K2.7 Code") },
+        { QStringLiteral("kimi-k2.7-code-highspeed"),  QStringLiteral("Kimi K2.7 Code Highspeed") },
+        { QStringLiteral("kimi-k3"),                   QStringLiteral("Kimi K3") },
+    };
+    const auto it = known.constFind(id);
+    if (it != known.constEnd()) { return it.value(); }
+
+    // Anything unrecognised: tidy the id into something readable rather than
+    // hiding the model. A new Kimi released next month should show up in this
+    // picker on its own, not wait for this list to be edited.
+    QString label = id;
+    label.replace(QLatin1Char('-'), QLatin1Char(' '));
+    label.replace(QLatin1Char('_'), QLatin1Char(' '));
+    if (!label.isEmpty()) { label[0] = label[0].toUpper(); }
+    return label;
+}
+
+// What is worth saying about a model beyond its name. Only the ones with a
+// real trade-off get a note; everything else shows its id, which is the thing
+// that actually distinguishes two similar entries.
+static QString nikitaModelNote(const QString &id)
+{
+    if (id == QLatin1String("kimi-k2.6")) {
+        return QStringLiteral("Stable but the best for run tools.");
+    }
+    if (id == QLatin1String("kimi-k2.7-code-highspeed")) {
+        return QStringLiteral("Best for coding projects. Fastest of the K2.7 line.");
+    }
+    if (id.startsWith(QLatin1String("kimi-k2.7"))) {
+        return id.contains(QLatin1String("code")) ? QStringLiteral("Best for coding projects.")
+                                                  : QStringLiteral("current generation");
+    }
+    if (id == QLatin1String("kimi-k3")) {
+        return QStringLiteral("newest model but may rate-limit is expected.");
+    }
+    return id;
+}
+
+// Three models, fixed, always in this order. Feeding the account's whole
+// /v1/models catalog into this list was worse than it sounds: the account
+// serves BOTH kimi-k2.7-code and kimi-k2.7-code-highspeed, so the picker grew
+// two near-identical K2.7 rows and the shape of the panel changed the moment a
+// key was accepted. This is a choice between three named options, not a mirror
+// of a provider's inventory -- k2.6 is the default (GA, the account's full rate
+// limit, which is what a multi-round tool turn needs), the highspeed K2.7 is
+// the coding pick, and k3 is newest but throttled in preview.
+//
+// Anything the account adds later still WORKS -- apiModel() will send whatever
+// id is stored -- it just is not advertised here. The notes are the user's own
+// words; leave them as written.
 QVariantList NikitaBackend::apiModelChoices() const
 {
-    return {
-        QVariantMap{{"id", "kimi-k2.6"},
-                    {"label", "Kimi K2.6"},
-                    {"note", "stable, full rate limit — best for tool runs"}},
-        QVariantMap{{"id", "kimi-k2.7-code-highspeed"},
-                    {"label", "Kimi K2.7 Code"},
-                    {"note", "fast, coding-tuned"}},
-        QVariantMap{{"id", "kimi-k3"},
-                    {"label", "Kimi K3"},
-                    {"note", "newest, 1M context — may rate-limit in preview"}},
-    };
+    static const QStringList ids{ QStringLiteral("kimi-k2.6"),
+                                  QStringLiteral("kimi-k2.7-code-highspeed"),
+                                  QStringLiteral("kimi-k3") };
+    QVariantList out;
+    for (const QString &id : ids) {
+        out.append(QVariantMap{{"id", id},
+                               {"label", nikitaModelLabel(id)},
+                               {"note", nikitaModelNote(id)}});
+    }
+    return out;
 }
 
 // Environment first, stored setting second. Never cached in a member: read at
 // the moment the header is built and dropped again, so the key is not sitting
 // in this object waiting to be printed by some future debug dump.
+bool NikitaBackend::deviceOverBle() const
+{
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (!dev || !dev->deviceState()) { return false; }
+    return dev->deviceState()->deviceInfo().isBle;
+}
+
 QString NikitaBackend::apiKey() const
 {
     const QString fromEnv = qEnvironmentVariable(NIKITA_API_KEY_ENV).trimmed();
@@ -1964,11 +2178,122 @@ QString NikitaBackend::apiKeySource() const
     return QString();
 }
 
+bool NikitaBackend::apiKeyWasVerified() const
+{
+    const QString key = apiKey();
+    if (key.isEmpty()) { return false; }
+    const QString seen = QSettings().value(QLatin1String(kApiKeyOkKey)).toString();
+    if (seen.isEmpty()) { return false; }
+    const QString hash = QString::fromLatin1(
+        QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha256).toHex());
+    return hash == seen;
+}
+
+void NikitaBackend::markApiKeyVerified(const QString &key)
+{
+    QSettings().setValue(QLatin1String(kApiKeyOkKey),
+        QString::fromLatin1(QCryptographicHash::hash(key.toUtf8(),
+                                                     QCryptographicHash::Sha256).toHex()));
+}
+
+bool NikitaBackend::apiKeyValid() const
+{
+    if (apiKey().isEmpty()) { return false; }
+    // A key the provider has accepted before stays good until it is told
+    // otherwise. Only an outright rejection takes it back down -- a check that
+    // could not reach the network says nothing about the key, and dropping the
+    // assistant offline every time the wifi hiccups is its own bug.
+    if (m_apiKeyStatus == QLatin1String("invalid")) { return false; }
+    return apiKeyWasVerified();
+}
+
+QString NikitaBackend::apiKeyStatus() const  { return m_apiKeyStatus; }
+QString NikitaBackend::apiKeyMessage() const { return m_apiKeyMessage; }
+
+// One GET against /v1/models. 200 means the key is real AND hands back the
+// model list in the same breath; 401/403 means it is not, and anything else --
+// no network, a 500, a timeout -- is reported as "offline", because none of
+// those are the key's fault and treating them as one would log the user out of
+// their own assistant every time a train goes into a tunnel.
+void NikitaBackend::checkApiKey()
+{
+    if (m_apiKeyCheck) { return; }   // one in flight is enough
+
+    const QString key = apiKey();
+    if (key.isEmpty()) {
+        m_apiKeyStatus.clear();
+        m_apiKeyMessage.clear();
+        emit apiKeyChanged();
+        return;
+    }
+
+    m_apiKeyStatus = QStringLiteral("checking");
+    m_apiKeyMessage.clear();
+    emit apiKeyChanged();
+
+    QNetworkRequest req{QUrl(QString::fromUtf8(NIKITA_API_MODELS_URL))};
+    req.setRawHeader("Authorization", QByteArray("Bearer ") + key.toUtf8());
+    req.setTransferTimeout(15000);
+
+    m_apiKeyCheck = m_net.get(req);
+    connect(m_apiKeyCheck, &QNetworkReply::finished, this, [this, key]() {
+        QNetworkReply *reply = m_apiKeyCheck;
+        m_apiKeyCheck = nullptr;
+        if (!reply) { return; }
+        reply->deleteLater();
+
+        const QByteArray body = reply->readAll();
+        const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+        if (http == 200) {
+            m_apiKeyStatus = QStringLiteral("valid");
+            m_apiKeyMessage.clear();
+            markApiKeyVerified(key);
+
+            // Logged, not offered. The picker is a fixed three (see
+            // apiModelChoices), so this is here to answer "what does this
+            // account actually have" when a model id needs checking.
+            QStringList ids;
+            const QJsonArray data = QJsonDocument::fromJson(body).object()
+                                        .value(QStringLiteral("data")).toArray();
+            for (const QJsonValue &v : data) {
+                const QString id = v.toObject().value(QStringLiteral("id")).toString().trimmed();
+                if (!id.isEmpty() && !ids.contains(id)) { ids.append(id); }
+            }
+            nikitaLog(QStringLiteral("API key verified — %1 model(s) on this account: %2")
+                          .arg(ids.size()).arg(ids.join(QStringLiteral(", "))));
+
+        } else if (http == 401 || http == 403) {
+            m_apiKeyStatus = QStringLiteral("invalid");
+            // Whatever the provider said, so a wrong-account or expired-key
+            // message reaches the person who can act on it.
+            const QString detail = QJsonDocument::fromJson(body).object()
+                                       .value(QStringLiteral("error")).toObject()
+                                       .value(QStringLiteral("message")).toString();
+            m_apiKeyMessage = detail.isEmpty() ? QStringLiteral("the API rejected this key")
+                                               : detail;
+            // Take back the remembered pass: this key is not usable any more,
+            // and a stale "verified" would let it come up green after a restart.
+            QSettings().remove(QLatin1String(kApiKeyOkKey));
+            nikitaLog(QStringLiteral("API key rejected (HTTP %1): %2").arg(http).arg(m_apiKeyMessage));
+
+        } else {
+            m_apiKeyStatus = QStringLiteral("offline");
+            m_apiKeyMessage = reply->errorString();
+            nikitaLog(QStringLiteral("API key check could not reach the API: %1").arg(m_apiKeyMessage));
+        }
+        emit apiKeyChanged();
+    });
+}
+
 void NikitaBackend::setApiKey(const QString &key)
 {
     const QString trimmed = key.trimmed();
     if (trimmed.isEmpty()) { clearApiKey(); return; }
     QSettings().setValue(QLatin1String(kApiKeyKey), trimmed);
+    // A newly typed key has proved nothing yet: drop any remembered pass so the
+    // panel says "checking", not "ready", while the answer is on its way.
+    QSettings().remove(QLatin1String(kApiKeyOkKey));
     // Length only. A log line is the one place a secret reliably escapes --
     // into a screenshot, a bug report, a pasted terminal buffer -- and knowing
     // that something arrived is the entire diagnostic value here.
@@ -1976,6 +2301,7 @@ void NikitaBackend::setApiKey(const QString &key)
                              "settings; exporting %2 in your shell overrides it.")
                   .arg(trimmed.size()).arg(QLatin1String(NIKITA_API_KEY_ENV)));
     emit apiKeyChanged();
+    checkApiKey();
 }
 
 QString NikitaBackend::revealApiKey() const
@@ -2001,6 +2327,9 @@ bool NikitaBackend::copyApiKeyToClipboard() const
 void NikitaBackend::clearApiKey()
 {
     QSettings().remove(QLatin1String(kApiKeyKey));
+    QSettings().remove(QLatin1String(kApiKeyOkKey));
+    m_apiKeyStatus.clear();
+    m_apiKeyMessage.clear();
     nikitaLog(QStringLiteral("API key removed from this app's settings."));
     emit apiKeyChanged();
 }
@@ -2315,6 +2644,7 @@ void NikitaBackend::reset()
     m_toolRounds = 0;
     if (m_canRate) { m_canRate = false; emit canRateChanged(); }
     saveHistory();
+    emit historyCleared();
 }
 
 // Public "clear the chat" entry point for the QML clear command.
@@ -3182,6 +3512,13 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     // always about that action.
     m_turnNeedsTools = messageNeedsTools(userText) || m_lastTurnWasAction
                        || m_lastTurnMissed || m_toolTurnCooldown > 0;
+    // Overrides all of the carry-over flags above. A turn that follows an action
+    // inherits the full toolbox by design -- which is exactly how a plain
+    // "remember X" ended up with buttons to press.
+    if (nikitaIsMemoryOnly(userText)) {
+        m_turnNeedsTools = false;
+        nikitaLog(QStringLiteral("turn: memory-only request -- memory tools only"));
+    }
     // Decided here, with the message in hand, for the same reason: systemPrompt()
     // runs later and never sees the text that started the turn.
     //
@@ -3204,12 +3541,25 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
         nikitaLog(QStringLiteral("send refused: the assistant is switched off"));
         return;
     }
+    // No usable key, no turn. The UI already hides the input in this state, but
+    // "not set up" has to mean it cannot act rather than that it is out of
+    // sight -- a queued call or a future entry point must not slip past.
+    if (!apiKeyValid()) {
+        nikitaLog(apiKey().isEmpty()
+            ? QStringLiteral("send refused: no Kimi API key")
+            : QStringLiteral("send refused: the Kimi API key has not been accepted"));
+        emit errorOccurred(apiKey().isEmpty()
+            ? QStringLiteral("No Kimi API key yet — add one in setup.")
+            : QStringLiteral("That Kimi API key was not accepted. Check it in setup."));
+        return;
+    }
 
     m_turnFocus = nikitaMessageFocus(userText);
     m_lastUserText = userText;      // the phrasing a proven move gets filed under
     m_lastDeviceContext = deviceContext;
     m_lastProvenTool.clear();
     m_forcedRetry = 0;       // corrections used this turn
+    m_lengthDeaths = 0;      // output-cap deaths recovered from this turn
     m_history.append(QJsonObject{{"role", "user"}, {"content", userText}});
     setThinking(true);
 
@@ -3559,7 +3909,7 @@ void NikitaBackend::dispatchTurn()
         // Action turns get the full toolset; plain conversation still gets the
         // memory tools so the assistant can learn durable facts as you talk.
         const QSet<QString> allowed = allowedTools();
-        QJsonArray offered = m_turnNeedsTools ? nikitaTools(agentReady(), m_turnFocus, &allowed)
+        QJsonArray offered = m_turnNeedsTools ? nikitaTools(agentReady(), m_turnFocus, &allowed, deviceOverBle())
                                               : nikitaMemoryTools();
 
         // Second attempt after the model answered in prose: hand it exactly one
@@ -4048,6 +4398,39 @@ void NikitaBackend::finalizeStream()
     if (toolCalls.isEmpty()) {
         toolCalls = salvageToolCalls(m_streamContent);
     }
+
+    // RAN OUT OF OUTPUT BUDGET, MID-THOUGHT. The frame says done_reason
+    // "length" with an empty message: every one of the reply's tokens went into
+    // reasoning -- almost always deliberating pixel by pixel over a screen read
+    // -- and the cap arrived before a single tool call or word did. Ending the
+    // turn here is what "it died in the middle of the action" looks like: three
+    // tool rows and then nothing.
+    //
+    // So don't end it. Put a plain instruction in the history and go round
+    // again: decide the ONE next call and stop thinking about the picture.
+    // Twice, then let the normal end-of-turn handling take over -- a model that
+    // cannot stop deliberating will not be talked out of it on the third ask.
+    if (toolCalls.isEmpty() && m_streamContent.trimmed().isEmpty()
+        && m_lastRawFrame.contains(QStringLiteral("\"length\""))
+        && m_lengthDeaths < 2) {
+        m_lengthDeaths++;
+        nikitaLogAs(assistantName(),
+                   QStringLiteral("round hit the output cap with nothing to show (%1/2) -- retrying "
+                                  "with a stop-deliberating nudge").arg(m_lengthDeaths));
+        m_history.append(QJsonObject{
+            {"role", "system"},
+            {"content", QStringLiteral(
+                "Your last reply used its ENTIRE output budget thinking and produced nothing. "
+                "Do not transcribe or analyse the screen art pixel by pixel -- glance at it, "
+                "find the highlighted bar and the words you can make out, and move on. "
+                "Right now: make ONE tool call, the single next step toward what was asked. "
+                "No commentary, no analysis, just the call. If you genuinely cannot read the "
+                "screen, press one button and read it again.")}
+        });
+        m_currentReply = nullptr;
+        dispatchTurn();
+        return;
+    }
     // Progress, not a budget, decides whether to keep going. A round counts as
     // progress if it asked for something this turn has not already done.
     bool madeProgress = false;
@@ -4076,6 +4459,10 @@ void NikitaBackend::finalizeStream()
         return;
     }
 
+    // The turn is ending with tool calls still on the table -- it did not finish,
+    // it ran out of rope: the same calls kept coming back round after round.
+    const bool stalled = !toolCalls.isEmpty() && !keepGoing;
+
     m_currentReply = nullptr;
     setThinking(false);
     // Prefer this round's prose; fall back to the best prose from earlier rounds
@@ -4084,6 +4471,18 @@ void NikitaBackend::finalizeStream()
     QString text = stripNonEnglish(m_streamContent);
     if (text.trimmed().isEmpty()) {
         text = stripNonEnglish(m_turnText);
+    }
+    // A stalled turn must NOT sign off with something it said on the way in.
+    // "You're in BadUSB. Backing out." was round one narrating its first move;
+    // shown as the last word of a turn that then pressed twenty buttons and
+    // gave up, it reads as a completed report of a thing that never happened.
+    // Better to say plainly that it did not get there.
+    if (stalled && stripNonEnglish(m_streamContent).trimmed().isEmpty()) {
+        text = QStringLiteral("I didn't get there. I kept going round the same step, so I stopped "
+                              "rather than keep pressing buttons blind. Tell me what's on the "
+                              "screen now and I'll pick it up from there.");
+        nikitaLog(QStringLiteral("turn stalled: %1 repeat round(s), dropped stale mid-turn prose")
+                      .arg(m_repeatRounds));
     }
     // Noted before anything fills the gap. A turn that produced no words AND
     // ran no tool is not an answer -- it is the absence of one, and the
@@ -5454,16 +5853,26 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
         if (times < 1) times = 1;
         if (times > NIKITA_MAX_PRESSES) times = NIKITA_MAX_PRESSES;
 
+        // OK and BACK, nothing else. The D-pad is gone on purpose: every attempt
+        // to walk a menu with up/down/left/right was a count made from a screen
+        // it could not reliably read, and a wrong count fires the wrong saved
+        // remote or opens the wrong app. Refusing here rather than only in the
+        // prompt is what makes it stick -- the schema no longer offers those
+        // buttons, and a model that asks for one anyway is told where to go.
         int key = -1;
-        if (b == QLatin1String("up")) key = InputEvent::Up;
-        else if (b == QLatin1String("down")) key = InputEvent::Down;
-        else if (b == QLatin1String("left")) key = InputEvent::Left;
-        else if (b == QLatin1String("right")) key = InputEvent::Right;
-        else if (b == QLatin1String("ok") || b == QLatin1String("enter") || b == QLatin1String("center")) key = InputEvent::Ok;
+        if (b == QLatin1String("ok") || b == QLatin1String("enter") || b == QLatin1String("center")) key = InputEvent::Ok;
         else if (b == QLatin1String("back")) key = InputEvent::Back;
 
         if (key < 0) {
-            done(QStringLiteral("{\"error\":\"unknown button '%1' (use up/down/left/right/ok/back)\"}").arg(b));
+            const bool dpad = (b == QLatin1String("up") || b == QLatin1String("down")
+                            || b == QLatin1String("left") || b == QLatin1String("right"));
+            done(dpad
+                ? QStringLiteral("{\"error\":\"'%1' is not available. There is no D-pad navigation: "
+                                 "menu walking is done through the CLI instead. To move between apps "
+                                 "use run_cli(loader open <App>) / run_cli(loader close); for files "
+                                 "use fls and fcat; to fire an IR signal use ir tx or ir universal. "
+                                 "press_button only does ok and back.\"}").arg(b)
+                : QStringLiteral("{\"error\":\"unknown button '%1' (only ok and back exist)\"}").arg(b));
             return;
         }
 
@@ -9812,7 +10221,14 @@ void FlipperCli::disconnectCli()
 // ---- one-shot CLI run for the assistant (isolated from the interactive panel) --
 void FlipperCli::runOneShot(const QString &cmd, std::function<void(bool, QString)> done)
 {
-    if (m_open || m_active) { done(false, QStringLiteral("The CLI panel is open -- close it first.")); return; }
+    if (m_open || m_active) {
+        // Actionable, because the model cannot close this panel itself and was
+        // left retrying a command that could never run.
+        done(false, QStringLiteral("The in-app CLI panel is open and owns the session, so run_cli "
+                                   "cannot be used right now. Either ask the user to close the CLI "
+                                   "panel, or do this with press_button navigation instead."));
+        return;
+    }
     if (m_runBusy)          { done(false, QStringLiteral("A CLI command is already running.")); return; }
     if (!m_appBackend)      { done(false, QStringLiteral("Backend unavailable.")); return; }
 

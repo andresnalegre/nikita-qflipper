@@ -31,6 +31,27 @@ AbstractOverlay {
 
     onDeviceInfoChanged: tabs.currentIndex = 0;
 
+    // Shown for a few seconds right after a cable becomes the active link. Only
+    // a real transition counts: this stays false for a device that was on USB
+    // from the start, which needs no announcement.
+    property bool cableJustConnected: false
+    readonly property bool onCable: deviceInfo !== undefined && !deviceInfo.isBle &&
+                                    deviceState && deviceState.isOnline
+    onOnCableChanged: {
+        if(onCable && Nikita.hasBle && Ble.sessionActive) {
+            cableJustConnected = true;
+            cableNoticeTimer.restart();
+        } else if(!onCable) {
+            cableJustConnected = false;
+            cableNoticeTimer.stop();
+        }
+    }
+    Timer {
+        id: cableNoticeTimer
+        interval: 6000
+        onTriggered: overlay.cableJustConnected = false
+    }
+
     TabButton {
         id: developerTab
         icon.source: "qrc:/assets/gfx/symbolic/developer-mode.svg"
@@ -191,7 +212,13 @@ AbstractOverlay {
             // in the Bluetooth glyph instead of just hiding it. IconImage
             // recolors whatever it's given from `color` above, same as the
             // USB glyph, so it always matches the connected/recovery state.
-            readonly property bool overBle: Nikita.hasBle && Ble.sessionActive
+            // The device's own answer, not the BLE panel's session flag. Plug a
+            // cable in while a wireless link is up and the cable takes over as
+            // the active device (both stay connected) -- the panel flag stays
+            // true through all of that, so it kept showing Bluetooth with the
+            // cable in hand.
+            readonly property bool overBle: deviceInfo ? deviceInfo.isBle
+                                                       : (Nikita.hasBle && Ble.sessionActive)
             icon.source: overBle ? "qrc:/assets/gfx/images/bluetooth.svg" : "qrc:/assets/gfx/symbolic/usb-connected.svg"
             icon.width: overBle ? 11 : 18
             icon.height: overBle ? 15 : 10
@@ -200,6 +227,21 @@ AbstractOverlay {
                                            Theme.color.lightblue : Theme.color.lightgreen
             text: (!deviceState || !deviceState.isOnline) ? qsTr("Disconnected") : deviceState.isRecoveryMode ?
                                            qsTr("Recovery mode") : qsTr("Connected")
+        }
+
+        // Plugging in while wireless is up switches the app to the cable in
+        // place, with the BLE link left standing. That takeover is silent
+        // otherwise -- and a cable that appears to have done nothing is exactly
+        // what sends someone off to disconnect and reconnect by hand. Announced
+        // for a few seconds, then out of the way again.
+        TransparentLabel {
+            id: cableTookOverLabel
+            Layout.preferredHeight: connectionLabel.height
+            visible: overlay.cableJustConnected
+            color: Theme.color.lightgreen
+            capitalized: false
+            text: Ble.sessionActive ? qsTr("Cable connected — Bluetooth still linked")
+                                    : qsTr("Cable connected")
         }
 
         TransparentLabel {
@@ -708,7 +750,10 @@ AbstractOverlay {
         const messageObj = {
             title : qsTr("Reboot Your Flipper?"),
             customText: qsTr("Reboot"),
-            message: qsTr("The Flipper will restart.<br/><br/>Anything running on it right now will stop.")
+            // "on it" trimmed on purpose: the dialog is a fixed width and the
+            // longer line ran past both edges. The Flipper is named in the line
+            // above, so nothing is lost by dropping it here.
+            message: qsTr("The Flipper will restart.<br/><br/>Anything running right now will stop.")
         };
         confirmationDialog.openWithMessage(function() { Nikita.rebootDevice(); }, messageObj);
     }

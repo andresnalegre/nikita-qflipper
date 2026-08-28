@@ -312,7 +312,19 @@ void ApplicationBackend::onCurrentDeviceChanged()
 
     } else if(device()) {
         qCDebug(LOG_BACKEND) << "Current device changed to" << device()->deviceState()->deviceInfo().name;
-        // No need to disconnect the old device, as it has been destroyed at this point
+        // Usually the old device has been destroyed by now and there is nothing
+        // to unwire. The exception is a cable taking over from a live BLE link:
+        // that device is still registered and still emitting, so drop its
+        // connections here or the backend hears from both at once.
+        if(m_boundDevice && m_boundDevice != device()) {
+            disconnect(m_boundDevice, nullptr, this, nullptr);
+            if(m_boundDeviceState) {
+                disconnect(m_boundDeviceState, nullptr, this, nullptr);
+            }
+        }
+        m_boundDevice = device();
+        m_boundDeviceState = deviceState();
+
         connect(device(), &FlipperZero::operationFinished, this, &ApplicationBackend::onDeviceOperationFinished);
         connect(device(), &FlipperZero::deviceStateChanged, this, &ApplicationBackend::firmwareUpdateStateChanged);
 

@@ -104,6 +104,11 @@ struct DeviceInfo {
     Q_PROPERTY(Flipper::Zero::StorageInfo storage MEMBER storage)
 
     Q_PROPERTY(int stackType MEMBER stackType)
+    // Which wire this device is actually reached over. The home screen used to
+    // guess from the BLE panel's own session flag, which stayed true while a
+    // cable took the device over -- so it kept claiming Bluetooth with the
+    // cable plugged in. This is the device's own answer.
+    Q_PROPERTY(bool isBle MEMBER isBle)
 
 public:
     QString name;

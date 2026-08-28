@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QPointer>
 #include <QAbstractListModel>
 
 #include "backenderror.h"
@@ -170,4 +171,14 @@ private:
     BackendState m_backendState;
     BackendError::ErrorType m_errorType;
     bool m_portReleased = false;
+
+    // The device these signals are currently wired to. Until a cable could take
+    // over from a live BLE link, the old device was always destroyed by the time
+    // currentDeviceChanged() arrived, so nothing had to be unwired. Now both
+    // devices stay registered, and without this the wireless one keeps feeding
+    // operationFinished/state changes into a backend that has moved on.
+    // Held as plain QObjects so this header does not have to pull in the whole
+    // device class; all that is done with them is disconnect().
+    QPointer<QObject> m_boundDevice;
+    QPointer<QObject> m_boundDeviceState;
 };

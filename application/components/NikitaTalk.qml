@@ -198,8 +198,15 @@ Rectangle {
     // Header label. "no model" read like the name of a model; this says what it
     // actually means, and every layer of the chromatic-aberration stack reads
     // the same property so they can never drift apart.
-    readonly property bool hasModel: Nikita.modelName.length > 0
-    readonly property string modelLabel: root.hasModel ? Nikita.modelName : "no model selected"
+    // A key that has not been accepted by the API is not a working assistant, so
+    // the badge does not get to claim one. It showed the model name from the
+    // moment the panel opened -- green dot, model pill, ready-looking -- with
+    // no key set at all, and the first message was then refused.
+    readonly property bool hasModel: Nikita.apiKeyValid && Nikita.modelName.length > 0
+    readonly property string modelLabel: root.hasModel ? Nikita.modelName
+                                       : (Nikita.apiKeyStatus === "checking" ? "checking key…"
+                                       : (Nikita.apiKeyStatus === "invalid"  ? "key rejected"
+                                       : (Nikita.apiKeyPresent ? "key not verified" : "No Model Selected")))
 
     // ---- view state / geometry ------------------------------------------
     // "normal" = docked in the corner, "max" = big read view, "min" = collapsed
@@ -310,6 +317,42 @@ Rectangle {
 
 
     ListModel { id: chatModel }
+
+    // Erase, and the "clear" command, throw the conversation away in the
+    // backend. This is the panel doing the same to its own copy: without it the
+    // bubbles stayed on screen and came straight back the next time the
+    // assistant was switched on, so an erase only held until the app restarted.
+    Connections {
+        target: Nikita
+        function onHistoryCleared() {
+            chatModel.clear();
+            root.streamIdx = -1;
+            root.turnLabelShown = false;
+            root.clearSelection();
+            root.greetIfReady();
+        }
+        // Switched back on after an erase: the log is empty and the greeting
+        // never ran, because it only fires once when the panel is created.
+        function onAssistantEnabledChanged() {
+            if (Nikita.assistantEnabled) {
+                root.greetIfReady();
+            } else {
+                // Switched OFF from the maximised view, the panel kept the
+                // maximised geometry -- so the "ENABLE NIKITA" face, which just
+                // fills the panel, stretched across the whole window and sat on
+                // top of the device screen. It looked like a broken layout and
+                // only came right after a restart, because viewState is not
+                // persisted. There is nothing to be big for once it is off.
+                root.viewState = "normal";
+            }
+        }
+        // And the moment a key is accepted. The greeting only fired when the
+        // panel was built, so pasting a key left the log blank until the app was
+        // restarted -- the assistant came online without a word.
+        function onApiKeyChanged() {
+            if (Nikita.apiKeyValid) { root.greetIfReady(); }
+        }
+    }
 
     // parent: root centered these on NikitaTalk's own narrow strip instead of
     // the screen -- a CustomDialog is a Popup sized to fill and center in
@@ -1322,8 +1365,12 @@ Rectangle {
                         anchors.fill: parent
                         verticalAlignment: Text.AlignVCenter
                         visible: input.text.length === 0 && !input.activeFocus
-                        text: root.hasModel ? ("Talk to " + root.aiName + "…")
-                                            : "Select a model to start…"
+                        // The same invitation whether or not a key is set up.
+                        // What is wrong when there isn't one is said by the badge
+                        // above and spelled out in SETUP; this box only has room
+                        // to name what it is for, and a sentence of instructions
+                        // here was clipped mid-word.
+                        text: "Talk to " + root.aiName + "…"
                         color: Theme.color.mediumorange1
                         font: input.font
                     }
@@ -1335,10 +1382,33 @@ Rectangle {
             // outside a turn it sends normally, and DURING a turn it drops the
             // text into the queue to run after this one. So a running turn shows
             // just STOP until the user starts typing, then STOP + SEND together.
-            Button {
-                text: "Stop"
+            // Drawn by hand rather than left to the themed Button, which was
+            // not reliably showing up mid-turn -- and a STOP you cannot find
+            // while something is running is the same as no STOP at all. Same
+            // colours as every other control in this panel: it is the ordinary
+            // way to end a turn, not an alarm.
+            Rectangle {
                 visible: Nikita.thinking
-                onClicked: Nikita.stopThinking()
+                Layout.preferredWidth: stopTxt.implicitWidth + 24
+                Layout.preferredHeight: 30
+                radius: 6
+                color: stopMouse.containsMouse ? Theme.color.mediumorange2 : "transparent"
+                border.width: 1
+                border.color: Theme.color.mediumorange2
+                Text {
+                    id: stopTxt
+                    anchors.centerIn: parent
+                    text: "STOP"
+                    color: Theme.color.lightorange2
+                    font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                }
+                MouseArea {
+                    id: stopMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Nikita.stopThinking()
+                }
             }
             Button {
                 text: "Send"
@@ -1358,26 +1428,12 @@ Rectangle {
         }
     }
 
-    // Empty state for the log. Parented to listView rather than declared inside
-    // it: a visual child declared in a ListView is reparented to the scrolling
-    // contentItem, which is zero-height when there are no rows to give it one.
-    //
-    // One line, not three. The heading repeated what the header already says a
-    // few pixels above it, and the "open model manager" link repeated the gear
-    // sitting right next to that; in the docked size all of it collided with
-    // the input box.
-    Text {
-        parent: listView
-        anchors.centerIn: parent
-        width: Math.max(120, listView.width - 32)
-        visible: chatModel.count === 0 && root.viewState !== "min"
-        text: root.hasModel ? "No messages yet."
-                            : "Pick or install a model to start talking."
-        color: Theme.color.mediumorange1
-        font.family: "Share Tech Mono"; font.pixelSize: 11
-        wrapMode: Text.WordWrap
-        horizontalAlignment: Text.AlignHCenter
-    }
+    // No empty state for the log. It went from three lines to one to none: the
+    // heading repeated the header a few pixels above it, the link repeated the
+    // gear beside it, and the last survivor -- "No messages yet." -- told
+    // someone looking at an empty log the one thing they could already see.
+    // With a key in place the greeting arrives on its own and the log is not
+    // empty for long.
 
     // ---- Model manager panel (gear icon) ----------------------------------
     // Not a Popup any more. A modal Popup brought a style-drawn dim with it and
@@ -1759,541 +1815,593 @@ Rectangle {
                     }
                 }
             }
-
-            // ---- BRAIN -------------------------------------------------
-            // Which Kimi model answers. k2.6 is the default -- GA, full account
-            // rate limit; k3 is newer with a 1M window but is throttled in
-            // preview, which stalls multi-round tool turns. One tap switches.
-            Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 1
-                color: Theme.color.mediumorange2
-                opacity: 0.4
-            }
-
-            Text {
-                text: "BRAIN"
-                color: Theme.color.lightorange2
-                font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
-            }
-
-            Repeater {
-                model: Nikita.apiModelChoices()
-                Rectangle {
-                    required property var modelData
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 38
-                    radius: 3
-                    color: "transparent"
-                    border.width: 1
-                    border.color: Nikita.apiModel === modelData.id
-                                  ? Theme.color.lightorange2
-                                  : (brainHover.containsMouse ? Theme.color.mediumorange1
-                                                              : Theme.color.mediumorange2)
-                    RowLayout {
-                        anchors.fill: parent
-                        anchors.leftMargin: 8
-                        anchors.rightMargin: 8
-                        spacing: 8
-                        // A filled dot marks the active model.
-                        Text {
-                            text: Nikita.apiModel === modelData.id ? "\u25cf" : "\u25cb"
-                            color: Nikita.apiModel === modelData.id
-                                   ? Theme.color.lightorange2 : Theme.color.mediumorange1
-                            font.family: "Share Tech Mono"; font.pixelSize: 12
-                        }
-                        ColumnLayout {
-                            spacing: 0
-                            Layout.fillWidth: true
-                            Text {
-                                text: modelData.label
-                                color: Nikita.apiModel === modelData.id
-                                       ? Theme.color.lightorange2 : Theme.color.mediumorange1
-                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
-                            }
-                            Text {
-                                text: modelData.note
-                                color: Theme.color.mediumorange1
-                                opacity: 0.7
-                                font.family: "Share Tech Mono"; font.pixelSize: 9
-                                Layout.fillWidth: true
-                                elide: Text.ElideRight
-                            }
-                        }
-                    }
-                    MouseArea {
-                        id: brainHover
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: Nikita.apiModel = modelData.id
-                    }
-                }
-            }
-
-
-            // Two states, and the resting one is what tells you a key is there:
-            // a stored key shows as a fixed row of dots you cannot edit, the
-            // way a saved password looks in any settings panel. Clicking it
-            // opens an EMPTY field to type a replacement into -- the real
-            // characters are never put back on screen, because the backend has
-            // no getter for them at all and this panel could not read them if
-            // it wanted to. The dots are a marker, not the key.
-            ColumnLayout {
-                id: apiKeyBox
-                Layout.fillWidth: true
-                spacing: 6
-
-                // Typing a new key over a saved one. Reset whenever the stored
-                // key changes underneath, so saving drops straight back to dots.
-                property bool editing: false
-                // The eye. Never sticks: a Timer puts it back, and saving,
-                // clearing or starting to type all close it.
-                property bool revealed: false
-
-                // Clicking the key opens it for editing WITH the key still in
-                // it, rather than handing back an empty box. Blanking the field
-                // on a click reads as having destroyed something -- and if you
-                // only wanted to look, or to fix one character, an empty field
-                // means fetching the key from wherever you keep it all over
-                // again. The consequence to know about: the dots now count the
-                // real key, so the field's width gives its length away, where
-                // the resting state deliberately showed a fixed 28.
-                function beginEditing() {
-                    if (fromEnv) { return; }   // the environment wins; nothing to edit
-                    apiKeyField.text = Nikita.revealApiKey();
-                    editing = true;
-                    apiKeyField.forceActiveFocus();
-                    apiKeyField.selectAll();
-                }
-                property bool fromEnv: Nikita.apiKeySource === "environment"
-                onFromEnvChanged: { editing = false; revealed = false; }
-
-                Text {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    text: apiKeyBox.fromEnv
-                          ? "Key found in MOONSHOT_API_KEY. The environment wins over anything saved here."
-                          : (Nikita.apiKeyPresent
-                             // The model name, not a sentence about storage.
-                             // Where the key lives is answered by the field
-                             // right below it being full.
-                             ? Nikita.modelName
-                             : "No kimi API key Found.")
-                    color: Nikita.apiKeyPresent ? Theme.color.mediumorange1 : "#ff6a6a"
-                    font.family: "Share Tech Mono"; font.pixelSize: 11
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 8
-
-                    // ---- eye: reveal the key ---------------------------
-                    // Drawn, not typed, for the same reason as the gear above:
-                    // Share Tech Mono has no glyph for an eye, and letting Qt
-                    // substitute a system symbol font puts it on a different
-                    // baseline at a different size.
-                    Item {
-                        Layout.preferredWidth: 20
-                        Layout.preferredHeight: 20
-                        Layout.alignment: Qt.AlignVCenter
-                        visible: Nikita.apiKeyPresent && !apiKeyBox.fromEnv
-                        Canvas {
-                            id: eyeIcon
-                            anchors.centerIn: parent
-                            width: 18; height: 18
-                            property color tint: eyeMouse.containsMouse || apiKeyBox.revealed
-                                                 ? Theme.color.lightorange2
-                                                 : Theme.color.mediumorange1
-                            property bool open: apiKeyBox.revealed
-                            onTintChanged: requestPaint()
-                            onOpenChanged: requestPaint()
-                            Component.onCompleted: requestPaint()
-                            onPaint: {
-                                var ctx = getContext("2d");
-                                ctx.reset();
-                                ctx.clearRect(0, 0, width, height);
-                                ctx.strokeStyle = eyeIcon.tint;
-                                ctx.fillStyle = eyeIcon.tint;
-                                ctx.lineWidth = 1.4;
-                                var w = width, h = height, cy = h / 2;
-                                // The almond, as two mirrored quadratic curves.
-                                ctx.beginPath();
-                                ctx.moveTo(w * 0.10, cy);
-                                ctx.quadraticCurveTo(w * 0.50, cy - h * 0.34, w * 0.90, cy);
-                                ctx.quadraticCurveTo(w * 0.50, cy + h * 0.34, w * 0.10, cy);
-                                ctx.stroke();
-                                ctx.beginPath();
-                                ctx.arc(w * 0.50, cy, w * 0.13, 0, Math.PI * 2);
-                                ctx.fill();
-                                // Struck through when hidden, so the two states
-                                // differ in shape and not only in brightness --
-                                // a colour-only difference is no difference at
-                                // all to a lot of people.
-                                if (!eyeIcon.open) {
-                                    ctx.beginPath();
-                                    ctx.moveTo(w * 0.14, h * 0.82);
-                                    ctx.lineTo(w * 0.86, h * 0.18);
-                                    ctx.stroke();
-                                }
-                            }
-                        }
-                        MouseArea {
-                            id: eyeMouse
-                            anchors.fill: parent
-                            anchors.margins: -3
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                apiKeyBox.revealed = !apiKeyBox.revealed;
-                                if (apiKeyBox.revealed) { hideAgain.restart(); }
-                            }
-                        }
-                    }
-                    // Never left showing. Walking away from a revealed key is
-                    // the whole risk of having this control at all.
-                    Timer {
-                        id: hideAgain
-                        interval: 15000
-                        onTriggered: apiKeyBox.revealed = false
-                    }
-
-                    Rectangle {
-                        Layout.fillWidth: true
-                        Layout.preferredHeight: 30
-                        radius: 3
-                        color: "transparent"
-                        border.width: 1
-                        border.color: Nikita.apiKeyPresent && !apiKeyBox.editing
-                                      ? Theme.color.mediumorange1
-                                      : Theme.color.mediumorange2
-
-                        // RESTING: a key is stored and nothing is being typed.
-                        // Masked, unless the eye is open -- and only then is the
-                        // real key asked for, one call, at the moment it is
-                        // needed. A fixed count of dots otherwise: the key's
-                        // real length is nobody's business.
-                        Text {
-                            anchors.left: parent.left
-                            anchors.right: apiCopyBtn.left
-                            anchors.verticalCenter: parent.verticalCenter
-                            anchors.leftMargin: 8
-                            anchors.rightMargin: 8
-                            visible: Nikita.apiKeyPresent && !apiKeyBox.editing
-                            elide: Text.ElideRight
-                            text: apiKeyBox.revealed ? Nikita.revealApiKey()
-                                                     : "•".repeat(28)
-                            color: Theme.color.lightorange2
-                            font.family: "Share Tech Mono"; font.pixelSize: 12
-                        }
-                        MouseArea {
-                            anchors.left: parent.left
-                            anchors.right: apiCopyBtn.left
-                            anchors.top: parent.top
-                            anchors.bottom: parent.bottom
-                            hoverEnabled: true
-                            enabled: Nikita.apiKeyPresent && !apiKeyBox.editing && !apiKeyBox.fromEnv
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: apiKeyBox.beginEditing()
-                        }
-
-                        // EDITING, or nothing stored yet.
-                        TextInput {
-                            id: apiKeyField
-                            anchors.left: parent.left
-                            anchors.right: apiCopyBtn.left
-                            anchors.top: parent.top
-                            anchors.bottom: parent.bottom
-                            anchors.leftMargin: 8
-                            anchors.rightMargin: 8
-                            verticalAlignment: TextInput.AlignVCenter
-                            visible: !Nikita.apiKeyPresent || apiKeyBox.editing
-                            enabled: visible && !apiKeyBox.fromEnv
-                            echoMode: apiKeyBox.revealed ? TextInput.Normal : TextInput.Password
-                            clip: true
-                            color: Theme.color.lightorange2
-                            font.family: "Share Tech Mono"; font.pixelSize: 12
-                            selectByMouse: true
-                            onAccepted: saveApiKey()
-                            Keys.onEscapePressed: {
-                                text = "";
-                                apiKeyBox.editing = false;
-                                apiKeyBox.revealed = false;
-                            }
-                            function saveApiKey() {
-                                if (text.length === 0) {
-                                    // Emptying the field and saving IS the
-                                    // delete. It is the only way the key goes
-                                    // away, which is the point: nothing about
-                                    // opening, looking at or clicking the field
-                                    // can lose it, and the one gesture that
-                                    // removes it is a thing you have to do on
-                                    // purpose and then confirm with Save.
-                                    //
-                                    // Guarded on a key existing, so Save on an
-                                    // empty field during first setup stays the
-                                    // harmless no-op it was.
-                                    if (Nikita.apiKeyPresent) { Nikita.clearApiKey(); }
-                                    apiKeyBox.editing = false;
-                                    apiKeyBox.revealed = false;
-                                    return;
-                                }
-                                Nikita.setApiKey(text);
-                                text = "";
-                                apiKeyBox.editing = false;
-                                apiKeyBox.revealed = false;
-                            }
-                            Text {
-                                anchors.verticalCenter: parent.verticalCenter
-                                visible: apiKeyField.text.length === 0
-                                text: Nikita.apiKeyPresent ? "paste a new key to replace the saved one"
-                                                           : "paste your Kimi API key"
-                                color: Theme.color.mediumorange1
-                                opacity: 0.5
-                                font.family: "Share Tech Mono"; font.pixelSize: 12
-                            }
-                        }
-
-                        // ---- copy, inside the field's right edge -----------
-                        // The key never reaches QML for this: copyApiKeyToClipboard()
-                        // reads it and puts it on the clipboard entirely in C++.
-                        Item {
-                            id: apiCopyBtn
-                            width: 26; height: parent.height
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            visible: Nikita.apiKeyPresent
-                            Canvas {
-                                id: copyIcon
-                                anchors.centerIn: parent
-                                width: 14; height: 14
-                                property color tint: copiedFlash.running
-                                                     ? Theme.color.lightorange2
-                                                     : (copyMouse.containsMouse ? Theme.color.lightorange2
-                                                                                : Theme.color.mediumorange1)
-                                onTintChanged: requestPaint()
-                                Component.onCompleted: requestPaint()
-                                onPaint: {
-                                    var ctx = getContext("2d");
-                                    ctx.reset();
-                                    ctx.clearRect(0, 0, width, height);
-                                    ctx.strokeStyle = copyIcon.tint;
-                                    ctx.lineWidth = 1.3;
-                                    var w = width, h = height;
-                                    // Two offset sheets: the back one peeking
-                                    // out top-right, the front one solid.
-                                    ctx.strokeRect(w * 0.30, h * 0.06, w * 0.62, h * 0.62);
-                                    ctx.clearRect(w * 0.06, h * 0.30, w * 0.62, h * 0.64);
-                                    ctx.strokeRect(w * 0.06, h * 0.30, w * 0.62, h * 0.62);
-                                }
-                            }
-                            // Confirmation, because a copy is invisible: nothing
-                            // else on screen changes, and without some feedback
-                            // there is no way to tell a click that worked from
-                            // one that missed the button. The icon itself is
-                            // the whole acknowledgement -- it brightens and
-                            // pops for a moment. No word beside it: a label
-                            // that appears and vanishes next to a button draws
-                            // more attention than the thing it is confirming.
-                            Timer { id: copiedFlash; interval: 450 }
-                            SequentialAnimation {
-                                id: copyPop
-                                NumberAnimation { target: copyIcon; property: "scale"
-                                                  to: 1.35; duration: 90
-                                                  easing.type: Easing.OutQuad }
-                                NumberAnimation { target: copyIcon; property: "scale"
-                                                  to: 1.0; duration: 160
-                                                  easing.type: Easing.OutQuad }
-                            }
-                            MouseArea {
-                                id: copyMouse
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: if (Nikita.copyApiKeyToClipboard()) {
-                                    copiedFlash.restart();
-                                    copyPop.restart();
-                                }
-                            }
-                        }
-                    }
-
-                    Text {
-                        visible: !apiKeyBox.fromEnv
-                        text: "Save"
-                        color: saveKeyMouse.containsMouse ? Theme.color.lightorange2
-                                                          : Theme.color.mediumorange1
-                        font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
-                        MouseArea {
-                            id: saveKeyMouse
-                            anchors.fill: parent
-                            anchors.margins: -6
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                // Save on a field nobody has typed into means
-                                // "let me type": the alternative is a button
-                                // that silently does nothing, which reads as
-                                // broken.
-                                if (!apiKeyBox.editing && Nikita.apiKeyPresent) {
-                                    apiKeyBox.beginEditing();
-                                } else {
-                                    apiKeyField.saveApiKey();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ---- ACCESS FILTERS ----------------------------------------
-            // What NIKITA is allowed to touch. The two buttons up top are
-            // shortcuts for the same toggles below -- not separate modes, just
-            // all-on/all-off in one click. The actual blocking happens in the
-            // backend (runOneTool), never here: a control that only hides a
-            // tool from the list is decoration, not a gate.
-            Rectangle {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 1
-                color: Theme.color.mediumorange2
-                opacity: 0.4
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 8
-
-                Text {
-                    text: "ACCESS"
-                    color: Theme.color.lightorange2
-                    font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
-                }
-                Text {
-                    text: Nikita.filterPreset === 1 ? "full"
-                        : Nikita.filterPreset === 0 ? "none" : "custom"
-                    // No red here. FORMAT wipes the entire SD card and uses the
-                    // standard palette, so red is not this app's language for
-                    // "destructive" -- it appears only on uninstall/cancel.
-                    color: Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange1
-                    font.family: "Share Tech Mono"; font.pixelSize: 11
-                    Layout.fillWidth: true
-                }
-
-                // preset: nothing
-                Rectangle {
-                    Layout.preferredWidth: noneLabel.implicitWidth + 16
-                    Layout.preferredHeight: 20
-                    radius: 3
-                    color: noneMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
-                    border.width: 1
-                    border.color: Nikita.filterPreset === 0 ? Theme.color.lightorange2
-                                                            : Theme.color.mediumorange2
-                    Text {
-                        id: noneLabel
-                        anchors.centerIn: parent
-                        text: "NO ACCESS"
-                        color: noneMouse.containsMouse ? "#0b0410"
-                             : (Nikita.filterPreset === 0 ? Theme.color.lightorange2
-                                                          : Theme.color.mediumorange1)
-                        font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
-                    }
-                    MouseArea {
-                        id: noneMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: Nikita.setAllFilters(false)
-                    }
-                }
-
-                // preset: everything
-                Rectangle {
-                    Layout.preferredWidth: allLabel.implicitWidth + 16
-                    Layout.preferredHeight: 20
-                    radius: 3
-                    color: allMouse.containsMouse ? Theme.color.lightgreen : "transparent"
-                    border.width: 1
-                    border.color: Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange2
-                    Text {
-                        id: allLabel
-                        anchors.centerIn: parent
-                        text: "FULL ACCESS"
-                        color: allMouse.containsMouse ? "#0b0410"
-                             : (Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange1)
-                        font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
-                    }
-                    MouseArea {
-                        id: allMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: Nikita.setAllFilters(true)
-                    }
-                }
-            }
-
-            ListView {
-                id: filterView
+            // Everything below the title scrolls. The panel is a fixed-height
+            // card, and the settings inside it are not: three model options, the
+            // key row and then one entry per access filter add up past the
+            // bottom edge on any window that isn't tall -- which left the
+            // permissions, the part with real consequences, cropped and
+            // unreachable. The header stays put so the title and the close
+            // button never scroll away from under the pointer.
+            Flickable {
+                id: setupFlick
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                spacing: 4
-                model: Nikita.filters
+                contentWidth: width
+                contentHeight: setupCol.implicitHeight
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar {
+                    // Only when there is something to scroll: a permanent bar on
+                    // a panel that happens to fit reads as broken chrome.
+                    policy: setupFlick.contentHeight > setupFlick.height
+                            ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+                }
 
-                delegate: Rectangle {
-                    width: filterView.width
-                    height: filterCol.implicitHeight + 12
-                    radius: 4
-                    color: modelData.enabled ? "#120818" : "#0d0610"
-                    border.width: 1
-                    border.color: modelData.enabled ? Theme.color.mediumorange2 : "#3a2a3a"
+                ColumnLayout {
+                    id: setupCol
+                    // Room for the scroll bar, so the widest rows are not sitting
+                    // underneath it.
+                    width: setupFlick.width - 12
+                    spacing: 10
 
+
+                    // ---- BRAIN -------------------------------------------------
+                    // Which Kimi model answers. k2.6 is the default -- GA, full account
+                    // rate limit; k3 is newer with a 1M window but is throttled in
+                    // preview, which stalls multi-round tool turns. One tap switches.
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Theme.color.mediumorange2
+                        opacity: 0.4
+                    }
+
+                    Text {
+                        text: "BRAIN"
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
+                    }
+
+                    Repeater {
+                        model: Nikita.apiModelChoices
+                        Rectangle {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 38
+                            radius: 3
+                            color: "transparent"
+                            border.width: 1
+                            border.color: Nikita.apiModel === modelData.id
+                                          ? Theme.color.lightorange2
+                                          : (brainHover.containsMouse ? Theme.color.mediumorange1
+                                                                      : Theme.color.mediumorange2)
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 8
+                                anchors.rightMargin: 8
+                                spacing: 8
+                                // A filled dot marks the active model.
+                                Text {
+                                    text: Nikita.apiModel === modelData.id ? "\u25cf" : "\u25cb"
+                                    color: Nikita.apiModel === modelData.id
+                                           ? Theme.color.lightorange2 : Theme.color.mediumorange1
+                                    font.family: "Share Tech Mono"; font.pixelSize: 12
+                                }
+                                ColumnLayout {
+                                    spacing: 0
+                                    Layout.fillWidth: true
+                                    Text {
+                                        text: modelData.label
+                                        color: Nikita.apiModel === modelData.id
+                                               ? Theme.color.lightorange2 : Theme.color.mediumorange1
+                                        font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                    }
+                                    Text {
+                                        text: modelData.note
+                                        color: Theme.color.mediumorange1
+                                        opacity: 0.7
+                                        font.family: "Share Tech Mono"; font.pixelSize: 9
+                                        Layout.fillWidth: true
+                                        elide: Text.ElideRight
+                                    }
+                                }
+                            }
+                            MouseArea {
+                                id: brainHover
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.apiModel = modelData.id
+                            }
+                        }
+                    }
+
+
+                    // Two states, and the resting one is what tells you a key is there:
+                    // a stored key shows as a fixed row of dots you cannot edit, the
+                    // way a saved password looks in any settings panel. Clicking it
+                    // opens an EMPTY field to type a replacement into -- the real
+                    // characters are never put back on screen, because the backend has
+                    // no getter for them at all and this panel could not read them if
+                    // it wanted to. The dots are a marker, not the key.
                     ColumnLayout {
-                        id: filterCol
-                        x: 10; y: 6
-                        width: parent.width - 20
-                        spacing: 2
+                        id: apiKeyBox
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        // Typing a new key over a saved one. Reset whenever the stored
+                        // key changes underneath, so saving drops straight back to dots.
+                        property bool editing: false
+                        // The eye. Never sticks: a Timer puts it back, and saving,
+                        // clearing or starting to type all close it.
+                        property bool revealed: false
+
+                        // Clicking the key opens it for editing WITH the key still in
+                        // it, rather than handing back an empty box. Blanking the field
+                        // on a click reads as having destroyed something -- and if you
+                        // only wanted to look, or to fix one character, an empty field
+                        // means fetching the key from wherever you keep it all over
+                        // again. The consequence to know about: the dots now count the
+                        // real key, so the field's width gives its length away, where
+                        // the resting state deliberately showed a fixed 28.
+                        function beginEditing() {
+                            if (fromEnv) { return; }   // the environment wins; nothing to edit
+                            apiKeyField.text = Nikita.revealApiKey();
+                            editing = true;
+                            apiKeyField.forceActiveFocus();
+                            apiKeyField.selectAll();
+                        }
+                        property bool fromEnv: Nikita.apiKeySource === "environment"
+                        onFromEnvChanged: { editing = false; revealed = false; }
+
+                        Text {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            // Present is not the same as working, and the difference
+                            // is the whole reason this line exists: a saved key that
+                            // the API rejects has to say so here rather than let the
+                            // panel look ready and fail on the first message.
+                            text: {
+                                if (!Nikita.apiKeyPresent) { return "No kimi API key Found."; }
+                                if (Nikita.apiKeyStatus === "checking") { return "Checking the key with Moonshot…"; }
+                                if (Nikita.apiKeyStatus === "invalid") {
+                                    return "Key rejected — " + Nikita.apiKeyMessage;
+                                }
+                                if (Nikita.apiKeyStatus === "offline" && !Nikita.apiKeyValid) {
+                                    return "Couldn't reach the API to check this key.";
+                                }
+                                // Never the model id. Which brain is answering is
+                                // the badge's job at the top of the chat, and
+                                // naming it here too put a second answer a few
+                                // pixels under the picker that sets it.
+                                if (apiKeyBox.fromEnv) {
+                                    return "Key found in MOONSHOT_API_KEY. The environment wins over anything saved here.";
+                                }
+                                return Nikita.apiKeyValid ? "Key accepted." : "Not verified yet.";
+                            }
+                            color: !Nikita.apiKeyPresent || Nikita.apiKeyStatus === "invalid" ? "#ff6a6a"
+                                 : Nikita.apiKeyValid ? Theme.color.mediumorange1 : "#ffd400"
+                            font.family: "Share Tech Mono"; font.pixelSize: 11
+                        }
 
                         RowLayout {
                             Layout.fillWidth: true
-                            spacing: 6
-                            Text {
-                                text: modelData.label
-                                color: modelData.enabled ? "#eaffea" : Theme.color.mediumorange1
-                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
-                                Layout.fillWidth: true
-                            }
-                            // Same pill styling as installed/not installed in
-                            // the model list above: one visual language, one click.
-                            Rectangle {
-                                Layout.preferredWidth: 44
-                                Layout.preferredHeight: 18
-                                radius: 3
-                                color: modelData.enabled ? "#0f3d1f" : "transparent"
-                                border.width: modelData.enabled ? 0 : 1
-                                border.color: Theme.color.mediumorange2
-                                Text {
+                            spacing: 8
+
+                            // ---- eye: reveal the key ---------------------------
+                            // Drawn, not typed, for the same reason as the gear above:
+                            // Share Tech Mono has no glyph for an eye, and letting Qt
+                            // substitute a system symbol font puts it on a different
+                            // baseline at a different size.
+                            Item {
+                                Layout.preferredWidth: 20
+                                Layout.preferredHeight: 20
+                                Layout.alignment: Qt.AlignVCenter
+                                visible: Nikita.apiKeyPresent && !apiKeyBox.fromEnv
+                                Canvas {
+                                    id: eyeIcon
                                     anchors.centerIn: parent
-                                    text: modelData.enabled ? "ON" : "OFF"
-                                    color: modelData.enabled ? "#39ff14" : Theme.color.mediumorange1
-                                    font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                                    width: 18; height: 18
+                                    property color tint: eyeMouse.containsMouse || apiKeyBox.revealed
+                                                         ? Theme.color.lightorange2
+                                                         : Theme.color.mediumorange1
+                                    property bool open: apiKeyBox.revealed
+                                    onTintChanged: requestPaint()
+                                    onOpenChanged: requestPaint()
+                                    Component.onCompleted: requestPaint()
+                                    onPaint: {
+                                        var ctx = getContext("2d");
+                                        ctx.reset();
+                                        ctx.clearRect(0, 0, width, height);
+                                        ctx.strokeStyle = eyeIcon.tint;
+                                        ctx.fillStyle = eyeIcon.tint;
+                                        ctx.lineWidth = 1.4;
+                                        var w = width, h = height, cy = h / 2;
+                                        // The almond, as two mirrored quadratic curves.
+                                        ctx.beginPath();
+                                        ctx.moveTo(w * 0.10, cy);
+                                        ctx.quadraticCurveTo(w * 0.50, cy - h * 0.34, w * 0.90, cy);
+                                        ctx.quadraticCurveTo(w * 0.50, cy + h * 0.34, w * 0.10, cy);
+                                        ctx.stroke();
+                                        ctx.beginPath();
+                                        ctx.arc(w * 0.50, cy, w * 0.13, 0, Math.PI * 2);
+                                        ctx.fill();
+                                        // Struck through when hidden, so the two states
+                                        // differ in shape and not only in brightness --
+                                        // a colour-only difference is no difference at
+                                        // all to a lot of people.
+                                        if (!eyeIcon.open) {
+                                            ctx.beginPath();
+                                            ctx.moveTo(w * 0.14, h * 0.82);
+                                            ctx.lineTo(w * 0.86, h * 0.18);
+                                            ctx.stroke();
+                                        }
+                                    }
                                 }
                                 MouseArea {
+                                    id: eyeMouse
                                     anchors.fill: parent
-                                    anchors.margins: -4
+                                    anchors.margins: -3
                                     hoverEnabled: true
                                     cursorShape: Qt.PointingHandCursor
-                                    onClicked: Nikita.setFilter(modelData.id, !modelData.enabled)
+                                    onClicked: {
+                                        apiKeyBox.revealed = !apiKeyBox.revealed;
+                                        if (apiKeyBox.revealed) { hideAgain.restart(); }
+                                    }
+                                }
+                            }
+                            // Never left showing. Walking away from a revealed key is
+                            // the whole risk of having this control at all.
+                            Timer {
+                                id: hideAgain
+                                interval: 15000
+                                onTriggered: apiKeyBox.revealed = false
+                            }
+
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 30
+                                radius: 3
+                                color: "transparent"
+                                border.width: 1
+                                border.color: Nikita.apiKeyPresent && !apiKeyBox.editing
+                                              ? Theme.color.mediumorange1
+                                              : Theme.color.mediumorange2
+
+                                // RESTING: a key is stored and nothing is being typed.
+                                // Masked, unless the eye is open -- and only then is the
+                                // real key asked for, one call, at the moment it is
+                                // needed. A fixed count of dots otherwise: the key's
+                                // real length is nobody's business.
+                                Text {
+                                    anchors.left: parent.left
+                                    anchors.right: apiCopyBtn.left
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.leftMargin: 8
+                                    anchors.rightMargin: 8
+                                    visible: Nikita.apiKeyPresent && !apiKeyBox.editing
+                                    elide: Text.ElideRight
+                                    text: apiKeyBox.revealed ? Nikita.revealApiKey()
+                                                             : "•".repeat(28)
+                                    color: Theme.color.lightorange2
+                                    font.family: "Share Tech Mono"; font.pixelSize: 12
+                                }
+                                MouseArea {
+                                    anchors.left: parent.left
+                                    anchors.right: apiCopyBtn.left
+                                    anchors.top: parent.top
+                                    anchors.bottom: parent.bottom
+                                    hoverEnabled: true
+                                    enabled: Nikita.apiKeyPresent && !apiKeyBox.editing && !apiKeyBox.fromEnv
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: apiKeyBox.beginEditing()
+                                }
+
+                                // EDITING, or nothing stored yet.
+                                TextInput {
+                                    id: apiKeyField
+                                    anchors.left: parent.left
+                                    anchors.right: apiCopyBtn.left
+                                    anchors.top: parent.top
+                                    anchors.bottom: parent.bottom
+                                    anchors.leftMargin: 8
+                                    anchors.rightMargin: 8
+                                    verticalAlignment: TextInput.AlignVCenter
+                                    visible: !Nikita.apiKeyPresent || apiKeyBox.editing
+                                    enabled: visible && !apiKeyBox.fromEnv
+                                    echoMode: apiKeyBox.revealed ? TextInput.Normal : TextInput.Password
+                                    clip: true
+                                    color: Theme.color.lightorange2
+                                    font.family: "Share Tech Mono"; font.pixelSize: 12
+                                    selectByMouse: true
+                                    onAccepted: saveApiKey()
+                                    Keys.onEscapePressed: {
+                                        text = "";
+                                        apiKeyBox.editing = false;
+                                        apiKeyBox.revealed = false;
+                                    }
+                                    function saveApiKey() {
+                                        if (text.length === 0) {
+                                            // Emptying the field and saving IS the
+                                            // delete. It is the only way the key goes
+                                            // away, which is the point: nothing about
+                                            // opening, looking at or clicking the field
+                                            // can lose it, and the one gesture that
+                                            // removes it is a thing you have to do on
+                                            // purpose and then confirm with Save.
+                                            //
+                                            // Guarded on a key existing, so Save on an
+                                            // empty field during first setup stays the
+                                            // harmless no-op it was.
+                                            if (Nikita.apiKeyPresent) { Nikita.clearApiKey(); }
+                                            apiKeyBox.editing = false;
+                                            apiKeyBox.revealed = false;
+                                            return;
+                                        }
+                                        Nikita.setApiKey(text);
+                                        text = "";
+                                        apiKeyBox.editing = false;
+                                        apiKeyBox.revealed = false;
+                                    }
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        visible: apiKeyField.text.length === 0
+                                        text: Nikita.apiKeyPresent ? "paste a new key to replace the saved one"
+                                                                   : "paste your Kimi API key"
+                                        color: Theme.color.mediumorange1
+                                        opacity: 0.5
+                                        font.family: "Share Tech Mono"; font.pixelSize: 12
+                                    }
+                                }
+
+                                // ---- copy, inside the field's right edge -----------
+                                // The key never reaches QML for this: copyApiKeyToClipboard()
+                                // reads it and puts it on the clipboard entirely in C++.
+                                Item {
+                                    id: apiCopyBtn
+                                    width: 26; height: parent.height
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    visible: Nikita.apiKeyPresent
+                                    Canvas {
+                                        id: copyIcon
+                                        anchors.centerIn: parent
+                                        width: 14; height: 14
+                                        property color tint: copiedFlash.running
+                                                             ? Theme.color.lightorange2
+                                                             : (copyMouse.containsMouse ? Theme.color.lightorange2
+                                                                                        : Theme.color.mediumorange1)
+                                        onTintChanged: requestPaint()
+                                        Component.onCompleted: requestPaint()
+                                        onPaint: {
+                                            var ctx = getContext("2d");
+                                            ctx.reset();
+                                            ctx.clearRect(0, 0, width, height);
+                                            ctx.strokeStyle = copyIcon.tint;
+                                            ctx.lineWidth = 1.3;
+                                            var w = width, h = height;
+                                            // Two offset sheets: the back one peeking
+                                            // out top-right, the front one solid.
+                                            ctx.strokeRect(w * 0.30, h * 0.06, w * 0.62, h * 0.62);
+                                            ctx.clearRect(w * 0.06, h * 0.30, w * 0.62, h * 0.64);
+                                            ctx.strokeRect(w * 0.06, h * 0.30, w * 0.62, h * 0.62);
+                                        }
+                                    }
+                                    // Confirmation, because a copy is invisible: nothing
+                                    // else on screen changes, and without some feedback
+                                    // there is no way to tell a click that worked from
+                                    // one that missed the button. The icon itself is
+                                    // the whole acknowledgement -- it brightens and
+                                    // pops for a moment. No word beside it: a label
+                                    // that appears and vanishes next to a button draws
+                                    // more attention than the thing it is confirming.
+                                    Timer { id: copiedFlash; interval: 450 }
+                                    SequentialAnimation {
+                                        id: copyPop
+                                        NumberAnimation { target: copyIcon; property: "scale"
+                                                          to: 1.35; duration: 90
+                                                          easing.type: Easing.OutQuad }
+                                        NumberAnimation { target: copyIcon; property: "scale"
+                                                          to: 1.0; duration: 160
+                                                          easing.type: Easing.OutQuad }
+                                    }
+                                    MouseArea {
+                                        id: copyMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: if (Nikita.copyApiKeyToClipboard()) {
+                                            copiedFlash.restart();
+                                            copyPop.restart();
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text {
+                                visible: !apiKeyBox.fromEnv
+                                text: "Save"
+                                color: saveKeyMouse.containsMouse ? Theme.color.lightorange2
+                                                                  : Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                MouseArea {
+                                    id: saveKeyMouse
+                                    anchors.fill: parent
+                                    anchors.margins: -6
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        // Save on a field nobody has typed into means
+                                        // "let me type": the alternative is a button
+                                        // that silently does nothing, which reads as
+                                        // broken.
+                                        if (!apiKeyBox.editing && Nikita.apiKeyPresent) {
+                                            apiKeyBox.beginEditing();
+                                        } else {
+                                            apiKeyField.saveApiKey();
+                                        }
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    // ---- ACCESS FILTERS ----------------------------------------
+                    // What NIKITA is allowed to touch. The two buttons up top are
+                    // shortcuts for the same toggles below -- not separate modes, just
+                    // all-on/all-off in one click. The actual blocking happens in the
+                    // backend (runOneTool), never here: a control that only hides a
+                    // tool from the list is decoration, not a gate.
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Theme.color.mediumorange2
+                        opacity: 0.4
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
 
                         Text {
-                            text: modelData.blurb
-                            color: Theme.color.mediumorange1
-                            font.family: "Share Tech Mono"; font.pixelSize: 10
-                            wrapMode: Text.WordWrap
+                            text: "ACCESS"
+                            color: Theme.color.lightorange2
+                            font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
+                        }
+                        Text {
+                            text: Nikita.filterPreset === 1 ? "full"
+                                : Nikita.filterPreset === 0 ? "none" : "custom"
+                            // No red here. FORMAT wipes the entire SD card and uses the
+                            // standard palette, so red is not this app's language for
+                            // "destructive" -- it appears only on uninstall/cancel.
+                            color: Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 11
                             Layout.fillWidth: true
+                        }
+
+                        // preset: nothing
+                        Rectangle {
+                            Layout.preferredWidth: noneLabel.implicitWidth + 16
+                            Layout.preferredHeight: 20
+                            radius: 3
+                            color: noneMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                            border.width: 1
+                            border.color: Nikita.filterPreset === 0 ? Theme.color.lightorange2
+                                                                    : Theme.color.mediumorange2
+                            Text {
+                                id: noneLabel
+                                anchors.centerIn: parent
+                                text: "NO ACCESS"
+                                color: noneMouse.containsMouse ? "#0b0410"
+                                     : (Nikita.filterPreset === 0 ? Theme.color.lightorange2
+                                                                  : Theme.color.mediumorange1)
+                                font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                            }
+                            MouseArea {
+                                id: noneMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.setAllFilters(false)
+                            }
+                        }
+
+                        // preset: everything
+                        Rectangle {
+                            Layout.preferredWidth: allLabel.implicitWidth + 16
+                            Layout.preferredHeight: 20
+                            radius: 3
+                            color: allMouse.containsMouse ? Theme.color.lightgreen : "transparent"
+                            border.width: 1
+                            border.color: Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange2
+                            Text {
+                                id: allLabel
+                                anchors.centerIn: parent
+                                text: "FULL ACCESS"
+                                color: allMouse.containsMouse ? "#0b0410"
+                                     : (Nikita.filterPreset === 1 ? "#39ff14" : Theme.color.mediumorange1)
+                                font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                            }
+                            MouseArea {
+                                id: allMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.setAllFilters(true)
+                            }
+                        }
+                    }
+
+                    // A Repeater, not a ListView: the panel scrolls as one page
+                    // now, and a list that scrolls inside a page that scrolls
+                    // fights the wheel for whichever one the pointer happens to
+                    // be over. Every filter is laid out at full height and the
+                    // Flickable above carries the lot.
+                    ColumnLayout {
+                        id: filterView
+                        Layout.fillWidth: true
+                        spacing: 4
+
+                        Repeater {
+                            model: Nikita.filters
+
+                            delegate: Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: filterCol.implicitHeight + 12
+                                radius: 4
+                                color: modelData.enabled ? "#120818" : "#0d0610"
+                                border.width: 1
+                                border.color: modelData.enabled ? Theme.color.mediumorange2 : "#3a2a3a"
+
+                                ColumnLayout {
+                                    id: filterCol
+                                    x: 10; y: 6
+                                    width: parent.width - 20
+                                    spacing: 2
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 6
+                                        Text {
+                                            text: modelData.label
+                                            color: modelData.enabled ? "#eaffea" : Theme.color.mediumorange1
+                                            font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                            Layout.fillWidth: true
+                                        }
+                                        // Same pill styling as installed/not installed in
+                                        // the model list above: one visual language, one click.
+                                        Rectangle {
+                                            Layout.preferredWidth: 44
+                                            Layout.preferredHeight: 18
+                                            radius: 3
+                                            color: modelData.enabled ? "#0f3d1f" : "transparent"
+                                            border.width: modelData.enabled ? 0 : 1
+                                            border.color: Theme.color.mediumorange2
+                                            Text {
+                                                anchors.centerIn: parent
+                                                text: modelData.enabled ? "ON" : "OFF"
+                                                color: modelData.enabled ? "#39ff14" : Theme.color.mediumorange1
+                                                font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                                            }
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                anchors.margins: -4
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: Nikita.setFilter(modelData.id, !modelData.enabled)
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        text: modelData.blurb
+                                        color: Theme.color.mediumorange1
+                                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                                        wrapMode: Text.WordWrap
+                                        Layout.fillWidth: true
+                                    }
+                                }
+                            }
                         }
                     }
                 }

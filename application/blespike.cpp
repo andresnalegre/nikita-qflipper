@@ -62,24 +62,35 @@ void BleSpike::setSessionActive(bool v) { if (v != m_sessionActive) { m_sessionA
 QVariantList BleSpike::devices() const
 {
     QVariantList out;
-    for (const QBluetoothDeviceInfo &d : m_found) {
+    for (int i = 0; i < m_found.size(); ++i) {
+        const QBluetoothDeviceInfo &d = m_found.at(i);
         QVariantMap m;
         m.insert(QStringLiteral("name"), d.name().isEmpty() ? QStringLiteral("(unnamed)") : d.name());
         const QString addr = d.address().toString();
         m.insert(QStringLiteral("address"), addr == QStringLiteral("00:00:00:00:00:00") || addr.isEmpty()
                                              ? d.deviceUuid().toString() : addr);
+        // Only a Flipper can be connected to -- the rest of the neighbourhood
+        // is listed so the scan is honest about what the radio can see, and the
+        // delegate greys them out rather than offering a link that cannot open.
+        m.insert(QStringLiteral("isFlipper"), i < m_isFlipper.size() ? m_isFlipper.at(i) : true);
         out.append(m);
     }
     return out;
 }
 
-void BleSpike::scan()
+void BleSpike::scan()    { startScan(false); }
+void BleSpike::scanAll() { startScan(true); }
+
+void BleSpike::startScan(bool everything)
 {
     if (m_scanning) { return; }
     m_found.clear();
+    m_isFlipper.clear();
     emit devicesChanged();
     m_status.clear();
-    log(QStringLiteral("scanning for BLE devices (~8s)…"));
+    m_scanAll = everything;
+    log(everything ? QStringLiteral("scanning the BLE neighbourhood (~8s)…")
+                   : QStringLiteral("scanning for Flippers (~8s)…"));
     setScanning(true);
     m_agent->start(QBluetoothDeviceDiscoveryAgent::LowEnergyMethod);
 }
@@ -98,17 +109,27 @@ void BleSpike::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
     // notwithstanding -- is what actually decides it.
     const bool looksFlipper = info.name().contains(QStringLiteral("Flipper"), Qt::CaseInsensitive)
                            || info.serviceUuids().contains(kSerialService);
-    if (!looksFlipper) { return; }
+    // The Flipper filter is what the first scan is for: someone who just opened
+    // BLE CONNECT wants their Flipper, not a list of the neighbours' earbuds.
+    // A later press asks for everything the radio can hear, and then the filter
+    // only decides which entries are connectable, not which ones are shown.
+    if (!looksFlipper && !m_scanAll) { return; }
     m_found.append(info);
-    log(QStringLiteral("  found: %1  %2   <-- Flipper?").arg(
+    m_isFlipper.append(looksFlipper);
+    log(QStringLiteral("  found: %1  %2%3").arg(
             info.name().isEmpty() ? QStringLiteral("(unnamed)") : info.name(),
-            info.address().toString()));
+            info.address().toString(),
+            looksFlipper ? QStringLiteral("   <-- Flipper?") : QString()));
     emit devicesChanged();
 }
 
 void BleSpike::connectToDevice(int index)
 {
     if (index < 0 || index >= m_found.size()) { return; }
+    if (index < m_isFlipper.size() && !m_isFlipper.at(index)) {
+        log(QStringLiteral("that device is not a Flipper -- nothing to connect to."));
+        return;
+    }
     disconnectDevice();
     const QBluetoothDeviceInfo info = m_found.at(index);
     log(QStringLiteral("connecting to %1…").arg(info.name()));
@@ -253,6 +274,10 @@ void BleSpike::connectSession(int index)
     using namespace Flipper::Zero;
 
     if (index < 0 || index >= m_found.size()) { return; }
+    if (index < m_isFlipper.size() && !m_isFlipper.at(index)) {
+        log(QStringLiteral("[session] that device is not a Flipper -- nothing to connect to."));
+        return;
+    }
 
     // Only one BLE central link to the Flipper at a time -- drop the raw spike
     // connection (and any prior session) before opening the real one.
@@ -333,6 +358,10 @@ void BleSpike::setDeviceRegistry(Flipper::DeviceRegistry *registry)
 void BleSpike::connectDevice(int index)
 {
     if (index < 0 || index >= m_found.size()) { return; }
+    if (index < m_isFlipper.size() && !m_isFlipper.at(index)) {
+        log(QStringLiteral("[main] that device is not a Flipper -- nothing to connect to."));
+        return;
+    }
     if (!m_reg) { log(QStringLiteral("[main] device registry unavailable.")); return; }
 
     // One BLE central link at a time -- drop any in-panel proof/spike link first.

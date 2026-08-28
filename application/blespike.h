@@ -42,7 +42,8 @@ public:
     bool connected() const { return m_connected; }
     bool sessionActive() const { return m_sessionActive; }
 
-    Q_INVOKABLE void scan();              // start LE discovery (~8s)
+    Q_INVOKABLE void scan();              // start LE discovery (~8s), Flippers only
+    Q_INVOKABLE void scanAll();           // same discovery, every LE device it can see
     Q_INVOKABLE void connectToDevice(int index);
     Q_INVOKABLE void ping();              // poke the CLI (send "\r\n") to prove the RX write path
     Q_INVOKABLE void disconnectDevice();
@@ -67,6 +68,7 @@ signals:
 private:
     void log(const QString &line);
     void setScanning(bool v);
+    void startScan(bool everything);
     void setConnected(bool v);
     void setSessionActive(bool v);
     void onDeviceDiscovered(const QBluetoothDeviceInfo &info);
@@ -82,6 +84,9 @@ private:
 
     QBluetoothDeviceDiscoveryAgent *m_agent = nullptr;
     QList<QBluetoothDeviceInfo>     m_found;
+    // Parallel to m_found: whether each entry is a Flipper (name or Serial
+    // service). Only these can be connected to; the rest are listed for sight.
+    QList<bool>                     m_isFlipper;
     QLowEnergyController           *m_ctrl = nullptr;
     QLowEnergyService              *m_serial = nullptr;
     QLowEnergyCharacteristic        m_rx;   // write endpoint (cached once discovered)
@@ -93,6 +98,7 @@ private:
 
     QString m_status;
     bool    m_scanning = false;
+    bool    m_scanAll = false;      // current scan lists every LE device
     bool    m_connected = false;
     bool    m_sessionActive = false;
 };

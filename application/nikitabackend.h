@@ -55,13 +55,30 @@ class NikitaBackend : public QObject
     // "environment" (MOONSHOT_API_KEY), "settings", or "" when there is none.
     Q_PROPERTY(QString apiKeySource READ apiKeySource NOTIFY apiKeyChanged)
     QString apiKeySource() const;
+    // Present is not the same as usable. A key is only VALID once Moonshot has
+    // answered a request made with it, and the whole UI -- the model pill, the
+    // input box, the ability to send at all -- hangs off this rather than off
+    // "a key was typed": an assistant that shows itself as live and then fails
+    // on the first message is worse than one that plainly says it isn't set up.
+    Q_PROPERTY(bool apiKeyValid READ apiKeyValid NOTIFY apiKeyChanged)
+    bool apiKeyValid() const;
+    // "", "checking", "valid", "invalid", or "offline" (reachable-network
+    // failure, which says nothing about the key). Drives the line under the
+    // field in setup.
+    Q_PROPERTY(QString apiKeyStatus READ apiKeyStatus NOTIFY apiKeyChanged)
+    QString apiKeyStatus() const;
+    // Whatever Moonshot said when it refused, kept verbatim for that line.
+    Q_PROPERTY(QString apiKeyMessage READ apiKeyMessage NOTIFY apiKeyChanged)
+    QString apiKeyMessage() const;
     // Which Kimi model answers. kimi-k3 is the newest flagship but is rate-limited
     // in preview; kimi-k2.6 / k2.7 are GA and run at the account's full tier. A
     // property so the setup panel can offer the choice, persisted in settings.
     Q_PROPERTY(QString apiModel READ apiModel WRITE setApiModel NOTIFY modelChanged)
     void setApiModel(const QString &id);
-    // The selectable Kimi models, each as {id, label, note} for the picker.
-    Q_INVOKABLE QVariantList apiModelChoices() const;
+    // The selectable models, each as {id, label, note} for the picker. A fixed
+    // curated three -- see the .cpp for why this is not the account's catalog.
+    Q_PROPERTY(QVariantList apiModelChoices READ apiModelChoices CONSTANT)
+    QVariantList apiModelChoices() const;
 
     // Set from the password field in setup. Write-only on purpose: there is no
     // getter, so nothing in QML can read it back out.
@@ -79,6 +96,9 @@ class NikitaBackend : public QObject
 public:
     Q_INVOKABLE void setApiKey(const QString &key);
     Q_INVOKABLE void clearApiKey();
+    // Ask Moonshot whether the stored key works, and take the model list back
+    // with the answer. Safe to call whenever; a check already in flight wins.
+    Q_INVOKABLE void checkApiKey();
     // Hands the key back in the clear, for the eye control in setup.
     //
     // This is a deliberate reversal: the field was built write-only, with no
@@ -295,6 +315,10 @@ signals:
                       bool finished, bool failed);
     void modelChanged();
     void agentChanged();
+    // The whole conversation was thrown away -- the panel has to drop its own
+    // copy of it too, or an erase only clears what is on disk and the bubbles
+    // stay on screen (and come back the next time the assistant is switched on).
+    void historyCleared();
     void filtersChanged();
     void modelInstallFinished(const QString &name, bool ok, const QString &message);
     void modelUninstallFinished(const QString &name, bool ok, const QString &message);
@@ -505,6 +529,11 @@ private:
     // ends a turn.
     QSet<QString> m_turnCallSigs;
     int        m_repeatRounds = 0;
+    // Rounds this turn that died on the output-token ceiling with nothing to
+    // show for them. The model spends its whole budget reasoning over the
+    // screen's block art, hits the cap mid-thought and returns empty -- no
+    // text, no tool call -- which used to end the turn in silence.
+    int        m_lengthDeaths = 0;
     // What was last written to /ext/nikita, so an unchanged sync is skipped
     // instead of costing a MkDir plus two Writes over USB on every message.
     QString    m_syncedMemory;
@@ -566,8 +595,20 @@ private:
     // QSettings at the moment a request is built and goes straight into the
     // header. Nothing keeps a copy that could be logged or dumped with the
     // rest of the object's state.
+    // True when the active Flipper is reached over Bluetooth rather than a
+    // cable. Decides which device tools a turn is even offered: the CLI needs
+    // the serial port, the screen and buttons need nothing.
+    bool       deviceOverBle() const;
     QString    apiKey() const;
     QString    apiModel() const;  // the model id sent to the API
+    // Key verification. The verified key is remembered by its hash (never the
+    // key itself), so a restart with the same key comes up usable straight
+    // away instead of red until the network answers.
+    void       markApiKeyVerified(const QString &key);
+    bool       apiKeyWasVerified() const;
+    QString    m_apiKeyStatus;      // "", "checking", "valid", "invalid", "offline"
+    QString    m_apiKeyMessage;     // the provider's own words when it refused
+    QNetworkReply *m_apiKeyCheck = nullptr;
     // The app builds messages in a loose shape: a tool call whose arguments are
     // a JSON object, and a tool result that just follows it. The
     // OpenAI wire format does not: a tool call needs an id and its arguments
