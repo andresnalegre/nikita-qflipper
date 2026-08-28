@@ -352,7 +352,8 @@ THE SD CARD -- A STARTING MAP, NOT A TRUTH. These are the folders the firmware c
 - /ext/favorites.txt and /ext/Manifest -- the favourites list and the asset manifest.
 - SO: WORK OUT THE FOLDER FROM WHAT WAS ASKED, GO THERE, AND LIST IT. "my sub-ghz captures" is /ext/subghz, "my badusb scripts" is /ext/badusb, "my remotes" is /ext/infrared. Do not start at /ext and walk down, and do not go looking on the device's screens for something that is a file. Then fls that folder -- if what you expected is not in it, say so and look around rather than inventing it. A folder can be empty, can hold sub-folders you did not expect, and can be named something this list never mentioned.
 - NAVIGATE THE CARD WITH THE CLI, ALWAYS: fls (list), fcat (read), fstat, ftree, fmkdir, frm, fmv, fmd5, fdf. Every one of them reaches the Flipper, and BOTH spellings work through run_cli -- "fls /ext/nfc", "ls /ext/nfc" and "storage list /ext/nfc" are the same command. Paths are absolute or resolve against /ext; there is no current folder through run_cli, so no fcd. Reading a file before acting on it is never wasted: it is how you learn the exact names inside it instead of guessing.
-- WHICH TOOLS YOU HAVE DEPENDS ON THE LINK, and you will only ever be handed the ones that work. Over a CABLE you get run_cli and no press_button/read_screen: the CLI does everything, deterministically. Over BLUETOOTH there is no CLI at all -- the terminal is USB-only -- so you get read_screen and press_button(ok/back) instead, and driving the device by screen is then the right answer rather than the lazy one. Do not ask for a tool that is not in your list; the one you were given is the one this link supports.
+- WHICH TOOLS YOU HAVE DEPENDS ON THE LINK, and you will only ever be handed the ones that work. Over a CABLE you get run_cli and ir_universal, and no press_button/read_screen: the CLI does everything, deterministically. Over BLUETOOTH there is no CLI at all -- the terminal is USB-only -- so run_cli and ir_universal are gone, and you get read_screen and press_button(ok/back) instead; driving the device by screen is then the right answer rather than the lazy one. Do not ask for a tool that is not in your list; the one you were given is the one this link supports.
+- OVER BLUETOOTH, FILES AND THE SCREEN ARE THE WHOLE TOOLBOX. Everything that goes through the CLI -- firing an IR signal, gpio, subghz, nfc, rfid, led, vibro, power -- needs the cable. If the user asks for one of those on a wireless link, say so plainly in one line and offer the cable; do not go hunting for a way round it.
 - THE CLI IS HOW YOU NAVIGATE (on a cable). All of it. Moving between apps, finding files, reading them, firing a signal -- run_cli does every one of those and it does them deterministically, from wherever the device happens to be. You do not walk menus. There is no D-pad available to you: press_button offers OK and BACK only, and that is deliberate.
 - WHAT THE TWO BUTTONS ARE FOR: OK confirms something that is ALREADY on the screen in front of you, BACK leaves it. A dialog asking to overwrite, a prompt waiting on a keypress, a screen the user asked you to step out of. That is the whole job. They are not a way to get somewhere.
 - IF YOU CATCH YOURSELF ABOUT TO PRESS A BUTTON IN ORDER TO REACH SOMETHING, STOP AND ASK WHICH COMMAND DOES IT. There is almost always one:
@@ -375,7 +376,7 @@ THE SD CARD -- A STARTING MAP, NOT A TRUTH. These are the folders the firmware c
   UNIVERSAL -- the firmware's built-in database, at /ext/infrared/assets/: tv.ir, ac.ir, audio.ir, projector.ir.
   SAVED -- the user's own captures, at /ext/infrared/<Name>.ir: Remote.ir, Remote2.ir, Remote3.ir, Remote4.ir, Samsung.ir and whatever else they have made.
 - WHICH ONE TO USE: if the user names a specific saved remote ("remote4", "the Samsung one") or gives a path, it is SAVED. If they name only a kind of device ("the TV", "turn off the TV", "the air conditioner") with no remote named, go UNIVERSAL. Do not ask when the request already says which; do ask when it is genuinely ambiguous.
-- UNIVERSAL, over the CLI: NEVER read_file these -- tv.ir alone is 170 KB and will blow the read cap for nothing. Ask the Flipper instead: run_cli(ir universal list tv) prints the valid signal names (on this firmware: Ch_prev, Vol_up, Ch_next, Mute, Vol_dn, Power). Then run_cli(ir universal tv Power). The other remotes are ac, audio, projector.
+- UNIVERSAL: NEVER read_file these -- tv.ir alone is 170 KB and will blow the read cap for nothing. To SEND, use the ir_universal TOOL: ir_universal(remote: "tv", button: "Power"). Remotes are tv, ac, audio, projector. That tool reads the database itself and transmits each brand's code through `ir tx`, which is the safe path. To see what a remote offers, run_cli(ir universal list tv) prints the valid signal names (on this firmware: Ch_prev, Vol_up, Ch_next, Mute, Vol_dn, Power) -- listing is fine, but do NOT send with run_cli(ir universal ...): a signal name that is not exactly one of those reboots the Flipper, and the tool cannot make that mistake.
 - PRESSING A BUTTON ON A SAVED REMOTE: DO IT OVER THE CLI. No navigation, no screens, no counting -- and it cannot pick the wrong remote. Three steps:
   1. read_file the remote, e.g. /ext/infrared/Remote4.ir. It is a plain text list of blocks: "name:" (the button), "protocol:", "address:", "command:".
   2. Find the block whose name: matches the button asked for -- "Power" -- and take its protocol, address and command. READ THE FILE BEFORE ACTING, always: the button names are the user's own and are not guessable ("Setings" is spelled exactly like that in Remote4.ir, and there are entries like Netflix_btn, Tcl_btn, Volume_up). Never invent a name and never assume the button you want exists -- look.
@@ -388,7 +389,7 @@ THE SD CARD -- A STARTING MAP, NOT A TRUTH. These are the folders the firmware c
 - If the request does not make it clear which of the two, ASK -- one short question, "universal remote, or one of your saved ones?" -- and act on the answer. This is exactly the case the ACT-DON'T-EXPLAIN rule carves out: a decision only they can make. Guessing wrong here either fires a stranger's code at their hardware or sends you wandering through a menu that never contained what they asked for.
 - SAVED REMOTES are FILES, so stop guessing at them: every one is a .ir file in /ext/infrared/. list_files that folder to see exactly which remotes exist (remote4.ir and so on), and read_file one to see its buttons -- each "name:" line in the file is a button on that remote, in the order the app lists them. Do that BEFORE you navigate: then you know the remote is really there, what it is called, whether it even HAS a Power button, and how far down the list it sits. Walking into the Infrared app to find out is the slow way and it is where the button-mashing starts.
 - To use a saved remote: open Infrared (run_cli(loader open Infrared)), read_screen, move to "Saved Remotes" and ok, then pick the remote by name from the list you already read off the SD, then move to the button you want and ok to fire it. Read the screen at each of those steps -- the lists are yours, not a fixed order anyone can memorise.
-- INFRARED submenu (what the user sees inside the Infrared app): "Universal Remotes" is the built-in TV/AC/audio/projector database, "Saved Remotes" is their own captured .ir files, "Learn New Remote" captures a new one. Know the difference so you can talk about them and so you route a request correctly -- not so you can walk in there. Both are reachable by command: `ir universal list <remote>` / `ir universal <remote> <signal>` for the database, and read the .ir file plus `ir tx` for a saved one. The signal name is the one thing never to guess: list it first.
+- INFRARED submenu (what the user sees inside the Infrared app): "Universal Remotes" is the built-in TV/AC/audio/projector database, "Saved Remotes" is their own captured .ir files, "Learn New Remote" captures a new one. Know the difference so you can talk about them and so you route a request correctly -- not so you can walk in there. Both are reachable without the screen: the ir_universal tool for the database, and read the .ir file plus `ir tx` for a saved one.
 
 LIMITS (be honest, never pretend):
 - You canNOT read a NEW physical card live (NFC/RFID scanning of a card in hand) -- that is not exposed here. You CAN see the screen (read_screen), press buttons, run the CLI, and read/write the SD. Offer those.
@@ -1255,8 +1256,15 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
                                .toObject().value(QStringLiteral("name")).toString();
             const bool manual = (n == QLatin1String("press_button")
                               || n == QLatin1String("read_screen"));
+            // ir_universal reads the code file over RPC (fine wirelessly) and
+            // then TRANSMITS each code through the CLI, which is serial-only.
+            // Offered on BLE it did the reading, reported progress, and died at
+            // the send -- a tool that half-works is worse than one that is not
+            // there, because the half that ran looks like success.
+            const bool needsCli = (n == QLatin1String("run_cli")
+                                || n == QLatin1String("ir_universal"));
             if (overBle) {
-                if (n == QLatin1String("run_cli")) { continue; }
+                if (needsCli) { continue; }
             } else if (manual) {
                 continue;
             }
@@ -5741,12 +5749,22 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
         // "it didn't work" even when the intent was fine. Blocking it here means
         // the device never crashes and the model falls back to the safe path
         // (navigate the Infrared app by button, or `ir tx` a known code).
+        // `ir universal list <remote>` is safe and useful -- it prints the valid
+        // signal names, which is the one thing that must never be guessed. It is
+        // the SEND form that takes the device down when the signal name is not
+        // in that list (`ir universal tv power`, lowercase, rebooted it), so
+        // only that half is blocked, and it is blocked in favour of the
+        // ir_universal TOOL, which does the same job through `ir tx` and cannot
+        // pass a bad name. Blocking the listing too was leaving the model no way
+        // to learn the names it was being told not to guess.
         if (command.contains(QRegularExpression(QStringLiteral("^\\s*ir\\s+universal\\b"),
-                                                QRegularExpression::CaseInsensitiveOption))) {
-            done(QStringLiteral("{\"error\":\"`ir universal` crashes this firmware and reboots "
-                "the Flipper -- not run. Do NOT send it. To fire a universal TV remote, navigate the "
-                "Infrared app by button (Infrared -> Universal Remotes -> TVs), or send a known code "
-                "with `ir tx <protocol> <address> <command>`, or play a saved .ir file.\"}"));
+                                                QRegularExpression::CaseInsensitiveOption))
+            && !command.contains(QRegularExpression(QStringLiteral("^\\s*ir\\s+universal\\s+list\\b"),
+                                                    QRegularExpression::CaseInsensitiveOption))) {
+            done(QStringLiteral("{\"error\":\"sending with `ir universal` crashes this firmware "
+                "when the signal name is not exactly one from `ir universal list <remote>` -- not run. "
+                "Use the ir_universal TOOL instead (remote: tv/ac/audio/projector, button: Power), "
+                "which sends the same codes through `ir tx` and cannot pass a bad name.\"}"));
             return;
         }
         // Isolated one-shot: pauses RPC, runs the command, hands RPC back.
@@ -5772,6 +5790,15 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             QStringLiteral("audio"), QStringLiteral("projector")};
         if (!known.contains(remote)) {
             done(QStringLiteral("{\"error\":\"unknown remote '%1' (use tv/ac/audio/projector)\"}").arg(remote));
+            return;
+        }
+        // Checked BEFORE the file is read, not after: failing at the transmit
+        // meant the read had already happened and the turn had already narrated
+        // progress it could not finish.
+        if (deviceOverBle()) {
+            done(QStringLiteral("{\"error\":\"the universal remote needs the Flipper's CLI, which "
+                 "only runs over USB. On Bluetooth there is no way to transmit -- plug the cable in, "
+                 "or tell the user to fire it from the Flipper's own Infrared > Universal Remotes.\"}"));
             return;
         }
         if (!m_cli) { done(QStringLiteral("{\"error\":\"CLI not available\"}")); return; }
@@ -9017,6 +9044,22 @@ const char *const kHostPassthrough[] = {
     "sha256sum", "ssh", "tar", "traceroute", "unzip", "which", "xxd", "zip",
 };
 
+// Which of the pass-through commands actually exist on this computer. They are
+// forwarded to a program of the same name, so "listed" and "works" are two
+// different things: nmap, docker or dig are only there if you installed them.
+// `help` says which ones are missing rather than letting you find out by
+// running one and reading a spawn error.
+QString cliMissingPassthrough()
+{
+    QStringList missing;
+    for (const char *name : kHostPassthrough) {
+        const QString n = QString::fromLatin1(name);
+        if (QStandardPaths::findExecutable(n).isEmpty()) { missing += n; }
+    }
+    missing.sort();
+    return missing.join(QLatin1Char(' '));
+}
+
 // Your user name on this computer. $USER is unset in a GUI process launched
 // from Finder or a .desktop file, so fall back to the home folder's name, which
 // is right on every platform this app ships to.
@@ -9688,8 +9731,16 @@ QString cliFormatHelp(const QString &raw, const QString &promptText)
     block += QStringLiteral("  (f-prefixed acts on the Flipper, bare acts on this computer)\n");
     block += QStringLiteral("------ Flipper ------\n");
     block += grid(flipperCmds);
-    block += QStringLiteral("------ Device ------\n");
+    block += QStringLiteral("------ Computer ------\n");
     block += grid(deviceCmds);
+    // Listed above, but only usable if the program is installed here.
+    {
+        const QString missing = cliMissingPassthrough();
+        if (!missing.isEmpty()) {
+            block += QStringLiteral("  (not installed on this computer: ") + missing
+                   + QStringLiteral(")\n");
+        }
+    }
     block += QStringLiteral("------ Firmware ------\n");
     block += grid(stock);
 
@@ -11605,8 +11656,16 @@ QString FlipperCli::cliOfflineHelp()
     out += QStringLiteral("  (f-prefixed acts on the Flipper, bare acts on this computer)\n");
     out += QStringLiteral("------ Flipper ------\n");
     out += grid(flipperCmds);
-    out += QStringLiteral("------ Device ------\n");
+    out += QStringLiteral("------ Computer ------\n");
     out += grid(deviceCmds);
+    // Listed above, but only usable if the program is installed here.
+    {
+        const QString missing = cliMissingPassthrough();
+        if (!missing.isEmpty()) {
+            out += QStringLiteral("  (not installed on this computer: ") + missing
+                   + QStringLiteral(")\n");
+        }
+    }
     out += QStringLiteral("------ Firmware ------\n");
     out += QStringLiteral("  (connect a Flipper to list these)\n");
     return out;

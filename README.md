@@ -26,6 +26,16 @@ The agent runs on the **Kimi API** — you supply an API key (or export `MOONSHO
 
 The most significant changes since the first cut, newest work first. Some sections further down still describe the earlier local-model design; where they conflict with this list, this list is current.
 
+- **The agent's toolbox now follows the link it is on.** `run_cli` needs the serial port, so over Bluetooth it is not offered at all; `read_screen` and `press_button` take its place. Over USB the reverse holds — the CLI does everything deterministically, so the screen tools are withheld rather than left as a slower way to get the same job wrong. `ir_universal` moved to the USB side too: it read its code database over RPC (fine wirelessly) and then transmitted through the CLI, so on BLE it half-ran and died at the send.
+- **The D-pad is gone. `press_button` is `ok` and `back`, and nothing else.** Walking menus by up/down/left/right meant counting rows off a picture the model could not reliably read — that is how "remote4" became Remote3. The enum in the tool schema no longer offers the other four, and a call that asks for one is answered with the command that does the job instead. `ok` confirms what is already on screen, `back` leaves it; neither is a way to travel.
+- **Infrared, done by command.** Saved remotes are files: read `/ext/infrared/<Name>.ir`, take the block whose `name:` matches, and `ir tx <protocol> <address> <command>` — with the trailing `00` padding stripped, because `ir tx RCA 0F000000 54000000` is rejected and `ir tx RCA 0F 54` is not. The universal database is never read as a file (`tv.ir` alone is 170 KB); `ir universal list tv` prints the valid signal names, and the `ir_universal` tool sends them. Sending with a raw `ir universal <remote> <signal>` is still refused — a name outside that list reboots the Flipper — but **listing is now allowed**, which it needed to be, since the rule right beside it says never guess a signal name.
+- **A turn can no longer die in silence.** A round that spends its whole output budget reasoning over the screen's block art and returns empty (`done_reason: "length"`) is retried with an instruction to stop analysing and make one call, twice, instead of ending the turn with three tool rows and no words. A turn that stalls no longer signs off with a sentence it said on the way in.
+- **The API key is verified, not just stored.** One `GET /v1/models` decides it: the model badge, the input box and the ability to send at all hang off a key the API has *accepted*, so the panel no longer shows a live-looking assistant that fails on the first message. The pass is remembered as a hash of the key, never the key.
+- **A cable plugged in while Bluetooth is live takes over, without dropping the wireless link.** Both devices stay registered, the home screen says *"Cable connected"*, and unplugging falls straight back to Bluetooth — no disconnect-and-reconnect. The connection glyph reads the device's own `isBle` rather than the BLE panel's session flag, which used to claim Bluetooth with the cable in hand.
+- **BLE scan has two modes.** With no device connected the button reads **FIND FLIPPER** and hunts for Flippers; once connected it becomes **SCAN NETWORK** and sweeps every LE device in range, listing them in the log. Only an actual Flipper gets a chip you can press, so a neighbourhood sweep no longer fills the panel with unpressable `(unnamed)` buttons.
+- **A memory-only request stays a memory-only request.** *"remember that remote4 is my tv remote"* used to inherit the full toolbox from the previous turn and go poking at the device; it is now handed the three memory tools and nothing else.
+- **The CLI panel's host group is labelled `Computer`, not `Device`** — in this app "device" means the Flipper, so the old heading said the opposite of the line above it. `help` also names the pass-through commands that are **not installed** on your machine, instead of letting you find out from a spawn error.
+- **Chat scrolling stopped fighting you.** Half the auto-scroll call sites ignored the "stick to bottom" flag — including the one that fires on every streamed token — so scrolling up during an answer hauled you back down several times a second. All of them now go through one guard, and the flag is decided from what you actually do rather than from every layout-driven `contentY` change.
 - **The brain moved from a local model to the Kimi API.** Nikita no longer runs `qwen3:4b` under Ollama — it talks to Moonshot's Kimi over the OpenAI-compatible API. **`kimi-k2.6` is the default** (GA, the account's full rate limit, and it prompt-caches the stable prefix so repeated rounds are cheap); **`kimi-k3`** is selectable for the hardest jobs but is rate-limited in preview. The whole Ollama path — model catalog, pull/remove, runtime installer — was removed. The setup panel gained a **BRAIN** model picker and an **API-key field** with show/copy/save; the key is write-only to the UI (there is no getter), and the environment variable `MOONSHOT_API_KEY` overrides a stored key.
 - **The cost, not the context window, is what the footer now shows** for an API turn — dollars per round and per turn, from the real token usage.
 - **Seeing and driving the Flipper's screen.** `read_screen` reads the current framebuffer so the agent is no longer blind, and `press_button` hands the resulting screen back with every press. Navigation is CLI-first: `loader open <App>` reaches an app deterministically instead of counting D-pad steps, and blind button sequences are never stored as reusable "recipes" (they only reproduce from the exact screen they started on).
@@ -148,10 +158,12 @@ Tools are assembled per turn, not fixed. Tool **count** is the single biggest le
 | `read_file` | Read a device file, up to ~8 KB |
 | `save_file` | Write a file to the SD card |
 | `make_dir` / `delete_file` / `rename_file` / `file_info` | The rest of the storage verbs |
-| `read_screen` | Read the current screen (the framebuffer) as text — the agent is not blind |
-| `press_button` | Tap up/down/left/right/ok/back — real D-pad input over RPC; hands back the resulting screen |
-| `run_cli` | Any Flipper CLI command: `device_info`, `subghz`, `nfc`, `gpio`, `ir`, `led`, `vibro`, `power`, `js`, … (known crashers like `ir universal` are refused) |
-| `ir_universal` | Fire a universal remote button (`tv`/`ac`/`audio`/`projector` × `Power`/`Mute`/…) — reads the `.ir` asset and transmits every brand's code over `ir tx`, no navigation |
+| `read_screen` | Read the current screen (the framebuffer) as text — **BLE only** |
+| `press_button` | Tap `ok` or `back` over RPC; hands back the resulting screen — **BLE only**. There is no D-pad |
+| `run_cli` | Any Flipper CLI command: `device_info`, `subghz`, `nfc`, `gpio`, `ir`, `led`, `vibro`, `power`, `js`, … — **USB only** (sending with `ir universal` is refused; `ir universal list` is allowed) |
+| `ir_universal` | Fire a universal remote button (`tv`/`ac`/`audio`/`projector` × `Power`/`Mute`/…) — reads the `.ir` asset and transmits every brand's code over `ir tx` — **USB only**, because the transmit goes through the CLI |
+
+The last four are **split by transport**: a turn over USB is offered `run_cli` and `ir_universal`; a turn over Bluetooth is offered `read_screen` and `press_button` instead. A tool that cannot work on the current link is never put on the table, so the model cannot pick it and half-run it.
 
 **Your computer** — only offered when agent mode is on. This is the part with no equivalent upstream: Nikita stops being a chat window about the Flipper and becomes something that does work on your machine.
 
@@ -319,6 +331,12 @@ Commands that straddle both by design:
 - **`wget <url> [dest]`** — downloads on the computer and writes the result straight onto the Flipper, which has no network of its own.
 - **`edit <file>`** — opens an editor panel, for device files and host files alike.
 
+`help` groups commands as **Flipper** (the `f`-prefixed set), **Computer** (everything that runs here), and **Firmware** (the connected Flipper's own command set). The pass-through commands are forwarded to a program of the same name on this machine, so *listed* and *works* are two different things — `help` names the ones that are not installed:
+
+```
+  (not installed on this computer: docker ifdown ifup nmap)
+```
+
 Plus the shell affordances you expect: Tab completion (host and device paths), `history` with `!12` and `!!`, `colors on|off`, and `verbose on|off` for a wire-level log of everything a command actually sends.
 
 `tgz <folder>` packs a folder the same way Backup does.
@@ -391,6 +409,9 @@ Connect without the cable: a `BleTransport` implements the same `FlipperTranspor
 A few things worth knowing:
 
 - **The CLI panel is still USB-only.** It talks to the device's raw USB serial port directly, which has no BLE equivalent — opening it over a Bluetooth session shows *"CLI is USB only."* instead of a blank terminal. Everything else (storage, file editing, device info, the screen mirror, firmware operations) works the same over either transport.
+- **That limit shapes the agent's toolbox too.** Over Bluetooth, files and the screen are the whole surface: `run_cli` and `ir_universal` are withheld, and `read_screen` / `press_button` are offered in their place. Anything CLI-backed — IR, `gpio`, `subghz`, `nfc`, `rfid`, `led`, `vibro`, `power` — needs the cable, and the agent is told to say so in one line rather than hunt for a way round it.
+- **Plugging the cable in while Bluetooth is live is not a disconnect.** The USB device takes over as the active one, the wireless device stays registered, the home screen says *"Cable connected — Bluetooth still linked"*, and unplugging falls straight back to Bluetooth.
+- **Scanning has two modes.** **FIND FLIPPER** (no device connected) filters to Flippers by GATT service UUID; **SCAN NETWORK** (once connected) lists every LE device in range in the log. Only a Flipper is offered as a connectable chip.
 - **A stuck connection times out and fails cleanly**, rather than hanging forever. macOS in particular can hold onto a stale CoreBluetooth-side connection record from an earlier session, which otherwise leaves `connectToDevice()` with no callback ever firing — no error, no spinner giving up on its own. If a connection attempt does time out repeatedly, macOS's Bluetooth Settings → *Forget This Device* clears it.
 - On macOS, the app's `Info.plist` carries `NSBluetoothAlwaysUsageDescription` — required for CoreBluetooth to scan or connect at all; without it the OS silently denies access with no dialog explaining why.
 
@@ -531,6 +552,7 @@ Stated plainly, because they are the honest state of the tree:
 - **A turn takes minutes on a 4B.** Roughly 60–120 s for a simple action on an M1 with 8 GB, and 100 % of that is the model — the tool itself executes in milliseconds. The largest single win available is a non-reasoning model; the largest one already taken was fitting the context in RAM.
 - **The Flipper's name cannot be changed on Official firmware.** `hardware_name` comes from the factory OTP block, read-only, and Official reads no `name.settings` from anywhere. The `name` command detects this and refuses instead of rebooting your device for nothing. Custom firmware (Momentum, Unleashed, RogueMaster) supports it.
 - **Erasing the SD-card half is best effort.** With no Flipper attached, the local data is erased anyway and the two files on the card are not — they are recreated from scratch when the assistant is next enabled.
+- **GPIO is USB-only, and that is a gap rather than a hard limit.** Pins are reached through `run_cli`, which needs the serial port, so there is no GPIO over Bluetooth. The firmware exposes it over RPC and the protobuf messages are already compiled into the plugin (`gpio.pb.c`, the same eight pins: `PC0 PC1 PC3 PB2 PB3 PA4 PA6 PA7`) — nothing in the app consumes them yet. Wiring it up means a request/response pair, `ProtobufSession` methods and an operation, in the same layer as `storageRead`.
 - **CI builds the Linux AppImage only, and only on release.** Nothing compiles on push, and Windows/macOS aren't covered at all.
 
 ---

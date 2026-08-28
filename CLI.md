@@ -147,7 +147,7 @@ covers the commands this panel *adds* on top of that.
 |---|---|---|---|
 | `clear` | `cls` | `clear` | Clears the terminal view. |
 | `colors` | `color`, `colours` | `colors on \| off` | Colours folders, prompt and log lines, `ls --color` style. |
-| `help` | `?` | `help [command]` | Lists every command (grouped the same way this doc is), or explains one. |
+| `help` | `?` | `help [command]` | Lists every command, or explains one. Three groups: **Flipper** (the `f`-prefixed set), **Computer** (everything that runs here), **Firmware** (the connected Flipper's own commands). |
 | `history` | — | `history [-c]` | Lists commands typed this session; `-c` clears it. |
 | `host` | `local`, `run` | `host <command> [args]` | Explicit escape hatch: runs *anything* on this computer, even a name that would otherwise be ambiguous or unknown — `host whoami`, `host git status`, `host bash myscript.sh`. |
 | `tgz` | — | `tgz <folder> [archive.tgz]` | Packs a folder on this computer into a `.tgz`, the same way the app's own Backup feature does. |
@@ -157,9 +157,17 @@ covers the commands this panel *adds* on top of that.
 
 These have no Flipper meaning at all, so there's nothing to disambiguate —
 they're just run directly, bare, on this computer: `awk`, `base64`, `dig`,
-`docker`, `env`, `git`, `gzip`, `hexdump`, `id`, `ifdown`, `ifup`, `lsof`,
-`man`, `netstat`, `nmap`, `nslookup`, `openssl`, `sha256sum`, `ssh`, `tar`,
-`traceroute`, `unzip`, `which`, `xxd`, `zip`.
+`docker`, `env`, `git`, `gzip`, `hexdump`, `hostname`, `id`, `ifdown`, `ifup`,
+`lsof`, `man`, `netstat`, `nmap`, `nslookup`, `openssl`, `sha256sum`, `ssh`,
+`tar`, `traceroute`, `unzip`, `which`, `xxd`, `zip`.
+
+Being listed is not the same as working: each one is forwarded to a program of
+the same name, so it only runs if that program is installed here. `help` says
+which are missing rather than letting you find out from a spawn error:
+
+```
+  (not installed on this computer: docker ifdown ifup nmap)
+```
 
 ---
 

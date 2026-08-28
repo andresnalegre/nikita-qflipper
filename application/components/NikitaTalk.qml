@@ -192,6 +192,10 @@ Rectangle {
         onTriggered: {
             var maxY = Math.max(0, listView.contentHeight - listView.height);
             listView.contentY = Math.max(0, Math.min(maxY, listView.contentY + root.dragScroll));
+            // Dragging a selection past the edge moves the view without any
+            // Flickable movement signal, so the follow flag has to be updated
+            // by hand here or the next incoming token snaps the selection away.
+            listView.stickToBottom = (listView.contentY + listView.height) >= (listView.contentHeight - 24);
         }
     }
 
@@ -297,7 +301,7 @@ Rectangle {
 
     function appendMessage(role, text) {
         pushRow(role, text, false, false);
-        listView.positionViewAtEnd();
+        listView.followEnd();
     }
 
     function clearChat() {
@@ -407,7 +411,7 @@ Rectangle {
         // between tool lines, and a working turn looks stopped.
         function onTurnStatusChanged() {
             if (Nikita.thinking && listView.stickToBottom) {
-                Qt.callLater(listView.positionViewAtEnd);
+                Qt.callLater(listView.followEnd);
             }
         }
         // Snap to the bottom the instant a turn starts, so the footer is on
@@ -415,7 +419,7 @@ Rectangle {
         function onThinkingChanged() {
             if (Nikita.thinking) {
                 listView.stickToBottom = true;
-                Qt.callLater(listView.positionViewAtEnd);
+                Qt.callLater(listView.followEnd);
             }
         }
         // One row per tool call, rewritten in place when it answers.
@@ -442,7 +446,7 @@ Rectangle {
             // actually ran. Set every update so the finished detail (with any
             // late-filled args) wins.
             chatModel.setProperty(idx, "toolDetail", detail);
-            if (listView.stickToBottom) { listView.positionViewAtEnd(); }
+            listView.followEnd();
         }
         // live typing: grow one bubble as tokens arrive
         function onPartialReceived(text) {
@@ -451,7 +455,7 @@ Rectangle {
             } else {
                 chatModel.setProperty(root.streamIdx, "text", text);
             }
-            listView.positionViewAtEnd();
+            listView.followEnd();
         }
         function onReplyReceived(text) {
             if(root.streamIdx >= 0) {
@@ -460,7 +464,7 @@ Rectangle {
             } else {
                 root.appendMessage("nikita", text);
             }
-            listView.positionViewAtEnd();
+            listView.followEnd();
         }
         function onErrorOccurred(text) {
             if(root.streamIdx >= 0) {
@@ -475,11 +479,11 @@ Rectangle {
         // Feedback from the manual save panel (model-free save straight to SD).
         function onScriptSaved(path) {
             root.appendMessage("nikita", "✅ Salvo em " + path);
-            listView.positionViewAtEnd();
+            listView.followEnd();
         }
         function onScriptSaveError(message) {
             root.appendMessage("nikita", "⚠️ Couldn't save: " + message);
-            listView.positionViewAtEnd();
+            listView.followEnd();
         }
     }
 
@@ -804,12 +808,27 @@ Rectangle {
             // someone is reading back through the conversation is worse than
             // not following at all.
             property bool stickToBottom: true
-            onContentYChanged: {
-                if (!moving && !flicking) { return; }   // programmatic scroll, not the user
-                stickToBottom = (contentY + height) >= (contentHeight - 24);
+
+            // The one place the view is allowed to jump to the end. Everything
+            // that used to call positionViewAtEnd() directly now goes through
+            // here, because half of those calls ignored stickToBottom -- so a
+            // streaming answer hauled the view back down on every token while
+            // the user was trying to scroll up, and the fight between the two
+            // read as the list shaking up and down.
+            function followEnd() {
+                if (stickToBottom) { positionViewAtEnd(); }
             }
-            onCountChanged: if (stickToBottom) Qt.callLater(positionViewAtEnd)
-            onContentHeightChanged: if (stickToBottom) Qt.callLater(positionViewAtEnd)
+
+            // Decided from what the USER does, not from every contentY change.
+            // contentY moves for layout reasons too -- a delegate growing as
+            // text streams in, the footer appearing -- and reading "the user
+            // scrolled" out of those was how the flag flickered.
+            onMovementStarted: stickToBottom = false
+            onMovementEnded: stickToBottom = (contentY + height) >= (contentHeight - 24)
+            onFlickEnded: stickToBottom = (contentY + height) >= (contentHeight - 24)
+
+            onCountChanged: Qt.callLater(followEnd)
+            onContentHeightChanged: Qt.callLater(followEnd)
 
             // ---- live turn status, as the list's footer ------------------
             // Directly under the last message, flowing with the conversation --
