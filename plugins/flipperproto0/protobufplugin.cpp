@@ -7,6 +7,7 @@
 #include "guirequest.h"
 #include "statusrequest.h"
 #include "systemrequest.h"
+#include "apprequest.h"
 #include "storagerequest.h"
 #include "propertyrequest.h"
 
@@ -92,6 +93,16 @@ const QByteArray ProtobufPlugin::guiStopScreenStream(uint32_t id) const
 const QByteArray ProtobufPlugin::guiScreenFrame(uint32_t id, const QByteArray screenData) const
 {
     return GuiScreenFrameRequest(id, screenData).encode();
+}
+
+const QByteArray ProtobufPlugin::appStart(uint32_t id, const QByteArray &name, const QByteArray &args) const
+{
+    return AppStartRequest(id, name, args).encode();
+}
+
+const QByteArray ProtobufPlugin::appExit(uint32_t id) const
+{
+    return AppExitRequest(id).encode();
 }
 
 const QByteArray ProtobufPlugin::guiSendInput(uint32_t id, int key, int type) const

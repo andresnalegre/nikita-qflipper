@@ -48,6 +48,7 @@ SOURCES += \
     flipperzero/rpc/systemgetdatetimeoperation.cpp \
     flipperzero/rpc/systemprotobufversionoperation.cpp \
     flipperzero/rpc/systemrebootoperation.cpp \
+    flipperzero/rpc/apploperation.cpp \
     flipperzero/rpc/systemsetdatetimeoperation.cpp \
     flipperzero/rpc/skipmotdoperation.cpp \
     flipperzero/devicestate.cpp \
@@ -164,6 +165,7 @@ HEADERS += \
     flipperzero/rpc/systemgetdatetimeoperation.h \
     flipperzero/rpc/systemprotobufversionoperation.h \
     flipperzero/rpc/systemrebootoperation.h \
+    flipperzero/rpc/apploperation.h \
     flipperzero/rpc/systemsetdatetimeoperation.h \
     flipperzero/rpc/skipmotdoperation.h \
     flipperzero/deviceinfo.h \

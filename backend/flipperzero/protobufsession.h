@@ -23,6 +23,8 @@ class SystemSetDateTimeOperation;
 class SystemFactoryResetOperation;
 class SystemUpdateOperation;
 class SystemProtobufVersionOperation;
+class AppStartOperation;
+class AppExitOperation;
 
 class StorageListOperation;
 class StorageInfoOperation;
@@ -80,6 +82,10 @@ public:
     SystemSetDateTimeOperation *setDateTime(const QDateTime &dateTime);
     SystemFactoryResetOperation *factoryReset();
     SystemDeviceInfoOperation *systemDeviceInfo();
+
+    // Loader over RPC -- the BLE stand-in for `loader open`/`loader close`.
+    AppStartOperation *appStart(const QByteArray &name, const QByteArray &args = QByteArray());
+    AppExitOperation *appExit();
     SystemUpdateOperation *systemUpdate(const QByteArray &manifestPath);
     SystemProtobufVersionOperation *systemProtobufVersion();
 

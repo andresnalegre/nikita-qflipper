@@ -4,11 +4,11 @@ import QtQuick.Controls 2.15
 
 import Theme 1.0
 
-// Gate for host_write/host_mkdir/host_move/host_copy/host_delete: NIKITA
+// Gate for computer_write/computer_mkdir/computer_move/computer_copy/computer_delete: NIKITA
 // cannot touch a file on this computer through one of these until a person
 // sees what it wants to do and presses Allow. Sibling of
-// HostRunConfirmDialog.qml (same openWith*/callback pattern) -- kept as a
-// separate component because host_run's dialog is command-text specific,
+// ComputerRunConfirmDialog.qml (same openWith*/callback pattern) -- kept as a
+// separate component because computer_run's dialog is command-text specific,
 // while this one is generic across five different verbs with different
 // summaries and an optional content preview.
 CustomDialog {

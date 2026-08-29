@@ -37,6 +37,7 @@ HEADERS += \
     storagerequest.h \
     storageresponse.h \
     systemrequest.h \
+    apprequest.h \
     systemresponse.h
 
 SOURCES += \
@@ -62,6 +63,7 @@ SOURCES += \
     storagerequest.cpp \
     storageresponse.cpp \
     systemrequest.cpp \
+    apprequest.cpp \
     systemresponse.cpp
 
 unix|win32 {

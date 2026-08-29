@@ -26,8 +26,17 @@ The agent runs on the **Kimi API** — you supply an API key (or export `MOONSHO
 
 The most significant changes since the first cut, newest work first. Some sections further down still describe the earlier local-model design; where they conflict with this list, this list is current.
 
+- **`run_ble` — the RPC loader over Bluetooth.** Since the Flipper does not carry its text CLI over BLE, the App RPC that *is* carried was wired end to end (new `AppStart`/`AppExit` request + operation classes, plugin encoding, `ProtobufSession::appStart/appExit`). `run_ble(open, "NFC")` opens an app in one deterministic RPC call — no D-pad, no screen-guessing — and `run_ble(close)` returns to the desktop. It **switches apps cleanly**: opening while another app is running first walks back to the desktop with `back` presses (App_Exit's async teardown was unreliable), *then* starts the new one. BLE-only, mirroring how `run_cli` is USB-only.
+- **Installed apps open by their `.fap` path, not a guessed name.** Built-in apps (NFC, Infrared, …) open by name; anything under `/ext/apps/<Category>/` must be opened by its full `.fap` path (`App_Start` accepts a path and silently ignores a made-up display name). And **"scripts" is a folder** — `/ext/apps/Scripts` — not an app: it is listed, never opened as one.
+- **BadUSB/HID payloads can't run over USB, and Nikita no longer crashes the Flipper trying.** One USB port, one mode at a time: qFlipper holds it as a serial port, a payload needs it as a keyboard, so they collide (`USB is locked` → forcing it hard-reboots the device). The agent now refuses over USB and tells you the real path — plug the Flipper's USB into the *target* machine and connect over **Bluetooth**, leaving the port free to type.
+- **BadUSB keyboard-layout awareness.** Garbled payload output (`https://` typed as `httpsö--`, dropped characters) is a layout mismatch, not a broken script — BadUSB sends key *positions*, mapped by the target's layout. Nikita now diagnoses this and tells you to set the Flipper's Bad USB layout to match the target (e.g. pt-BR/ABNT2), and notes the required layout when it writes a script.
+- **BLE auto-reconnect.** The Flipper you connect to over Bluetooth is remembered (its per-host UUID + name), and on the next launch — when no cable is present — the app silently scans and reconnects to *that* device, no panel, no picking. A cable, if present, still wins.
+- **The computer-side tools were renamed `host_*` → `computer_*`** (`computer_run`, `computer_read`, …) so which machine a call touches is readable from the name alone; the two confirmation dialogs and their QML were renamed to match. Old `host_*` names from a proven move or an older conversation are translated on the fly, so nothing filed under the old name breaks.
+- **Queued messages show as their own turns.** Typing while a turn runs used to queue the text invisibly (only in the "queued" strip) and then send all of it joined into one blob. Now each queued message is drawn as its own "you" bubble the instant it starts, and the queue is processed **one message per turn**.
+- **Chat rendering fixes.** The copy button toggled `visible` on hover, reflowing the row and jerking the scroll — it is now fixed-width and fades via opacity. And the auto-scroll uses `positionViewAtEnd()` rather than a hand-set `contentY`, which had stranded the list in blank space (messages blanking out and flickering back on scroll).
+- **An interrupted turn no longer poisons the next request.** Pressing STOP mid-round left an assistant `tool_calls` message with no matching tool results, which made the *next* API call fail (`must be followed by tool messages responding to each tool_call_id`). Every dangling call is now answered with a synthetic "interrupted" result at the wire boundary.
 - **The agent's toolbox now follows the link it is on.** `run_cli` needs the serial port, so over Bluetooth it is not offered at all; `read_screen` and `press_button` take its place. Over USB the reverse holds — the CLI does everything deterministically, so the screen tools are withheld rather than left as a slower way to get the same job wrong. `ir_universal` moved to the USB side too: it read its code database over RPC (fine wirelessly) and then transmitted through the CLI, so on BLE it half-ran and died at the send.
-- **The D-pad is gone. `press_button` is `ok` and `back`, and nothing else.** Walking menus by up/down/left/right meant counting rows off a picture the model could not reliably read — that is how "remote4" became Remote3. The enum in the tool schema no longer offers the other four, and a call that asks for one is answered with the command that does the job instead. `ok` confirms what is already on screen, `back` leaves it; neither is a way to travel.
+- **`press_button` follows the link.** Over **USB** it is `ok` and `back` only — the CLI navigates deterministically, and up/down/left/right there was guesswork off a picture the model could not read (that is how "remote4" became Remote3). Over **BLE** there is no CLI, so the full D-pad returns, because it is the only cursor there is — with the discipline that one press is followed by a `read_screen` before the next.
 - **Infrared, done by command.** Saved remotes are files: read `/ext/infrared/<Name>.ir`, take the block whose `name:` matches, and `ir tx <protocol> <address> <command>` — with the trailing `00` padding stripped, because `ir tx RCA 0F000000 54000000` is rejected and `ir tx RCA 0F 54` is not. The universal database is never read as a file (`tv.ir` alone is 170 KB); `ir universal list tv` prints the valid signal names, and the `ir_universal` tool sends them. Sending with a raw `ir universal <remote> <signal>` is still refused — a name outside that list reboots the Flipper — but **listing is now allowed**, which it needed to be, since the rule right beside it says never guess a signal name.
 - **A turn can no longer die in silence.** A round that spends its whole output budget reasoning over the screen's block art and returns empty (`done_reason: "length"`) is retried with an instruction to stop analysing and make one call, twice, instead of ending the turn with three tool rows and no words. A turn that stalls no longer signs off with a sentence it said on the way in.
 - **The API key is verified, not just stored.** One `GET /v1/models` decides it: the model badge, the input box and the ability to send at all hang off a key the API has *accepted*, so the panel no longer shows a live-looking assistant that fails on the first message. The pass is remembered as a hash of the key, never the key.
@@ -159,8 +168,9 @@ Tools are assembled per turn, not fixed. Tool **count** is the single biggest le
 | `save_file` | Write a file to the SD card |
 | `make_dir` / `delete_file` / `rename_file` / `file_info` | The rest of the storage verbs |
 | `read_screen` | Read the current screen (the framebuffer) as text — **BLE only** |
-| `press_button` | Tap `ok` or `back` over RPC; hands back the resulting screen — **BLE only**. There is no D-pad |
+| `press_button` | Tap a button and get the resulting screen back. **USB:** `ok`/`back` only. **BLE:** full D-pad (`up`/`down`/`left`/`right`/`ok`/`back`), since there is no CLI to navigate with |
 | `run_cli` | Any Flipper CLI command: `device_info`, `subghz`, `nfc`, `gpio`, `ir`, `led`, `vibro`, `power`, `js`, … — **USB only** (sending with `ir universal` is refused; `ir universal list` is allowed) |
+| `run_ble` | Open or close an app by name (or `.fap` path) over RPC — the deterministic way to navigate on a wireless link — **BLE only** |
 | `ir_universal` | Fire a universal remote button (`tv`/`ac`/`audio`/`projector` × `Power`/`Mute`/…) — reads the `.ir` asset and transmits every brand's code over `ir tx` — **USB only**, because the transmit goes through the CLI |
 
 The last four are **split by transport**: a turn over USB is offered `run_cli` and `ir_universal`; a turn over Bluetooth is offered `read_screen` and `press_button` instead. A tool that cannot work on the current link is never put on the table, so the model cannot pick it and half-run it.
@@ -169,15 +179,15 @@ The last four are **split by transport**: a turn over USB is offered `run_cli` a
 
 | Tool | Does |
 |---|---|
-| `host_read` / `host_write` | Read and overwrite text files anywhere you can |
-| `host_run` | Run a shell command and get back the exit code plus combined stdout/stderr |
-| `host_cd` | Move around, and report where it is and what is there |
-| `host_list` / `host_find` | Browse and search the filesystem |
-| `host_mkdir` / `host_move` / `host_copy` / `host_delete` | The rest of the file verbs |
+| `computer_read` / `computer_write` | Read and overwrite text files anywhere you can |
+| `computer_run` | Run a shell command and get back the exit code plus combined stdout/stderr |
+| `computer_cd` | Move around, and report where it is and what is there |
+| `computer_list` / `computer_find` | Browse and search the filesystem |
+| `computer_mkdir` / `computer_move` / `computer_copy` / `computer_delete` | The rest of the file verbs |
 
 In practice that means asking for the outcome instead of the steps: *"read the crash log on my Desktop and tell me what broke"*, *"build this project and fix the first error"*, *"pull every `.sub` off the card into a folder in Documents, grouped by frequency."* It runs the commands, reads the real output, and reports what actually happened rather than what it intended.
 
-`host_cd` is stateful: the agent walks a working directory the way a person at a shell does, and `host_run` starts wherever it last landed — so a task can move somewhere and stay there across a dozen calls. Paths accept `~`, and well-known folder names ("Desktop", "Downloads", and their pt-BR spellings) resolve through `QStandardPaths` rather than being hardcoded, so they land in the right place on a localised install or a relocated home.
+`computer_cd` is stateful: the agent walks a working directory the way a person at a shell does, and `computer_run` starts wherever it last landed — so a task can move somewhere and stay there across a dozen calls. Paths accept `~`, and well-known folder names ("Desktop", "Downloads", and their pt-BR spellings) resolve through `QStandardPaths` rather than being hardcoded, so they land in the right place on a localised install or a relocated home.
 
 The two machines never blur together: the Flipper tools and the host tools are separate families with separate names, and a call aimed at the wrong one is rerouted rather than silently run in the wrong place.
 
@@ -185,7 +195,7 @@ The two machines never blur together: the Flipper tools and the host tools are s
 
 A local 7B model will cheerfully report a file it never wrote. Most of the agent code is about making that impossible rather than unlikely:
 
-- **Writes are read back.** `host_write` checks the file's size on disk against what it meant to write, and reports `verified: true/false` — the return value of `QFile::write` is not evidence.
+- **Writes are read back.** `computer_write` checks the file's size on disk against what it meant to write, and reports `verified: true/false` — the return value of `QFile::write` is not evidence.
 - **Deletes distinguish "gone" from "was never there."** A delete of a missing file returns `deleted: false, existed: false` with an explicit instruction not to claim a deletion. Recursive removes are re-checked on disk afterwards, because `removeRecursively()` can return false having emptied most of a folder.
 - **Claimed-but-unrun actions are caught.** The final text is scanned for claims ("saved to…", "created…") that no tool call backs up; when one is found the turn is sent back for correction, up to six times.
 - **Destructive paths are refused.** Deleting `/`, a home directory, or anything at depth ≤ 1 is rejected with a message asking for something inside it instead.
@@ -254,10 +264,10 @@ Under the model in the same panel, nine switches decide what Nikita can reach. `
 | Flipper: create and change | `save_file` `make_dir` `rename_file` |
 | Flipper: delete | `delete_file` |
 | Flipper: control | `press_button` `run_cli` `read_screen` `ir_universal` |
-| Computer: read | `host_list` `host_read` `host_find` `host_cd` |
-| Computer: create and change | `host_write` `host_mkdir` `host_move` `host_copy` |
-| Computer: delete | `host_delete` |
-| Computer: run commands | `host_run` |
+| Computer: read | `computer_list` `computer_read` `computer_find` `computer_cd` |
+| Computer: create and change | `computer_write` `computer_mkdir` `computer_move` `computer_copy` |
+| Computer: delete | `computer_delete` |
+| Computer: run commands | `computer_run` |
 
 A disabled group is not merely hidden from the model — the call is refused at execution time as well. Hiding a tool from the list is a smaller menu, not a gate: a small model invents tool names, and an older conversation still in history carries calls from when the access was allowed.
 
@@ -290,12 +300,12 @@ Both dialogs have Cancel and a confirm, and expand to full size if the text does
 
 Agent mode is **off by default** and gated behind an explicit opt-in in the setup wizard, with a warning. Here is the same warning at more length, because it matters:
 
-**With agent mode on, a local language model can run arbitrary shell commands as you, and read, overwrite or delete any file you can.** The workspace folder you pick is *where it starts*, not a fence around it — `host_run` takes a full command line, so a boundary on the typed tools was never real, and pretending otherwise only pushed the model off tools that report failures honestly and onto `sh -c`, where mistakes are invisible.
+**With agent mode on, a local language model can run arbitrary shell commands as you, and read, overwrite or delete any file you can.** The workspace folder you pick is *where it starts*, not a fence around it — `computer_run` takes a full command line, so a boundary on the typed tools was never real, and pretending otherwise only pushed the model off tools that report failures honestly and onto `sh -c`, where mistakes are invisible.
 
 Concretely:
 
-- `host_run` executes via `/bin/sh -c` (or `cmd /c` on Windows), with a 15-minute timeout and captured output. There is no allowlist and no per-command confirmation.
-- `host_write` and `host_delete` reach anywhere on the filesystem, minus the root/home guards described above.
+- `computer_run` executes via `/bin/sh -c` (or `cmd /c` on Windows), with a 15-minute timeout and captured output. There is no allowlist and no per-command confirmation.
+- `computer_write` and `computer_delete` reach anywhere on the filesystem, minus the root/home guards described above.
 - The agent reads files off your SD card and can download URLs. **That content enters the model's context.** A text file planted on a Flipper you didn't prepare yourself is a plausible prompt-injection vector.
 
 Sensible use: keep the workspace under version control, leave agent mode off for day-to-day device work, and turn it on deliberately for a session where you want it. Per-action confirmation is on the roadmap below and is not implemented yet.
@@ -409,7 +419,8 @@ Connect without the cable: a `BleTransport` implements the same `FlipperTranspor
 A few things worth knowing:
 
 - **The CLI panel is still USB-only.** It talks to the device's raw USB serial port directly, which has no BLE equivalent — opening it over a Bluetooth session shows *"CLI is USB only."* instead of a blank terminal. Everything else (storage, file editing, device info, the screen mirror, firmware operations) works the same over either transport.
-- **That limit shapes the agent's toolbox too.** Over Bluetooth, files and the screen are the whole surface: `run_cli` and `ir_universal` are withheld, and `read_screen` / `press_button` are offered in their place. Anything CLI-backed — IR, `gpio`, `subghz`, `nfc`, `rfid`, `led`, `vibro`, `power` — needs the cable, and the agent is told to say so in one line rather than hunt for a way round it.
+- **That limit shapes the agent's toolbox too.** Over Bluetooth, files and the screen are the surface: `run_cli` and `ir_universal` are withheld, and `read_screen` / `press_button` (full D-pad) are offered in their place — plus **`run_ble`**, which opens and closes apps over the App RPC so navigation is a single deterministic call rather than button-walking. Anything else CLI-backed — IR `tx`, `gpio`, `subghz`, `nfc`, `rfid`, `led`, `vibro`, `power` — still needs the cable, and the agent says so rather than hunting for a way round it.
+- **The last-used Flipper is remembered and reconnected automatically.** Connect over BLE once and the device (its per-host UUID + name) is saved; the next launch reconnects to it on its own when no cable is present. `forgetSaved()` clears it.
 - **Plugging the cable in while Bluetooth is live is not a disconnect.** The USB device takes over as the active one, the wireless device stays registered, the home screen says *"Cable connected — Bluetooth still linked"*, and unplugging falls straight back to Bluetooth.
 - **Scanning has two modes.** **FIND FLIPPER** (no device connected) filters to Flippers by GATT service UUID; **SCAN NETWORK** (once connected) lists every LE device in range in the log. Only a Flipper is offered as a connectable chip.
 - **A stuck connection times out and fails cleanly**, rather than hanging forever. macOS in particular can hold onto a stale CoreBluetooth-side connection record from an earlier session, which otherwise leaves `connectToDevice()` with no callback ever firing — no error, no spinner giving up on its own. If a connection attempt does time out repeatedly, macOS's Bluetooth Settings → *Forget This Device* clears it.
@@ -552,7 +563,7 @@ Stated plainly, because they are the honest state of the tree:
 - **A turn takes minutes on a 4B.** Roughly 60–120 s for a simple action on an M1 with 8 GB, and 100 % of that is the model — the tool itself executes in milliseconds. The largest single win available is a non-reasoning model; the largest one already taken was fitting the context in RAM.
 - **The Flipper's name cannot be changed on Official firmware.** `hardware_name` comes from the factory OTP block, read-only, and Official reads no `name.settings` from anywhere. The `name` command detects this and refuses instead of rebooting your device for nothing. Custom firmware (Momentum, Unleashed, RogueMaster) supports it.
 - **Erasing the SD-card half is best effort.** With no Flipper attached, the local data is erased anyway and the two files on the card are not — they are recreated from scratch when the assistant is next enabled.
-- **GPIO is USB-only, and that is a gap rather than a hard limit.** Pins are reached through `run_cli`, which needs the serial port, so there is no GPIO over Bluetooth. The firmware exposes it over RPC and the protobuf messages are already compiled into the plugin (`gpio.pb.c`, the same eight pins: `PC0 PC1 PC3 PB2 PB3 PA4 PA6 PA7`) — nothing in the app consumes them yet. Wiring it up means a request/response pair, `ProtobufSession` methods and an operation, in the same layer as `storageRead`.
+- **GPIO is USB-only, and that is a gap rather than a hard limit.** Pins are reached through `run_cli`, which needs the serial port, so there is no GPIO over Bluetooth. The firmware exposes it over RPC and the protobuf messages are compiled into the plugin (`gpio.pb.c`, the same eight pins: `PC0 PC1 PC3 PB2 PB3 PA4 PA6 PA7`) — nothing consumes them yet. The App RPC (open/close an app) was wired this way for `run_ble`, so GPIO is the same shape of work in the same layer as `storageRead`: a request/response pair, an operation, and a `ProtobufSession` method.
 - **CI builds the Linux AppImage only, and only on release.** Nothing compiles on push, and Windows/macOS aren't covered at all.
 
 ---

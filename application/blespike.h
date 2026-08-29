@@ -58,6 +58,17 @@ public:
     Q_INVOKABLE void connectDevice(int index);
     Q_INVOKABLE void disconnectAll();
 
+    // Remember-and-reconnect. connectDevice() records the chosen Flipper (its
+    // stable per-host UUID + name) in QSettings; autoConnect() scans and, the
+    // moment that same Flipper is seen, connects to it with no picking. So a
+    // returning user is back on their device without opening the panel.
+    Q_PROPERTY(bool hasSavedDevice READ hasSavedDevice CONSTANT)
+    bool hasSavedDevice() const;
+    Q_PROPERTY(QString savedDeviceName READ savedDeviceName CONSTANT)
+    QString savedDeviceName() const;
+    Q_INVOKABLE void autoConnect();     // scan, then connect to the saved Flipper
+    Q_INVOKABLE void forgetSaved();     // stop auto-reconnecting to it
+
 signals:
     void statusChanged();
     void devicesChanged();
@@ -99,6 +110,8 @@ private:
     QString m_status;
     bool    m_scanning = false;
     bool    m_scanAll = false;      // current scan lists every LE device
+    bool    m_autoConnecting = false;   // this scan is a silent reconnect
+    QString m_savedId;                  // the remembered Flipper's UUID/address
     bool    m_connected = false;
     bool    m_sessionActive = false;
 };

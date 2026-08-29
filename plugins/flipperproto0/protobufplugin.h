@@ -20,6 +20,8 @@ public:
     const QByteArray statusPing(uint32_t id, const QByteArray &data) const override;
 
     const QByteArray systemReboot(uint32_t id, RebootMode mode) const override;
+    const QByteArray appStart(uint32_t id, const QByteArray &name, const QByteArray &args) const override;
+    const QByteArray appExit(uint32_t id) const override;
     const QByteArray systemFactoryReset(uint32_t id) const override;
     const QByteArray systemDeviceInfo(uint32_t id) const override;
     const QByteArray systemGetDateTime(uint32_t id) const override;

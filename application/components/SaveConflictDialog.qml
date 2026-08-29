@@ -6,7 +6,7 @@ import Theme 1.0
 
 // A file already sits at the path a save_file wants to write on the Flipper.
 // Instead of the firmware silently overwriting it, the user decides: Replace it,
-// Rename the new one, or Cancel. Sibling of HostActionConfirmDialog -- same
+// Rename the new one, or Cancel. Sibling of ComputerActionConfirmDialog -- same
 // CustomDialog/openWith* pattern, but three outcomes instead of allow/deny, and
 // a name field for the Rename path.
 CustomDialog {

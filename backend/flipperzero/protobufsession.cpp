@@ -25,6 +25,7 @@
 #include "rpc/storagemd5sumoperation.h"
 
 #include "rpc/systemrebootoperation.h"
+#include "rpc/apploperation.h"
 #include "rpc/systemdeviceinfooperation.h"
 #include "rpc/systemgetdatetimeoperation.h"
 #include "rpc/systemsetdatetimeoperation.h"
@@ -150,6 +151,16 @@ SystemFactoryResetOperation *ProtobufSession::factoryReset()
 SystemDeviceInfoOperation *ProtobufSession::systemDeviceInfo()
 {
     return enqueueOperation(new SystemDeviceInfoOperation(getAndIncrementCounter(), this));
+}
+
+AppStartOperation *ProtobufSession::appStart(const QByteArray &name, const QByteArray &args)
+{
+    return enqueueOperation(new AppStartOperation(getAndIncrementCounter(), name, args, this));
+}
+
+AppExitOperation *ProtobufSession::appExit()
+{
+    return enqueueOperation(new AppExitOperation(getAndIncrementCounter(), this));
 }
 
 SystemUpdateOperation *ProtobufSession::systemUpdate(const QByteArray &manifestPath)

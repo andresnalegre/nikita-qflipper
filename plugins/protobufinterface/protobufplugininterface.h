@@ -22,6 +22,8 @@ public:
     virtual const QByteArray statusPing(uint32_t id, const QByteArray &data = QByteArray()) const = 0;
     virtual const QByteArray systemFactoryReset(uint32_t id) const = 0;
     virtual const QByteArray systemReboot(uint32_t id, RebootMode mode) const = 0;
+    virtual const QByteArray appStart(uint32_t id, const QByteArray &name, const QByteArray &args) const = 0;
+    virtual const QByteArray appExit(uint32_t id) const = 0;
     virtual const QByteArray systemDeviceInfo(uint32_t id) const = 0;
     virtual const QByteArray systemGetDateTime(uint32_t id) const = 0;
     virtual const QByteArray systemSetDateTime(uint32_t id, const QDateTime &dateTime) const = 0;

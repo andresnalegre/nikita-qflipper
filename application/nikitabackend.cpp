@@ -53,6 +53,7 @@
 #include "flipperzero/screenstreamer.h"
 #include "screenframe.h"
 #include "flipperzero/protobufsession.h"
+#include "flipperzero/rpc/apploperation.h"
 #include "flipperzero/utilityinterface.h"
 #include "flipperzero/rpc/storagelistoperation.h"
 #include "flipperzero/rpc/storagereadoperation.h"
@@ -135,7 +136,7 @@ static const char *kAssistantEnabledKey = "nikita/assistantEnabled";
 // tokens. kimi-k3 holds a million, so this is not about fitting -- it is about
 // what the history COSTS. Every message in the window is re-sent and re-billed
 // on every round of every turn, and a turn can take four rounds, so one 8000
-// character host_read result dragged along behind the conversation is paid for
+// character computer_read result dragged along behind the conversation is paid for
 // again and again. The 14-message window is usually the binding limit; this
 // only bites when a turn is hauling something large.
 // Big on purpose. 2048 was a cost tweak that quietly broke multi-round work: a
@@ -193,19 +194,19 @@ static const NikitaFilterGroup NIKITA_FILTERS[] = {
       "delete_file" },
     { "flipper_control","Flipper: control",
       "Press buttons and run commands on the Flipper.",
-      "press_button run_cli read_screen ir_universal" },
-    { "host_read",      "Computer: read",
+      "press_button run_cli run_ble read_screen ir_universal" },
+    { "computer_read",      "Computer: read",
       "List folders, read files and search on this computer.",
-      "host_list host_read host_find host_cd" },
-    { "host_write",     "Computer: create and change",
+      "computer_list computer_read computer_find computer_cd" },
+    { "computer_write",     "Computer: create and change",
       "Write files, create folders, move and copy on this computer.",
-      "host_write host_mkdir host_move host_copy" },
-    { "host_delete",    "Computer: delete",
+      "computer_write computer_mkdir computer_move computer_copy" },
+    { "computer_delete",    "Computer: delete",
       "Delete files and folders on this computer.",
-      "host_delete" },
-    { "host_run",       "Computer: run commands",
+      "computer_delete" },
+    { "computer_run",       "Computer: run commands",
       "Execute terminal commands on this computer. The widest access on this list.",
-      "host_run" },
+      "computer_run" },
 };
 static const int NIKITA_FILTER_COUNT = int(sizeof(NIKITA_FILTERS) / sizeof(NIKITA_FILTERS[0]));
 
@@ -229,15 +230,15 @@ static const QHash<QString, QString> &nikitaToolGroups()
 // ---- Host agent (edit/test the app's own source) -------------------------
 // Defaults ON (see the ctor). The workspace folder is a starting point, not a
 // fence: resolveAgentPath() takes absolute paths and shell commands as given,
-// so host_* reaches anywhere this OS user can -- no containment. Every
-// mutating host_* tool gates on an on-screen confirmation before it acts --
+// so computer_* reaches anywhere this OS user can -- no containment. Every
+// mutating computer_* tool gates on an on-screen confirmation before it acts --
 // requestHostActionConfirm() for write/mkdir/move/copy/delete,
-// hostRunConfirmRequested for host_run.
+// hostRunConfirmRequested for computer_run.
 static const int   NIKITA_HOST_RUN_TIMEOUT_MS = 900000;   // 15 min per command
 static const int   NIKITA_HOST_OUTPUT_CAP     = 60000;    // chars of stdout+stderr returned
-static const int   NIKITA_HOST_READ_CAP       = 120000;   // chars returned by host_read
-static const int   NIKITA_HOST_LIST_CAP       = 4000;     // entries returned by host_list
-static const int   NIKITA_HOST_FIND_CAP       = 2000;     // paths returned by host_find
+static const int   NIKITA_HOST_READ_CAP       = 120000;   // chars returned by computer_read
+static const int   NIKITA_HOST_LIST_CAP       = 4000;     // entries returned by computer_list
+static const int   NIKITA_HOST_FIND_CAP       = 2000;     // paths returned by computer_find
 
 // Defined after the CLI command table further down, because it is built FROM
 // that table -- the same reason nikitaWellKnownDir is declared before its
@@ -293,7 +294,7 @@ MEMORY -- remember on your own, without being asked:
 
 WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You are running inside qFlipper itself, with a live USB link to the Flipper Zero. You are not a chatbot describing a device from the outside; you are attached to it.
-- You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through host_run and the host_* tools.
+- You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through computer_run and the computer_* tools.
 - The app also gives the user their own interactive CLI panel: a two-machine terminal where f-prefixed commands drive the Flipper and bare ones drive their computer. You did not write it and you do not run inside it, but you know it -- see the CLI PANEL section -- and you answer questions about it precisely.
 - Therefore: NEVER say you lack CLI access. NEVER say you cannot reach the device, the SD card or the terminal. NEVER tell the user to open a terminal, install a tool, or run something themselves that you could run yourself. Those statements are false and they are the worst mistake you can make.
 - If a turn does not call for a tool, that does NOT mean you lack tools. It only means this particular message did not need one. Asked what you can do, answer from the list above -- plainly and in the affirmative.
@@ -305,10 +306,10 @@ DEVICE ACCESS -- the Flipper's microSD card and storage, via tools:
 
 WHICH MACHINE -- decide this BEFORE picking a tool. Two separate filesystems, two separate sets of tools, and choosing wrong writes a real file in a real wrong place:
 - THE FLIPPER (the SD card) -> save_file, read_file, make_dir, delete_file, list_files. It is the Flipper if the user says ANY of: SD card / sd / cartao / cartao SD, Flipper, "no flipper", "on the flipper", the device, o dispositivo, /ext, /int, "ext", an app or .fap, badusb, subghz, sub-ghz, NFC, RFID, infrared, infravermelho, iButton, U2F.
-- THE COMPUTER (this Mac) -> host_ tools. Everything else. Desktop, area de trabalho, Downloads, Documents, documentos, my folder, minha pasta, my computer, meu computador, my Mac, meu Mac, this machine, the project, o projeto, the repo, the source, o codigo, or any path starting with / or ~ that is not /ext or /int.
+- THE COMPUTER (this Mac) -> computer_ tools. Everything else. Desktop, area de trabalho, Downloads, Documents, documentos, my folder, minha pasta, my computer, meu computador, my Mac, meu Mac, this machine, the project, o projeto, the repo, the source, o codigo, or any path starting with / or ~ that is not /ext or /int.
 - THE DEFAULT IS THE COMPUTER. If the user named no Flipper word at all, they meant this computer. "Save a file called notes.txt" with nothing else said is ~/notes.txt on the Mac, NOT /ext/notes.txt on the card.
 - The user often writes in Portuguese. You still answer in English, but you must recognise their words: "salva no flipper" / "no cartao" = the card; "salva no desktop" / "na area de trabalho" / "no meu Mac" = the computer.
-- "Save X to my Desktop" is the COMPUTER. Use host_write with ~/Desktop/X. It is not /ext/Desktop, and it is never save_file.
+- "Save X to my Desktop" is the COMPUTER. Use computer_write with ~/Desktop/X. It is not /ext/Desktop, and it is never save_file.
 - "Save X to my Flipper" is the CARD. Use save_file with the right /ext folder.
 - Genuinely unsure which they meant? Ask in one short line. Guessing wrong here is worse than a question, because the file lands somewhere they will not think to look.
 - When you report where something went, give the FULL path you got back from the tool -- "/Users/nikita/Desktop/hello.txt", not "on your Desktop". The full path is what lets them catch it instantly if you picked the wrong machine.
@@ -326,6 +327,7 @@ WHICH MACHINE -- decide this BEFORE picking a tool. Two separate filesystems, tw
 - CALL tools, do not TYPE them: invoke a tool through your tool channel and write nothing else that turn -- NEVER paste the tool-call JSON like {"name":"read_file",...} into the chat, never narrate or "show" the call. One call, wait for its result, then react. If you print the JSON yourself it never runs and you look broken.
 - Device facts are NOT files, and NOT something to hunt for on the screen. Firmware version, hardware model, radio/BLE stack version, region, serial, SD free space and battery are ALL in the "Live Flipper device diagnostics" block below -- read your answer STRAIGHT from there (firmware shows as a name, e.g. "mntm-dev (commit ...)" for Momentum, or a number for stock). If a fact genuinely isn't in that block, say so plainly. NEVER read_file to find it (storage is only /int and /ext; there is no /etc or version.txt), and NEVER press buttons to "go check" it.
 
+- BADUSB / HID PAYLOADS NEED THE USB PORT FREE, so they CANNOT run over a USB connection. The Flipper has one USB port and one mode at a time: over USB I hold it as a serial port, and a payload that emulates a keyboard (a Bad USB .txt, or a JS script that types over USB HID -- open_apps and the like) needs that same port. They collide -- the Flipper says "USB is locked, close companion app first" and forcing it CRASHES and reboots the device. This is physics, not a bug. To run such a payload: the Flipper's USB goes into the TARGET machine and I connect over BLUETOOTH -- then the port is free to be a keyboard and the payload runs. If asked to run a BadUSB/HID payload while on USB, do NOT try it; tell the user to plug the Flipper into the target and connect over Bluetooth first.
 DEVICE CONTROL -- prefer the CLI; press buttons only when there is no command for it:
 - CLI FIRST, buttons last. Simulating the D-pad is guesswork -- a button sequence only works from the exact screen it started on, and one wrong count lands in the wrong app (pressing ok on Sub-GHz instead of Infrared). The CLI is deterministic: it does the thing regardless of where the cursor was, and you KNOW the result. Reach for run_cli before press_button.
 - To OPEN a built-in app, do NOT navigate the menu by button -- run `loader open <App>`. Exact names: "Sub-GHz", "125 kHz RFID", "NFC", "Infrared", "GPIO", "iButton", "Bad USB", "U2F". So "go into infrared" is  run_cli(loader open Infrared)  -- it launches the app straight from wherever you are. `loader list` shows the installed apps and their exact names; `loader close` returns to the desktop; `loader info` tells you what is open (this is how you KNOW where you are).
@@ -333,7 +335,7 @@ DEVICE CONTROL -- prefer the CLI; press buttons only when there is no command fo
 - Buttons (press_button) are only for stepping WITHIN an app's own screens when no CLI covers it. Even then, read the screen each press returns and stop when it shows the goal.
 - LOADING: if a returned screen shows an hourglass (a near-empty screen with a small centered symbol) the app is still loading its data -- do NOT press anything yet. Wait and read_screen again until the real screen appears. Selecting a universal remote (TVs/ACs) loads its code database and takes a second or two before the remote is usable.
 - UNIVERSAL REMOTE: on the device this is Infrared -> Universal Remotes -> TVs/ACs/..., a panel of labelled keys (POWER, MUTE, VOL, CH) with a selection cursor. That is what the USER sees. You do not drive it -- run_cli(ir universal list tv) then run_cli(ir universal tv Power) sends the same signal by name, with nothing to aim at.
-- press_button(button, times): button is ok or back -- those two and nothing else. There is no D-pad. ok confirms what is already on the screen, back leaves it; neither is a way to travel anywhere. Every press hands the resulting screen straight back.
+- press_button depends on the LINK. Over USB it is ok and back only -- the CLI navigates, so ok confirms what is on screen and back leaves it, neither travels anywhere. Over BLUETOOTH it also has up/down/left/right, because there is no CLI there and the D-pad is the only cursor. Every press hands the resulting screen straight back; read it before the next one.
 - READING THE SCREEN ART: it arrives as a block-art picture of a 128x64 display. GLANCE at it. Find the filled bar (that is the highlighted item) and the words you can make out around it, then decide your next move. Do NOT transcribe it pixel by pixel or reason your way through it line by line -- that burns your entire reply budget and you end up returning nothing at all, which wastes the whole turn. If a screen is genuinely unreadable, that is not a puzzle to solve: press one button and read it again.
 - read_screen(): reads the Flipper's CURRENT screen as text -- menu items, titles, and which item is highlighted. You are NOT blind: call it to see where you are. For device FACTS (version, model, region) still use the diagnostics block, not the screen -- but for NAVIGATION, read_screen is your eyes.
 THE SD CARD -- A STARTING MAP, NOT A TRUTH. These are the folders the firmware creates, and they tell you WHERE TO LOOK FIRST. What is actually inside them is the user's own: their filing, their sub-folders, their names, and they will not match anyone else's card. So use the map to pick the folder, then USE THE COMMANDS TO SEE WHAT IS REALLY THERE -- fls it, fcat what you find, and work from that. Never answer from this list as though you had looked; never claim a file exists because it usually would; never guess a name you could have listed. Look, read, then act -- and when the job is to change something, read it before you edit it.
@@ -354,7 +356,14 @@ THE SD CARD -- A STARTING MAP, NOT A TRUTH. These are the folders the firmware c
 - NAVIGATE THE CARD WITH THE CLI, ALWAYS: fls (list), fcat (read), fstat, ftree, fmkdir, frm, fmv, fmd5, fdf. Every one of them reaches the Flipper, and BOTH spellings work through run_cli -- "fls /ext/nfc", "ls /ext/nfc" and "storage list /ext/nfc" are the same command. Paths are absolute or resolve against /ext; there is no current folder through run_cli, so no fcd. Reading a file before acting on it is never wasted: it is how you learn the exact names inside it instead of guessing.
 - WHICH TOOLS YOU HAVE DEPENDS ON THE LINK, and you will only ever be handed the ones that work. Over a CABLE you get run_cli and ir_universal, and no press_button/read_screen: the CLI does everything, deterministically. Over BLUETOOTH there is no CLI at all -- the terminal is USB-only -- so run_cli and ir_universal are gone, and you get read_screen and press_button(ok/back) instead; driving the device by screen is then the right answer rather than the lazy one. Do not ask for a tool that is not in your list; the one you were given is the one this link supports.
 - OVER BLUETOOTH, FILES AND THE SCREEN ARE THE WHOLE TOOLBOX. Everything that goes through the CLI -- firing an IR signal, gpio, subghz, nfc, rfid, led, vibro, power -- needs the cable. If the user asks for one of those on a wireless link, say so plainly in one line and offer the cable; do not go hunting for a way round it.
-- THE CLI IS HOW YOU NAVIGATE (on a cable). All of it. Moving between apps, finding files, reading them, firing a signal -- run_cli does every one of those and it does them deterministically, from wherever the device happens to be. You do not walk menus. There is no D-pad available to you: press_button offers OK and BACK only, and that is deliberate.
+- THE CLI IS HOW YOU NAVIGATE ON A CABLE. All of it. Moving between apps, finding files, reading them, firing a signal -- run_cli does every one deterministically, from wherever the device is. On USB you do not walk menus, and press_button is only OK and BACK.
+- OVER BLUETOOTH, OPEN APPS WITH run_ble, NOT WITH BUTTONS. run_ble(open, "NFC") opens the NFC app in one deterministic RPC call -- no D-pad, no counting. run_ble(close) returns to the desktop. It switches apps cleanly too (it exits the current one first), so to go from Sub-GHz to NFC you just call run_ble(open, NFC) -- you do NOT press back yourself. When run_ble reports opened, the app IS open: say so and stop. Do NOT read_screen to 'confirm' it -- that is a wasted call, and the screen art is not something to lean on. Only read_screen when you actually need to act on what is shown INSIDE an app.
+- DO NOT INVENT AN APP FROM A VAGUE WORD. "open my saved ones", "the codes" do not name an app -- do not map them to one. When the word is not clearly one of the real apps, ask which app, or treat it as a FOLDER and use the file tools.
+- "SCRIPTS" IS A FOLDER, NOT AN APP: it means /ext/apps/Scripts on the SD card. "go to scripts" / "open scripts" = list_files(/ext/apps/Scripts) (and read_file one if asked), NOT run_ble. Do NOT open Bad USB for it -- that was wrong every time. Same for any other /ext/apps/<Category> folder the user names. Guessing wrong and opening the incorrect app is worse than asking.
+- READING THE SAME SCREEN TWICE IN A ROW IS A MISTAKE, NOT A STRATEGY. If a read_screen told you nothing usable, calling it again returns the same nothing. Either act (press a button, open something) or say plainly you cannot read the screen -- never sit in a read_screen loop.
+- BUTTONS ARE FOR WHAT run_ble CANNOT DO: moving a cursor WITHIN an app's own screens (picking a saved remote from a list, moving to a key on a universal-remote panel), and unlocking. Then the discipline is not optional: ONE move, read the returned screen, decide the next move from what you SEE highlighted -- never from a count, never two presses without looking between them. Read the highlighted NAME and confirm it before you press ok. If you cannot read the screen, say so and stop; never claim an app is open until a read_screen shows it open.
+- IF THE FLIPPER IS LOCKED IT EATS BUTTONS -- UNLOCK WITH BACK x3. A locked device still runs run_ble and every RPC call normally, but ignores D-pad input, so presses seem to do nothing and the screen does not change. The unlock is three BACK presses in quick succession: press_button(back), press_button(back), press_button(back). If two presses in a row return an identical screen, suspect the lock and try this before anything else.
+- THE DESKTOP (dolphin on screen) IS A HUB, and each direction goes somewhere specific -- know this so you can read where a press landed: OK (or up from a menu) opens the MAIN MENU (Sub-GHz, NFC, ...). LEFT opens the file/folder list. DOWN opens the apps zone (switch app with left/right, ok to run). UP opens Lock / mute / dummy-mode. RIGHT shows the Flipper's passport/mood. But to actually OPEN a named app over BLE you do not walk any of this -- you call run_ble(open, <name>).
 - WHAT THE TWO BUTTONS ARE FOR: OK confirms something that is ALREADY on the screen in front of you, BACK leaves it. A dialog asking to overwrite, a prompt waiting on a keypress, a screen the user asked you to step out of. That is the whole job. They are not a way to get somewhere.
 - IF YOU CATCH YOURSELF ABOUT TO PRESS A BUTTON IN ORDER TO REACH SOMETHING, STOP AND ASK WHICH COMMAND DOES IT. There is almost always one:
   * open an app -> run_cli(loader open "Infrared" / "NFC" / "Sub-GHz" / "125 kHz RFID" / "GPIO" / "iButton" / "Bad USB" / "U2F")
@@ -400,11 +409,12 @@ ACT, DON'T EXPLAIN -- THIS IS THE MOST IMPORTANT RULE ABOUT HOW YOU WORK:
 - When a turn needs a tool, emit ONLY the tool call that turn -- zero prose, zero preamble, zero code blocks. React AFTER the result comes back.
 - "make/create/write/save a script (BadUSB, Sub-GHz, IR, NFC, ...)" means: call save_file and actually write it onto the Flipper right now. Pick the correct path yourself (BadUSB -> /ext/badusb/NAME.txt, etc.). Folders are auto-created, so never stop to ask about folders.
 - ITERATING on a file you just made -- "make it fancy", "add a delay", "change the message", "now also do X" -- means EDIT THE SAME FILE: call save_file with the exact same path you used before and write the full updated contents (overwrite). Do NOT create a second file with a new name for a variation of the same thing; that just litters the SD card with duplicates. A fresh filename is only for a genuinely different artifact.
-- "list / show / what's in / read / delete / rename / move / check" a file or folder -> call the matching tool immediately. "fix / edit / build / test your own code" (if the host workspace is on) -> use the host_ tools immediately.
+- "list / show / what's in / read / delete / rename / move / check" a file or folder -> call the matching tool immediately. "fix / edit / build / test your own code" (if the host workspace is on) -> use the computer_ tools immediately.
 - Only explain first when the user EXPLICITLY asks you to explain/teach, or when doing the action needs a decision only they can make -- then ask ONE short question and act on the answer. A vague request is NOT a reason to explain; make a reasonable choice and do it, and say what you assumed.
 - After acting, if it makes sense to keep going (e.g. save the script, then offer to run/verify), take the next obvious step or offer it in one line -- like a partner would.
 
 BADUSB / DUCKYSCRIPT -- know this cold so you write REAL, ROBUST scripts, not toys:
+- KEYBOARD LAYOUT IS THE #1 CAUSE OF "GARBLED" BADUSB OUTPUT. BadUSB does not send letters -- it sends physical KEY POSITIONS (HID scancodes), and the target machine maps those positions to characters using ITS keyboard layout. A payload typed with the wrong layout comes out scrambled: on a Brazilian (ABNT2) Mac a US-layout payload turns "https://" into "httpsö--" and drops letters, because ":" and "/" sit on different keys. So when the user reports mangled output -- ":// became ö--", missing characters, wrong symbols -- do NOT think the script is wrong: it is a LAYOUT MISMATCH. Tell them to set the Flipper Bad USB keyboard layout to match the TARGET machine (e.g. Portuguese/Brazil pt-BR / ABNT2), chosen in the Bad USB app's layout picker; on Momentum/Unleashed the layout files live in /ext/badusb/assets/layouts/*.kl. The layout is a device-side setting, NOT something in the .txt script. When you WRITE a script, note at the top (as a REM) which layout the target needs, and prefer keystrokes that map the same across layouts (GUI SPACE for macOS Spotlight then the app name, plain ASCII, ENTER/TAB) over punctuation-heavy lines where you can.
 - A BadUSB payload is a DuckyScript file saved as PLAIN TEXT at /ext/badusb/NAME.txt. It is NOT .duk, NOT .sh, NOT a programming language. There is NO puts(), NO print(), NO quotes-as-syntax. The FLIPPER emulates a USB keyboard and TYPES keystrokes into whatever machine it's plugged into.
 - Commands, one per line: ID vid:pid Maker:Product (a BARE DIRECTIVE that sets the USB identity -- it is NOT text and is NEVER written as STRING) | REM comment | DELAY ms | STRING literal text | STRINGLN text+enter | ENTER | TAB | GUI (Win/Cmd) | GUI r (Win Run) | GUI SPACE (mac Spotlight) | GUI L (focus URL bar in a browser) | CTRL/ALT/SHIFT/CTRL-ALT combos | ARROW keys (UP/DOWN/LEFT/RIGHT) | ESC | DELETE | REPEAT n (repeat previous line). Modifiers combine: CTRL SHIFT ENTER.
 - FIRST LINE, ALWAYS, NO EXCEPTIONS: the USB identity, as a BARE ID DIRECTIVE. Every BadUSB script you write begins with this exact line, character for character, before the REM, before anything:
@@ -447,7 +457,7 @@ POWER MOVES -- think like an operator, go beyond the obvious:
 - NEVER fake an action. Do NOT say something happened (e.g. "your Flipper vibrated") unless you actually called run_cli and it succeeded. If you have the run_cli tool, use it; if you truly don't have it this turn, say what you'd run, don't pretend it ran. Never claim you lack CLI access when the run_cli tool is present.
 - run_cli understands Unix-style shortcuts on top of the raw firmware commands, in both spellings: ls/fls, cat/fcat, tree/ftree, stat/fstat, md5/fmd5, mkdir/fmkdir, rm/frm, mv/fmv, df/fdf, touch/ftouch, echo/fecho, whoami/fwhoami, open/fopen, close/fclose, vibro/fvibro, reboot/freboot, shutdown/fshutdown. run_cli ALWAYS reaches the Flipper and never this computer, so both spellings mean the same thing there -- "fls /ext/nfc", "ls /ext/nfc" and "storage list /ext/nfc" are one command. Relative paths resolve against /ext; there is no current folder, so no cd or pwd.
 - Names are DATA. Use the exact spelling the user typed -- capitalisation, digits, punctuation and all. "HAck3RM4N" is a folder called HAck3RM4N, not Hackerman; "lolo.txt" is not "lolo.TXT". Tidying a name up produces a file the user cannot find and did not ask for.
-- TWO MACHINES, TWO TOOLS -- never mix them up. run_cli is the Flipper. host_run and the other host_* tools are THIS COMPUTER. To read a file off the SD card use read_file or run_cli; to read one off the user's disk use host_read. Reaching for the wrong one is the most common way to give a confidently wrong answer.
+- TWO MACHINES, TWO TOOLS -- never mix them up. run_cli is the Flipper. computer_run and the other computer_* tools are THIS COMPUTER. To read a file off the SD card use read_file or run_cli; to read one off the user's disk use computer_read. Reaching for the wrong one is the most common way to give a confidently wrong answer.
 - When you tell the USER what to type in the CLI panel, the prefix matters and run_cli's leniency does not apply there: the panel's bare "ls" is their computer and "fls" is the Flipper. Use the exact name from the CLI PANEL section below.
 - Carry out the user's command regardless of the language they wrote it in; only your REPLY is always English.
 - Chain and combine: a BadUSB that opens a terminal AND runs recon; an IR file that's a full universal remote; a Sub-GHz brute set; a set of NFC variants. Multi-step, complete, ready to run.
@@ -577,11 +587,11 @@ static QJsonArray salvageToolCalls(const QString &content)
         QStringLiteral("press_button"), QStringLiteral("save_file"),
         QStringLiteral("make_dir"), QStringLiteral("delete_file"),
         QStringLiteral("rename_file"), QStringLiteral("file_info"),
-        QStringLiteral("host_list"), QStringLiteral("host_read"),
-        QStringLiteral("host_write"), QStringLiteral("host_run"),
-        QStringLiteral("host_cd"), QStringLiteral("host_mkdir"), QStringLiteral("host_delete"),
-        QStringLiteral("host_move"), QStringLiteral("host_copy"),
-        QStringLiteral("host_find"),
+        QStringLiteral("computer_list"), QStringLiteral("computer_read"),
+        QStringLiteral("computer_write"), QStringLiteral("computer_run"),
+        QStringLiteral("computer_cd"), QStringLiteral("computer_mkdir"), QStringLiteral("computer_delete"),
+        QStringLiteral("computer_move"), QStringLiteral("computer_copy"),
+        QStringLiteral("computer_find"),
         QStringLiteral("remember"), QStringLiteral("list_memory"),
         QStringLiteral("forget")
     };
@@ -913,16 +923,37 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             {"parameters", QJsonObject{{"type", "object"}, {"properties", QJsonObject{}}}}
         }}
     };
+    // The D-pad is offered ONLY over Bluetooth, and this is decided here rather
+    // than argued in the prompt. On a cable the CLI navigates -- deterministic,
+    // and up/down/left/right there was pure guesswork off a screen it could not
+    // read (that is how "remote4" became Remote3). Over Bluetooth there is no
+    // CLI, so the D-pad is the ONLY way to move a cursor, and withholding it
+    // left a wireless session unable to navigate at all.
+    const QJsonArray pressButtons = overBle
+        ? QJsonArray{"up", "down", "left", "right", "ok", "back"}
+        : QJsonArray{"ok", "back"};
+    const QString pressDesc = overBle
+        ? QStringLiteral("Press a button on the Flipper over Bluetooth. This is the ONLY way to "
+              "drive the device on a wireless link -- there is no CLI here. up/down/left/right move "
+              "the selection, ok enters/confirms the highlighted item, back leaves. But do not press "
+              "blind: the resulting screen is returned with every press in the \"screen\" field, and "
+              "you MUST read the highlighted item's name off it and confirm it is what you want "
+              "BEFORE the next press. One move, then look. A count is never evidence of position.")
+        : QStringLiteral("Tap OK or BACK on the Flipper. Those two only over USB -- there is "
+              "deliberately no D-pad, because the CLI navigates deterministically: loader open/close "
+              "to move between apps, fls/fcat for files, ir tx / the ir_universal tool to fire a "
+              "signal. OK confirms what is already on screen, BACK leaves it; neither is a way to "
+              "travel. The resulting screen comes back in the \"screen\" field.");
     const QJsonObject pressButton{
         {"type", "function"},
         {"function", QJsonObject{
             {"name", "press_button"},
-            {"description", "Tap OK or BACK on the connected Flipper Zero. These two only -- there is deliberately no D-pad here. Walking menus by up/down/left/right is guesswork that lands on the wrong item, and everything it was used for is done properly through run_cli instead (loader open/close/info to move between apps, storage/fls/fcat for files, ir tx to fire a signal). Use OK to confirm a prompt that is already on screen and BACK to leave one. The RESULTING screen comes back with the press, in the \"screen\" field. If you are reaching for this to NAVIGATE somewhere, stop: the CLI knows the way and this does not."},
+            {"description", pressDesc},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
-                    {"button", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"ok", "back"}}, {"description", "Which button to tap -- ok to confirm what is on screen, back to leave it"}}},
-                    {"times", QJsonObject{{"type", "integer"}, {"description", "How many times to tap it (default 1). Leave it at 1 unless you have a screen-confirmed reason not to."}}}
+                    {"button", QJsonObject{{"type", "string"}, {"enum", pressButtons}, {"description", "Which button to tap"}}},
+                    {"times", QJsonObject{{"type", "integer"}, {"description", "How many times to tap it (default 1). Leave it at 1 unless you can justify the count from a screen you have already read."}}}
                 }},
                 {"required", QJsonArray{"button"}}
             }}
@@ -932,13 +963,34 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         {"type", "function"},
         {"function", QJsonObject{
             {"name", "run_cli"},
-            {"description", "Run a command on the FLIPPER ZERO over USB and get its text output back. You always have this -- it is the full Flipper CLI. Use it for anything the storage tools don't cover: device_info, gpio (mode/read/set), subghz (tx/rx/decode), nfc, rfid, ir (tx), led, vibro, power (off/reboot), i2c, onewire, ikey, loader, log, free, uptime, js, top. Unix-style shortcuts are translated for you and BOTH spellings work here -- 'fls /ext/nfc', 'ls /ext/nfc' and 'storage list /ext/nfc' all do the same thing, because this tool only ever reaches the Flipper. Available: ls/fls, cat/fcat, tree/ftree, stat/fstat, md5/fmd5, mkdir/fmkdir, rm/frm, mv/fmv, df/fdf, touch/ftouch, echo/fecho, whoami/fwhoami, open/fopen, close/fclose, vibro/fvibro, reboot/freboot, shutdown/fshutdown. Relative paths resolve against /ext; there is no current folder here, so no cd. NOT available: cp between the two machines, find, locate, grep, head, tail, wc, sed, diff, edit and rm -r -- those need the interactive panel, so use the file tools instead. To run something on THIS COMPUTER use host_run, never this tool. One command per call. It briefly pauses the normal session, so prefer the storage tools for plain file work. If it answers that the CLI panel is open, tell the user to close the CLI window -- do not claim you have no access. SAFETY: a malformed or unknown firmware subcommand does not just print an error here -- it can crash the Flipper and force a reboot. `ir universal tv power` did exactly that, and the reason was the SIGNAL NAME: the valid one is `Power`, capitalised, and a name that is not in the list can take the device down. Run `ir universal list tv` first and copy the name from its output. Send only commands whose EXACT syntax you are sure of; if a command returns its own help/usage banner, that means it did NOT run -- read the usage and correct it, do not report success. When unsure, run the bare command (e.g. `ir`) to see its help first, then use the precise form it shows."},
+            {"description", "Run a command on the FLIPPER ZERO over USB and get its text output back. You always have this -- it is the full Flipper CLI. Use it for anything the storage tools don't cover: device_info, gpio (mode/read/set), subghz (tx/rx/decode), nfc, rfid, ir (tx), led, vibro, power (off/reboot), i2c, onewire, ikey, loader, log, free, uptime, js, top. Unix-style shortcuts are translated for you and BOTH spellings work here -- 'fls /ext/nfc', 'ls /ext/nfc' and 'storage list /ext/nfc' all do the same thing, because this tool only ever reaches the Flipper. Available: ls/fls, cat/fcat, tree/ftree, stat/fstat, md5/fmd5, mkdir/fmkdir, rm/frm, mv/fmv, df/fdf, touch/ftouch, echo/fecho, whoami/fwhoami, open/fopen, close/fclose, vibro/fvibro, reboot/freboot, shutdown/fshutdown. Relative paths resolve against /ext; there is no current folder here, so no cd. NOT available: cp between the two machines, find, locate, grep, head, tail, wc, sed, diff, edit and rm -r -- those need the interactive panel, so use the file tools instead. To run something on THIS COMPUTER use computer_run, never this tool. One command per call. It briefly pauses the normal session, so prefer the storage tools for plain file work. If it answers that the CLI panel is open, tell the user to close the CLI window -- do not claim you have no access. SAFETY: a malformed or unknown firmware subcommand does not just print an error here -- it can crash the Flipper and force a reboot. `ir universal tv power` did exactly that, and the reason was the SIGNAL NAME: the valid one is `Power`, capitalised, and a name that is not in the list can take the device down. Run `ir universal list tv` first and copy the name from its output. Send only commands whose EXACT syntax you are sure of; if a command returns its own help/usage banner, that means it did NOT run -- read the usage and correct it, do not report success. When unsure, run the bare command (e.g. `ir`) to see its help first, then use the precise form it shows."},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
                     {"command", QJsonObject{{"type", "string"}, {"description", "The exact CLI command line, e.g. 'device_info' or 'led r 255' or 'vibro 1'"}}}
                 }},
                 {"required", QJsonArray{"command"}}
+            }}
+        }}
+    };
+    // The Bluetooth stand-in for run_cli's most important job: opening an app.
+    // Over BLE there is no serial CLI, but the loader IS reachable over RPC, so
+    // this opens or closes an app by name deterministically -- no D-pad, no
+    // screen-guessing. It does NOT run arbitrary CLI text (the Flipper does not
+    // carry its CLI over Bluetooth); it does the one thing that matters for
+    // navigation, and does it reliably.
+    const QJsonObject runBle{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "run_ble"},
+            {"description", "Open or close a Flipper app over Bluetooth, deterministically. action \"open\" launches an app by its EXACT name; action \"close\" returns to the desktop. For a BUILT-IN app the name is one of: Sub-GHz, 125 kHz RFID, NFC, Infrared, GPIO, iButton, Bad USB, U2F. For an INSTALLED app (a .fap under /ext/apps/<Category>/) you MUST pass its FULL .fap PATH as the name, e.g. /ext/apps/Bluetooth/hid_ble.fap -- App_Start launches external apps by path and a made-up display name silently fails; list_files the category folder to get the exact .fap filename first. DO NOT GUESS a name from a vague word: \"scripts\", \"saved\", \"my codes\", \"read\" are NOT apps -- if the user says something that is not clearly one of these apps, ASK which app they mean, or consider they mean a FOLDER on the SD card (use list_files/read_file for that). When it succeeds the app IS open -- that is the confirmation. Do NOT then call read_screen just to check it opened, and do NOT press any button. Only read_screen afterwards if you genuinely need to see or act on content INSIDE the app."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"action", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"open", "close"}}, {"description", "open to launch an app, close to return to the desktop"}}},
+                    {"name", QJsonObject{{"type", "string"}, {"description", "For open: the app's exact name, e.g. NFC or Infrared. Ignored for close."}}}
+                }},
+                {"required", QJsonArray{"action"}}
             }}
         }}
     };
@@ -1080,15 +1132,16 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         tools.append(readScreen);
         tools.append(pressButton);
         tools.append(runCli);
+        tools.append(runBle);
     }
 
     if (!agent) { return tools; }
 
     // Host tools: only advertised when the user has turned agent mode on.
-    const QJsonObject hostList{
+    const QJsonObject computerList{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_list"},
+            {"name", "computer_list"},
             {"description", "List files and folders on THIS COMPUTER. Absolute path, or ~/... for home, or relative to the workspace folder. Use \".\" for the workspace folder itself."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1099,10 +1152,10 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostRead{
+    const QJsonObject computerRead{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_read"},
+            {"name", "computer_read"},
             {"description", "Read a text file from THIS COMPUTER. Absolute path, or ~/... , or relative to the workspace folder."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1113,10 +1166,10 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostWrite{
+    const QJsonObject computerWrite{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_write"},
+            {"name", "computer_write"},
             {"description", "Write/overwrite a text file on THIS COMPUTER. Creates missing parent folders. Absolute path, or ~/... , or relative to the workspace folder. It OVERWRITES the whole file, so read it first."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1128,11 +1181,11 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostRun{
+    const QJsonObject computerRun{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_run"},
-            {"description", "Run a shell command on THIS COMPUTER and get back its exit code plus captured stdout/stderr. Runs in the workspace folder unless cwd is given. Prefer a typed tool (host_read, host_find, host_delete) when one fits -- they report failures properly. Blocks until the command finishes or times out."},
+            {"name", "computer_run"},
+            {"description", "Run a shell command on THIS COMPUTER and get back its exit code plus captured stdout/stderr. Runs in the workspace folder unless cwd is given. Prefer a typed tool (computer_read, computer_find, computer_delete) when one fits -- they report failures properly. Blocks until the command finishes or times out."},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
@@ -1144,11 +1197,11 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         }}
     };
 
-    const QJsonObject hostCd{
+    const QJsonObject computerCd{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_cd"},
-            {"description", "Move to a folder on this computer, and get back where you now are plus what is in it. Call it with no path to just ask where you are. Relative paths after this resolve from here, and host_run starts here."},
+            {"name", "computer_cd"},
+            {"description", "Move to a folder on this computer, and get back where you now are plus what is in it. Call it with no path to just ask where you are. Relative paths after this resolve from here, and computer_run starts here."},
             {"parameters", QJsonObject{
                 {"type", "object"},
                 {"properties", QJsonObject{
@@ -1158,10 +1211,10 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostMkdir{
+    const QJsonObject computerMkdir{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_mkdir"},
+            {"name", "computer_mkdir"},
             {"description", "Create a folder on this computer, parents included. Absolute path, or ~/... , or relative to the workspace folder."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1172,10 +1225,10 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostDelete{
+    const QJsonObject computerDelete{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_delete"},
+            {"name", "computer_delete"},
             {"description", "Delete a file or a folder (recursively) on this computer. Destructive and not undoable -- only when the user clearly asked for it."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1186,10 +1239,10 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostMove{
+    const QJsonObject computerMove{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_move"},
+            {"name", "computer_move"},
             {"description", "Move or rename a file on this computer. Creates the destination folder if it is missing."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1201,10 +1254,10 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostCopy{
+    const QJsonObject computerCopy{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_copy"},
+            {"name", "computer_copy"},
             {"description", "Copy a file on this computer. Creates the destination folder if it is missing."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1216,10 +1269,10 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
-    const QJsonObject hostFind{
+    const QJsonObject computerFind{
         {"type", "function"},
         {"function", QJsonObject{
-            {"name", "host_find"},
+            {"name", "computer_find"},
             {"description", "Search a folder tree on this computer for names matching a wildcard. Returns full paths."},
             {"parameters", QJsonObject{
                 {"type", "object"},
@@ -1233,16 +1286,16 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
     };
 
     if (focus != FocusDevice) {
-        tools.append(hostList);
-        tools.append(hostRead);
-        tools.append(hostWrite);
-        tools.append(hostRun);
-        tools.append(hostCd);
-        tools.append(hostMkdir);
-        tools.append(hostDelete);
-        tools.append(hostMove);
-        tools.append(hostCopy);
-        tools.append(hostFind);
+        tools.append(computerList);
+        tools.append(computerRead);
+        tools.append(computerWrite);
+        tools.append(computerRun);
+        tools.append(computerCd);
+        tools.append(computerMkdir);
+        tools.append(computerDelete);
+        tools.append(computerMove);
+        tools.append(computerCopy);
+        tools.append(computerFind);
     }
 
     // Transport filter, before the access filter. Offering a tool that cannot
@@ -1263,10 +1316,13 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             // there, because the half that ran looks like success.
             const bool needsCli = (n == QLatin1String("run_cli")
                                 || n == QLatin1String("ir_universal"));
+            // run_ble is the mirror image: it uses App RPC, which only exists
+            // over the wireless link, so it is dropped on a cable.
+            const bool bleOnly = (n == QLatin1String("run_ble"));
             if (overBle) {
                 if (needsCli) { continue; }
-            } else if (manual) {
-                continue;
+            } else {
+                if (bleOnly || manual) { continue; }
             }
             kept.append(v);
         }
@@ -1668,6 +1724,7 @@ static bool messageNeedsTools(const QString &text)
 
 
 static QString nikitaMemoryPath();   // fwd decl: defined below, used in the ctor
+static QStringList nikitaSanitizeSkills(QStringList in);  // fwd decl
 
 NikitaBackend::NikitaBackend(QObject *parent)
     : QObject(parent)
@@ -1858,7 +1915,7 @@ void NikitaBackend::readPortableMemory()
                 // The card wins, same as memory.txt: it is the portable brain,
                 // the local file is only a cache of it.
                 if (!lines.isEmpty()) {
-                    m_skills = lines;
+                    m_skills = nikitaSanitizeSkills(lines);
                     while (m_skills.size() > 24) { m_skills.removeFirst(); }
                     saveProvenMoves();
                     nikitaLog(QStringLiteral("actions-memory.txt read from the card: %1 proven move(s)")
@@ -2474,7 +2531,7 @@ void NikitaBackend::applyNamePersonality()
 // and often Unicode block characters, none of which survives being dropped into
 // a Text item -- Share Tech Mono has no glyph for ESC or the block-drawing
 // range, so it renders as garbage. Strips the whole class (CSI/OSC sequences,
-// C0 controls, U+2500-U+259F). Used for host_run's live output.
+// C0 controls, U+2500-U+259F). Used for computer_run's live output.
 static QString sanitizeStatusLine(const QString &in)
 {
     QString out;
@@ -2515,7 +2572,7 @@ static QString sanitizeStatusLine(const QString &in)
 
 // A tool name is jargon. This is the same event in the words someone waiting
 // on it would use. Anything unmapped falls back to "working" rather than
-// leaking an identifier like host_mkdir into the window.
+// leaking an identifier like computer_mkdir into the window.
 // "name(key=value, ...)" for a tool call, so the chat row can be expanded to
 // show exactly what ran. Long values (a whole script) are trimmed -- the point
 // is to see WHICH command and its key arguments, not to reprint a file.
@@ -2534,16 +2591,16 @@ static QString nikitaToolDetail(const QString &name, const QJsonObject &args)
 static QString nikitaToolStatus(const QString &tool)
 {
     static const QHash<QString, QString> phrases = {
-        {QStringLiteral("host_write"),  QStringLiteral("writing the file")},
-        {QStringLiteral("host_read"),   QStringLiteral("reading the file")},
-        {QStringLiteral("host_list"),   QStringLiteral("listing the folder")},
-        {QStringLiteral("host_find"),   QStringLiteral("searching")},
-        {QStringLiteral("host_run"),    QStringLiteral("running the command")},
-        {QStringLiteral("host_cd"),     QStringLiteral("changing folder")},
-        {QStringLiteral("host_mkdir"),  QStringLiteral("creating the folder")},
-        {QStringLiteral("host_delete"), QStringLiteral("deleting")},
-        {QStringLiteral("host_move"),   QStringLiteral("moving")},
-        {QStringLiteral("host_copy"),   QStringLiteral("copying")},
+        {QStringLiteral("computer_write"),  QStringLiteral("writing the file")},
+        {QStringLiteral("computer_read"),   QStringLiteral("reading the file")},
+        {QStringLiteral("computer_list"),   QStringLiteral("listing the folder")},
+        {QStringLiteral("computer_find"),   QStringLiteral("searching")},
+        {QStringLiteral("computer_run"),    QStringLiteral("running the command")},
+        {QStringLiteral("computer_cd"),     QStringLiteral("changing folder")},
+        {QStringLiteral("computer_mkdir"),  QStringLiteral("creating the folder")},
+        {QStringLiteral("computer_delete"), QStringLiteral("deleting")},
+        {QStringLiteral("computer_move"),   QStringLiteral("moving")},
+        {QStringLiteral("computer_copy"),   QStringLiteral("copying")},
         {QStringLiteral("save_file"),   QStringLiteral("writing to the Flipper")},
         {QStringLiteral("read_file"),   QStringLiteral("reading from the Flipper")},
         {QStringLiteral("list_files"),  QStringLiteral("listing the Flipper")},
@@ -2720,17 +2777,17 @@ static bool nikitaResultProves(const QString &result)
     return true;
 }
 
-// One proven move per tool, most recent wins -- twenty examples of host_write
+// One proven move per tool, most recent wins -- twenty examples of computer_write
 // teach nothing that one doesn't, and each competes for context.
 // Write the turn's lessons, once the whole turn is visible: several tools for
 // one request is a RECIPE, and filing it as independent pairings is the
-// mistake that taught the model a folder-plus-file request was host_mkdir alone.
+// mistake that taught the model a folder-plus-file request was computer_mkdir alone.
 // Re-checks that the thing this call claimed to create still exists right
 // now, since a later step in the same turn may have undone it. Only paths on
 // this machine are audited -- a Flipper path would mean an RPC round trip
 // through the same link the device tools already report over.
 // A member, not a free function, because it has to resolve the path EXACTLY
-// the way the tool did. The model writes "Desktop/note.txt"; host_write turns
+// the way the tool did. The model writes "Desktop/note.txt"; computer_write turns
 // that into /Users/<user>/Desktop/note.txt through resolveAgentPath and saves
 // it there. Checking the raw argument with QFileInfo::exists() asks whether
 // "Desktop/note.txt" exists relative to the app's working directory -- it never
@@ -2739,12 +2796,12 @@ static bool nikitaResultProves(const QString &result)
 bool NikitaBackend::moveStillHolds(const QString &tool, const QJsonObject &args) const
 {
     static const QStringList kCreators = {
-        QStringLiteral("host_write"), QStringLiteral("host_mkdir"),
-        QStringLiteral("host_copy"),  QStringLiteral("host_move"),
+        QStringLiteral("computer_write"), QStringLiteral("computer_mkdir"),
+        QStringLiteral("computer_copy"),  QStringLiteral("computer_move"),
     };
     if (!kCreators.contains(tool)) { return true; }   // nothing to check against
 
-    // host_move and host_copy land at the destination, not the source.
+    // computer_move and computer_copy land at the destination, not the source.
     QString path = args.value(QStringLiteral("to")).toString();
     if (path.isEmpty()) { path = args.value(QStringLiteral("destination")).toString(); }
     if (path.isEmpty()) { path = args.value(QStringLiteral("path")).toString(); }
@@ -2784,7 +2841,7 @@ void NikitaBackend::flushPendingMoves()
     // the chain spelled out, so the next time a request looks like this one the
     // prompt says "this took three calls" rather than "this took that call".
     // Each step is named WITH ITS TARGET, not just the tool name. A recipe that
-    // read "host_write -> host_run -> save_file" recorded that three calls
+    // read "computer_write -> computer_run -> save_file" recorded that three calls
     // happened but hid WHAT they produced -- so a fib task that also generated a
     // BadUSB looked, in memory, like it had only written the python file. Naming
     // the target of every step makes the stored recipe show the whole thing.
@@ -2847,7 +2904,7 @@ void NikitaBackend::recordProvenMove(const QString &tool, const QJsonObject &arg
     // Accumulate, don't replace.
     //
     // This used to drop every previous entry for the tool, so a second
-    // host_write erased the first and the file never grew past a handful of
+    // computer_write erased the first and the file never grew past a handful of
     // lines -- it looked like it wasn't storing anything at all. Several
     // examples of the same tool are worth keeping: "save to Desktop" and "save
     // to /ext/badusb" are the same call with genuinely different shapes, and a
@@ -2883,12 +2940,27 @@ void NikitaBackend::saveProvenMoves() const
     f.close();
 }
 
+// Proven-move lines that mention run_ble are dropped on load. run_ble is not a
+// recordable move any more (see runOneTool), but a card written by an earlier
+// build carries a poisoned "run_ble -> run_ble -> run_ble" recipe that makes
+// the model fire several opens for one request. Strip them wherever the list is
+// read, so the bad line stops replaying without needing to rewrite the card.
+static QStringList nikitaSanitizeSkills(QStringList in)
+{
+    QStringList out;
+    for (const QString &line : in) {
+        if (line.contains(QLatin1String("run_ble"))) { continue; }
+        out.append(line);
+    }
+    return out;
+}
+
 void NikitaBackend::loadProvenMoves()
 {
     QFile f(nikitaSkillsPath());
     if (!f.open(QIODevice::ReadOnly)) { return; }
-    m_skills = QString::fromUtf8(f.readAll())
-                   .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    m_skills = nikitaSanitizeSkills(QString::fromUtf8(f.readAll())
+                   .split(QLatin1Char('\n'), Qt::SkipEmptyParts));
     f.close();
 }
 
@@ -2925,11 +2997,19 @@ void NikitaBackend::clearQueue()
 void NikitaBackend::flushQueue()
 {
     if (m_queued.isEmpty() || m_thinking || !m_assistantEnabled) { return; }
-    const QString joined = m_queued.join(QLatin1Char('\n'));
-    m_queued.clear();
+    // ONE message per turn, in order -- not all of them joined into a single
+    // send. Joining made three queued questions arrive as one blob the model
+    // answered in one lump, and none of them showed in the chat as their own
+    // "you" turn. Taking the front item and leaving the rest gives each queued
+    // message its own turn; when this turn finishes, flushQueue runs again for
+    // the next. The UI is told which message is starting so it can draw the
+    // matching "you" bubble at the right moment.
+    const QString next = m_queued.takeFirst();
     emit queuedChanged();
-    nikitaLog(QStringLiteral("queue flushed -> sending %1 char(s)").arg(joined.size()));
-    send(joined, m_lastDeviceContext);
+    emit queuedMessageStarting(next);
+    nikitaLog(QStringLiteral("queue -> sending next (%1 left): %2")
+                  .arg(m_queued.size()).arg(next.left(80)));
+    send(next, m_lastDeviceContext);
 }
 
 bool NikitaBackend::canRate() const { return m_canRate; }
@@ -3074,7 +3154,7 @@ QString NikitaBackend::assistantName() const
 // into every turn, and that happens earlier in this file than the definition.
 static QString nikitaWellKnownDir(const QString &name);
 
-// A stored move is "host_write \t <what was asked> \t path=/Users/x/t.txt content=ONE".
+// A stored move is "computer_write \t <what was asked> \t path=/Users/x/t.txt content=ONE".
 // This turns the tool half into a sentence the assistant could have spoken:
 // "I created t.txt and saved it to /Users/x". Read back into the prompt, a
 // sentence about a finished task primes the model to do the task; a log of
@@ -3100,40 +3180,40 @@ static QString nikitaPlainMove(const QString &tool, const QString &shape)
     const QString name = QFileInfo(path).fileName();
     const QString dir  = QFileInfo(path).path();
 
-    if (tool == QLatin1String("host_write") || tool == QLatin1String("save_file")) {
+    if (tool == QLatin1String("computer_write") || tool == QLatin1String("save_file")) {
         return name.isEmpty() ? QStringLiteral("I wrote the file.")
              : QStringLiteral("I created %1 and saved it to %2.").arg(name, dir);
     }
-    if (tool == QLatin1String("host_mkdir") || tool == QLatin1String("make_dir")) {
+    if (tool == QLatin1String("computer_mkdir") || tool == QLatin1String("make_dir")) {
         return path.isEmpty() ? QStringLiteral("I created the folder.")
                               : QStringLiteral("I created the folder %1.").arg(path);
     }
-    if (tool == QLatin1String("host_delete") || tool == QLatin1String("delete_file")) {
+    if (tool == QLatin1String("computer_delete") || tool == QLatin1String("delete_file")) {
         return path.isEmpty() ? QStringLiteral("I deleted it.")
                               : QStringLiteral("I deleted %1.").arg(path);
     }
-    if (tool == QLatin1String("host_move") || tool == QLatin1String("rename_file")) {
+    if (tool == QLatin1String("computer_move") || tool == QLatin1String("rename_file")) {
         return to.isEmpty() ? QStringLiteral("I moved it.")
                             : QStringLiteral("I moved it to %1.").arg(to);
     }
-    if (tool == QLatin1String("host_copy")) {
+    if (tool == QLatin1String("computer_copy")) {
         return to.isEmpty() ? QStringLiteral("I copied it.")
                             : QStringLiteral("I copied it to %1.").arg(to);
     }
-    if (tool == QLatin1String("host_run") || tool == QLatin1String("run_cli")) {
+    if (tool == QLatin1String("computer_run") || tool == QLatin1String("run_cli")) {
         return cmd.isEmpty() ? QStringLiteral("I ran the command.")
                              : QStringLiteral("I ran %1.").arg(cmd);
     }
-    if (tool == QLatin1String("host_read") || tool == QLatin1String("read_file")) {
+    if (tool == QLatin1String("computer_read") || tool == QLatin1String("read_file")) {
         return path.isEmpty() ? QStringLiteral("I read the file.")
                               : QStringLiteral("I read %1.").arg(path);
     }
-    if (tool == QLatin1String("host_list") || tool == QLatin1String("list_files")) {
+    if (tool == QLatin1String("computer_list") || tool == QLatin1String("list_files")) {
         return path.isEmpty() ? QStringLiteral("I listed the folder.")
                               : QStringLiteral("I listed %1.").arg(path);
     }
-    if (tool == QLatin1String("host_find")) { return QStringLiteral("I searched for it."); }
-    if (tool == QLatin1String("host_cd"))   { return QStringLiteral("I changed folder."); }
+    if (tool == QLatin1String("computer_find")) { return QStringLiteral("I searched for it."); }
+    if (tool == QLatin1String("computer_cd"))   { return QStringLiteral("I changed folder."); }
     if (tool == QLatin1String("press_button")) { return QStringLiteral("I pressed the button on the Flipper."); }
     if (tool == QLatin1String("file_info"))    { return QStringLiteral("I checked the file."); }
     if (tool == QLatin1String("remember")) {
@@ -3212,7 +3292,7 @@ QString NikitaBackend::systemPrompt() const
             sys.remove(pfrom, pto - pfrom);
             sys.insert(pfrom, QStringLiteral(
                 "OPERATING RULES:\n"
-                "- run_cli is the FLIPPER. host_run and host_* are THIS COMPUTER. Mixing them up is "
+                "- run_cli is the FLIPPER. computer_run and computer_* are THIS COMPUTER. Mixing them up is "
                 "the most common way to be confidently wrong.\n"
                 "- Names are DATA: use the exact spelling the user typed, capitals and all.\n"
                 "- Never claim an action happened unless the tool actually ran and succeeded.\n"
@@ -3337,17 +3417,17 @@ QString NikitaBackend::systemPrompt() const
             "    Documents: \"%7\"\n"
             "- They are not the same on every computer. Someone else running NIKITA has a different user name, possibly a different operating system, and possibly a Desktop that isn't called Desktop. Never assemble a path like \"/Users/<name>/Desktop\" from what you have seen before -- read it from the lines above, or write \"Desktop/file.txt\" and let it be resolved for you.\n"
             "- A relative path resolves from the CURRENT FOLDER above, not from the workspace and not from home. \"notes.txt\" means \"%2/notes.txt\". If that is not what you meant, say the absolute path or move first.\n"
-            "- host_cd(path) moves you and answers with where you landed and what is in it; host_cd with no path just tells you where you are. \"..\" goes up. The move STICKS for the rest of the conversation, and host_run starts there too.\n"
+            "- computer_cd(path) moves you and answers with where you landed and what is in it; computer_cd with no path just tells you where you are. \"..\" goes up. The move STICKS for the rest of the conversation, and computer_run starts there too.\n"
             "- The line above is regenerated every single turn, so it is never stale. Trust it over anything you remember from earlier in the conversation -- if you moved ten messages ago, this already reflects it, and you do NOT need a tool call to find out where you are.\n"
             "- Before writing, deleting or moving anything, be sure the folder is the one you mean. Reading a listing costs one call; writing into the wrong tree costs the user their afternoon. When a path came from the user and you are not certain how it resolves, resolve it out loud in your reply as you act.\n"
-            "- host_list(path), host_read(path), host_write(path, content): browse, read and edit files anywhere. host_write creates missing folders and OVERWRITES the whole file, so read it first, then write the full new contents.\n"
+            "- computer_list(path), computer_read(path), computer_write(path, content): browse, read and edit files anywhere. computer_write creates missing folders and OVERWRITES the whole file, so read it first, then write the full new contents.\n"
             "- Any path may start with a folder NAME instead of a location: \"Desktop/notes.txt\", \"Downloads/x.zip\", \"Documents/plan.md\". Those resolve to this user's real folders wherever they happen to live. It is the safest way to write, because it cannot be wrong on someone else's machine.\n"
-            "- host_mkdir(path), host_move(from, to), host_copy(from, to), host_delete(path), host_find(path, pattern): create, move, copy, delete and search. Use these instead of shelling out to mkdir/mv/cp/rm/find -- they report what actually happened, where a shell command just hands you an exit code.\n"
-            "- host_run(command, cwd): run a shell command and get the exit code plus combined stdout/stderr. It BLOCKS until the command finishes, so prefer targeted commands. Reach for it when no typed tool fits, not as the default.\n"
-            "- Reads (host_list, host_read, host_find, host_cd) run at once and are just shown to the user as they happen -- you never have to describe those before doing them, just do it. Every tool that CHANGES something (host_write, host_mkdir, host_move, host_copy, host_delete, host_run) instead pauses for a person to approve it on screen first, so the call simply takes longer to answer -- that is not a failure, keep waiting on it like any other tool result. If they decline, the result says so plainly; report that back honestly instead of trying the same call again or claiming it worked.\n"
-            "- The reach is real, so the care has to be too. host_delete is not undoable and there is no bin to fish things out of. Delete what was asked for and nothing adjacent; when a request would remove more than the user clearly named, do the named part and say what you left alone.\n"
-            "- The workspace folder is not a boundary, just a starting point: it is where bare relative paths land and where host_run begins. Say the path you actually mean.\n"
-            "- Your own core lives in application/nikitabackend.cpp + .h and application/components/ under that workspace. To fix a bug in yourself: host_read the file, host_write the corrected version, then host_run the build and read the errors.\n"
+            "- computer_mkdir(path), computer_move(from, to), computer_copy(from, to), computer_delete(path), computer_find(path, pattern): create, move, copy, delete and search. Use these instead of shelling out to mkdir/mv/cp/rm/find -- they report what actually happened, where a shell command just hands you an exit code.\n"
+            "- computer_run(command, cwd): run a shell command and get the exit code plus combined stdout/stderr. It BLOCKS until the command finishes, so prefer targeted commands. Reach for it when no typed tool fits, not as the default.\n"
+            "- Reads (computer_list, computer_read, computer_find, computer_cd) run at once and are just shown to the user as they happen -- you never have to describe those before doing them, just do it. Every tool that CHANGES something (computer_write, computer_mkdir, computer_move, computer_copy, computer_delete, computer_run) instead pauses for a person to approve it on screen first, so the call simply takes longer to answer -- that is not a failure, keep waiting on it like any other tool result. If they decline, the result says so plainly; report that back honestly instead of trying the same call again or claiming it worked.\n"
+            "- The reach is real, so the care has to be too. computer_delete is not undoable and there is no bin to fish things out of. Delete what was asked for and nothing adjacent; when a request would remove more than the user clearly named, do the named part and say what you left alone.\n"
+            "- The workspace folder is not a boundary, just a starting point: it is where bare relative paths land and where computer_run begins. Say the path you actually mean.\n"
+            "- Your own core lives in application/nikitabackend.cpp + .h and application/components/ under that workspace. To fix a bug in yourself: computer_read the file, computer_write the corrected version, then computer_run the build and read the errors.\n"
             "- Nothing here is blocked, so nothing here is undone for you either. Never claim you edited a file you didn't, and never report a path you didn't get back from a tool this turn. Say what you changed and where, plainly.\n"
             "- A tool that comes back with \"error\" did NOT happen. Read the error text and repeat what it actually says. In particular, a permission error is the OPERATING SYSTEM refusing this app -- it is never the folder being read-only, never the file being locked, and never a reason to go write somewhere else instead. Say which folder was refused and what the error told you to do, and stop; do not silently retry the same write in Documents and report that as success.")
             .arg(m_agentRoot, agentCwd(), QDir::homePath(), QSysInfo::prettyProductName(),
@@ -3492,6 +3572,7 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     m_turnTruncated = false;
     m_turnWasFileAction = messageIsFileWrite(userText);
     m_turnRanAnyTool = false;
+    m_turnToolsRun.clear();
     m_turnToolsRan.clear();
     m_turnPathsTouched.clear();
     m_pendingMoves.clear();
@@ -3657,14 +3738,38 @@ QJsonArray NikitaBackend::toOpenAiMessages(const QJsonArray &msgs)
     QStringList pendingIds;
     int counter = 0;
 
+    // Every id issued by an assistant turn MUST be answered by a tool message,
+    // or the whole request is rejected: "an assistant message with 'tool_calls'
+    // must be followed by tool messages responding to each 'tool_call_id'".
+    // The history can end up short of one for reasons that have nothing to do
+    // with the model -- pressing STOP mid-round is the common one, since the
+    // assistant turn is recorded before the tools run and the results then
+    // never arrive -- and the damage does not show up until the NEXT message,
+    // which fails and keeps failing. So close the gap here, at the boundary,
+    // with a result that says what actually happened.
+    auto flushPending = [&out, &pendingIds]() {
+        for (const QString &id : std::as_const(pendingIds)) {
+            out.append(QJsonObject{
+                {QStringLiteral("role"), QStringLiteral("tool")},
+                {QStringLiteral("tool_call_id"), id},
+                {QStringLiteral("content"),
+                 QStringLiteral("{\"error\":\"no result -- the turn was interrupted before this "
+                                "call finished\"}")}
+            });
+        }
+        pendingIds.clear();
+    };
+
     for (const QJsonValue &v : msgs) {
         QJsonObject m = v.toObject();
         const QString role = m.value(QStringLiteral("role")).toString();
 
+        // Anything that is not a tool result closes the previous call batch.
+        if (role != QLatin1String("tool")) { flushPending(); }
+
         if (role == QLatin1String("assistant") && m.contains(QStringLiteral("tool_calls"))) {
             const QJsonArray calls = m.value(QStringLiteral("tool_calls")).toArray();
             QJsonArray rebuilt;
-            pendingIds.clear();
             for (const QJsonValue &cv : calls) {
                 QJsonObject call = cv.toObject();
                 QJsonObject fn = call.value(QStringLiteral("function")).toObject();
@@ -3715,6 +3820,7 @@ QJsonArray NikitaBackend::toOpenAiMessages(const QJsonArray &msgs)
 
         out.append(m);
     }
+    flushPending();
     return out;
 }
 
@@ -3798,7 +3904,7 @@ void NikitaBackend::dispatchTurn()
     // both outlived the local models.
     //
     // It actively broke tool calling. Measured on the same prompt, twice:
-    // without it the model called host_write correctly; with it, no tool call
+    // without it the model called computer_write correctly; with it, no tool call
     // at all -- the same 29 tokens generated both times, so the call was
     // emitted and did not survive the shape it had been taught.
     //
@@ -3825,7 +3931,7 @@ void NikitaBackend::dispatchTurn()
     }
 
     // A message-count window is not a budget. Fourteen short turns and fourteen
-    // turns that each carried a 8000-character host_read result cost wildly
+    // turns that each carried a 8000-character computer_read result cost wildly
     // different amounts of context, and only the second kind pushes the system
     // prompt out of the window -- silently, because llama-server's
     // --context-shift drops the oldest tokens rather than reporting an error.
@@ -3930,7 +4036,7 @@ void NikitaBackend::dispatchTurn()
             //
             // A single tool works beautifully when forcedToolName() guesses
             // right and fails absolutely when it guesses wrong: "remove the
-            // folder X" retried with host_mkdir, and no amount of insisting
+            // folder X" retried with computer_mkdir, and no amount of insisting
             // could have produced a delete, because delete was not on the table.
             // That guess comes from a hand-written list of verbs, and a list of
             // verbs is never finished -- there is always one more word, in one
@@ -3941,14 +4047,14 @@ void NikitaBackend::dispatchTurn()
             // give up, and the right tool is present even when the keyword that
             // would have named it is missing.
             const QString first = forcedToolName();
-            // host_run and run_cli belong here too. "open safari at
+            // computer_run and run_cli belong here too. "open safari at
             // andresnicolas.com" is an action with no file in it, and a retry
             // offering only the file tools could not have served it.
             QStringList wanted;
             if (m_turnFocus == 2) {          // plainly this computer
-                wanted = QStringList{QStringLiteral("host_write"), QStringLiteral("host_mkdir"),
-                                     QStringLiteral("host_delete"), QStringLiteral("host_move"),
-                                     QStringLiteral("host_copy"), QStringLiteral("host_run")};
+                wanted = QStringList{QStringLiteral("computer_write"), QStringLiteral("computer_mkdir"),
+                                     QStringLiteral("computer_delete"), QStringLiteral("computer_move"),
+                                     QStringLiteral("computer_copy"), QStringLiteral("computer_run")};
             } else if (m_turnFocus == 1) {   // plainly the Flipper
                 // Device control belongs here too, not just file writes: a
                 // "turn off the TV" retry that only offered save_file/run_cli
@@ -3962,8 +4068,8 @@ void NikitaBackend::dispatchTurn()
                 // control tools, so a device request that was mis-classified as
                 // ambiguous (e.g. "turn off my tv") still has ir_universal to
                 // reach for instead of being stuck shelling out.
-                wanted = QStringList{QStringLiteral("ir_universal"), QStringLiteral("host_run"),
-                                     QStringLiteral("run_cli"), QStringLiteral("host_write"),
+                wanted = QStringList{QStringLiteral("ir_universal"), QStringLiteral("computer_run"),
+                                     QStringLiteral("run_cli"), QStringLiteral("computer_write"),
                                      QStringLiteral("press_button"), QStringLiteral("read_screen"),
                                      QStringLiteral("save_file")};
             }
@@ -4169,8 +4275,8 @@ bool NikitaBackend::consumeModelFrame(const QJsonObject &obj)
 QString NikitaBackend::forcedToolName() const
 {
     // Which tool the retry offers. A fixed answer of "write" meant a retry on
-    // "create a folder" pushed host_write, and a retry on "delete X" pushed
-    // host_write as well -- the second attempt could not succeed no matter how
+    // "create a folder" pushed computer_write, and a retry on "delete X" pushed
+    // computer_write as well -- the second attempt could not succeed no matter how
     // firmly it was asked, because it was being asked for the wrong thing.
     const QString t = m_lastUserText.toLower();
     const bool host = (m_turnFocus == 2);
@@ -4188,7 +4294,7 @@ QString NikitaBackend::forcedToolName() const
     // Verb before noun, always.
     //
     // "folder" was tested first, so "remove the folder ANDRESLINDO" retried
-    // with host_mkdir -- asking to CREATE the thing the user asked to destroy.
+    // with computer_mkdir -- asking to CREATE the thing the user asked to destroy.
     // The noun says what the request is about; only the verb says what to do
     // with it, and when the two point different ways the verb is the one that
     // carries the instruction.
@@ -4205,41 +4311,41 @@ QString NikitaBackend::forcedToolName() const
     // Checked first: launching an app or a URL is neither a file operation nor a
     // folder operation, and every branch below would have sent it to the wrong
     // tool. "open the safari at andresnicolas.com" fell through all of them to
-    // host_write, so the retry led with a tool that could not possibly serve it.
+    // computer_write, so the retry led with a tool that could not possibly serve it.
     if (any({"open ", "launch", "start ", "run ", "execute", "browser", "safari",
              "chrome", "firefox", "terminal", "abre ", "abrir", "roda ", "rodar",
              "executa", "http", ".com", ".app", "fire up", "pull up", "boot ",
              "go to ", "www.", "acessa", "acessar", "visita", "visitar", "abra ",
              "inicia", "vscode", "vs code", "iterm", "finder", "spotify"})) {
-        return host ? QStringLiteral("host_run") : QStringLiteral("run_cli");
+        return host ? QStringLiteral("computer_run") : QStringLiteral("run_cli");
     }
     if (any({"delete", "remove", "erase", "apaga", "deleta", "remova", "exclui",
              "delet", "apag", "exclu", "remov", "eras", "trash", "get rid of",
              "livra", "joga fora", "manda pro lixo", "descarta", "descartar",
              "kill it", "wipe"})) {
-        return host ? QStringLiteral("host_delete") : QStringLiteral("delete_file");
+        return host ? QStringLiteral("computer_delete") : QStringLiteral("delete_file");
     }
     if (any({"rename", "renomeia", "renomear", "renom", "muda o nome",
              "mudar o nome", "troca o nome", "trocar o nome", "chame de",
              "chama de", "rename to"})) {
-        return host ? QStringLiteral("host_move") : QStringLiteral("rename_file");
+        return host ? QStringLiteral("computer_move") : QStringLiteral("rename_file");
     }
     if (any({"move ", "mover", "mova", "mov", "leva pra", "leva para",
              "transfere", "transferir", "arrasta", "arrastar", "relocate",
              "transfer"})) {
-        return host ? QStringLiteral("host_move") : QStringLiteral("rename_file");
+        return host ? QStringLiteral("computer_move") : QStringLiteral("rename_file");
     }
     if (any({"copy", "copia", "copiar", "duplica", "copi", "duplic", "clone",
              "clona", "clonar", "backup", "replic", "mirror"})) {
-        return host ? QStringLiteral("host_copy") : QStringLiteral("rename_file");
+        return host ? QStringLiteral("computer_copy") : QStringLiteral("rename_file");
     }
     // Only now does "folder" mean anything: nothing above claimed the request,
     // so it is a folder being made rather than one being acted on.
     if (any({"folder", "directory", "pasta", "diretorio", "subfolder",
              "subpasta", "novo diretorio"})) {
-        return host ? QStringLiteral("host_mkdir") : QStringLiteral("make_dir");
+        return host ? QStringLiteral("computer_mkdir") : QStringLiteral("make_dir");
     }
-    return host ? QStringLiteral("host_write") : QStringLiteral("save_file");
+    return host ? QStringLiteral("computer_write") : QStringLiteral("save_file");
 }
 
 // The second factor. Everything else this class believes about a turn comes
@@ -4259,11 +4365,11 @@ bool NikitaBackend::turnWorkVerified() const
     if (m_turnHadToolError || m_turnToolsRan.isEmpty()) { return false; }
     if (m_turnPathsTouched.isEmpty()) { return false; }
 
-    // Only file-shaped work can be checked this way. A host_run or a button
+    // Only file-shaped work can be checked this way. A computer_run or a button
     // press leaves nothing on disk to confirm, so those keep the full round.
     static const QSet<QString> checkable = {
-        QStringLiteral("host_write"), QStringLiteral("host_mkdir"),
-        QStringLiteral("host_move"),  QStringLiteral("host_copy"),
+        QStringLiteral("computer_write"), QStringLiteral("computer_mkdir"),
+        QStringLiteral("computer_move"),  QStringLiteral("computer_copy"),
         QStringLiteral("save_file"),  QStringLiteral("make_dir")
     };
     for (const QString &t : m_turnToolsRan) {
@@ -4522,10 +4628,55 @@ void NikitaBackend::finalizeStream()
         for (const QString &c : kClaims) {
             if (low.contains(c)) { claimedWithoutActing = true; break; }
         }
+        // Navigation claims are their own species and the single words above
+        // miss them: "NFC app is open." sailed through because the list has
+        // "opened", not "is open". Over BLE this is the whole failure -- the
+        // model announces it arrived somewhere without pressing a button. These
+        // are phrases, matched as phrases, so an honest "I can't open it" does
+        // not trip them.
+        static const QStringList kNavClaims = {
+            QStringLiteral("is open"), QStringLiteral("is now open"), QStringLiteral("now open"),
+            QStringLiteral("is running"), QStringLiteral("app open"), QStringLiteral("launched"),
+            QStringLiteral("navigated"), QStringLiteral("you're in"), QStringLiteral("you are in"),
+            QStringLiteral("i'm in"), QStringLiteral("i am in"), QStringLiteral("we're in"),
+            QStringLiteral("on the screen now"), QStringLiteral("selected "), QStringLiteral("highlighted ")
+        };
+        for (const QString &c : kNavClaims) {
+            if (low.contains(c)) { claimedWithoutActing = true; break; }
+        }
+    }
+
+    // The single-press loophole. "NFC app is open." after one press_button(ok)
+    // was NOT caught above, because a tool DID run (m_turnRanAnyTool true), so
+    // the block never looked. But pressing ok once from the desktop opens the
+    // main menu, not NFC -- the claim is still false. So: an app-open claim is
+    // only believed if run_ble actually opened it, or a read_screen was the LAST
+    // thing the turn did (i.e. it looked and is reporting what it saw). Neither
+    // here means the arrival was announced, not verified.
+    // No size cap. The false claim "NFC is open. I can't enforce a 3-second
+    // wait..." was 113 chars and sailed past an 80-char limit that had no
+    // business being here: a lie in a long sentence is still a lie. The phrases
+    // are specific to an app-open claim, so a legitimate discussion rarely trips
+    // them, and the only cost of a false positive is one forced retry.
+    if (m_turnFocus == 1) {
+        const QString low2 = text.toLower();
+        const bool claimsOpen = low2.contains(QLatin1String("is open"))
+                             || low2.contains(QLatin1String("app open"))
+                             || low2.contains(QLatin1String("now open"))
+                             || low2.contains(QLatin1String("is running"))
+                             || low2.contains(QLatin1String("you're in"))
+                             || low2.contains(QLatin1String("navigated"))
+                             || low2.contains(QLatin1String("i've opened"))
+                             || low2.contains(QLatin1String("i opened"))
+                             || low2.contains(QLatin1String("i'll open"))
+                             || low2.contains(QLatin1String("open bad usb on the next"));
+        const bool backed = m_turnToolsRun.contains(QLatin1String("run_ble"))
+                         || m_turnToolsRun.contains(QLatin1String("read_screen"));
+        if (claimsOpen && !backed) { claimedWithoutActing = true; }
     }
 
     // The all-or-nothing version of that check is what let the folder-and-file
-    // case through: host_mkdir HAD run, so m_turnRanAnyTool was true, and a
+    // case through: computer_mkdir HAD run, so m_turnRanAnyTool was true, and a
     // reply claiming a file had also been created sailed past. "Some tool ran"
     // is not the question. The question is whether the tools that ran cover
     // what the sentence says happened.
@@ -4636,13 +4787,13 @@ void NikitaBackend::finalizeStream()
 
         // What the RETRY is told. Pointing at a guessed tool is what made this
         // loop six times: the request said "create a folder", so the guess was
-        // host_mkdir, the folder already existed, and the model correctly saw
+        // computer_mkdir, the folder already existed, and the model correctly saw
         // nothing to do and answered in prose again. When the checklist knows
         // which item is missing, name the item -- an instruction that can be
         // followed beats one that has to be interpreted.
         const QString only = missingArtifacts.isEmpty()
                            ? forcedToolName()
-                           : (m_turnFocus == 2 ? QStringLiteral("host_write")
+                           : (m_turnFocus == 2 ? QStringLiteral("computer_write")
                                                : QStringLiteral("save_file"));
         // The log keeps the blunt wording. The developer reading it needs to know
         // this was a false claim, not a tidy continuation.
@@ -4666,13 +4817,18 @@ void NikitaBackend::finalizeStream()
                 "asked for. Only the call: no explanation, no apology, no code block.")
                 .arg(missingArtifacts.join(QStringLiteral(" and ")),
                      buildChecklist(), only, missingArtifacts.first());
-        } else if (saidNothing || claimedWithoutActing) {
+        } else if ((saidNothing || claimedWithoutActing) && m_turnFocus == 1 && deviceOverBle()) {
+            // Flipper turn over Bluetooth: there is no CLI, so "navigate" means
+            // actually walking the menu with the D-pad and looking between
+            // presses. Announcing arrival without a press is the exact thing to
+            // kill here.
             correction = QStringLiteral(
-                "That last reply did not do anything -- you called no tool, so nothing "
-                "changed and nothing was created, deleted or opened. Do it now: if the request "
-                "needs a tool, call it (%1 is the likely one, but pick what actually fits); if "
-                "it only needs an answer, give the answer. Never reply with nothing, and never "
-                "say it is done unless a tool told you it was.").arg(only);
+                "STOP. You claimed you got there but the app is NOT open -- pressing ok once from "
+                "the desktop opens the main menu, not the app you named. To OPEN an app over "
+                "Bluetooth, call run_ble(action=open, name=<the app, e.g. NFC>) -- one call, it "
+                "opens deterministically, no buttons. Do that NOW. Then read_screen to confirm. "
+                "Only use press_button for moving a cursor INSIDE an app once it is open, and never "
+                "claim an app is open until run_ble succeeded or a read_screen shows it.");
         } else {
             correction = QStringLiteral(
                 "You answered in words but called no tool, so nothing happened -- what you "
@@ -4924,13 +5080,13 @@ void NikitaBackend::onStreamFinished(QNetworkReply *reply)
 // -- the model confuses the two machines often enough that requiring the exact
 // one would produce false alarms on work that really did happen.
 static const char *const kToolsThatWrite[] = {
-    "save_file", "host_write", "host_copy", "host_move", "rename_file", "host_run"
+    "save_file", "computer_write", "computer_copy", "computer_move", "rename_file", "computer_run"
 };
 static const char *const kToolsThatMakeDirs[] = {
-    "make_dir", "host_mkdir", "host_run"
+    "make_dir", "computer_mkdir", "computer_run"
 };
 static const char *const kToolsThatDelete[] = {
-    "delete_file", "host_delete", "host_run"
+    "delete_file", "computer_delete", "computer_run"
 };
 
 static bool nikitaRanAnyOf(const QSet<QString> &ran, const char *const *names, int count)
@@ -5103,7 +5259,7 @@ void NikitaBackend::runToolCalls(const QJsonArray &toolCalls, int index)
     if (index == 0 && !toolCalls.isEmpty()) { setTurnStatus(QStringLiteral("getting to work")); }
     if (index >= toolCalls.size()) {
         // A small model treats one successful tool as the whole job done. Asked
-        // to "create a folder and put an empty file in it" it calls host_mkdir,
+        // to "create a folder and put an empty file in it" it calls computer_mkdir,
         // gets {"created":true}, and answers "created the folder, and inside it
         // an empty heythere.py" -- narrating a second step it never took.
         //
@@ -5226,21 +5382,21 @@ static bool nikitaIsComputerPath(const QString &p)
 static QString nikitaReroute(const QString &name, bool toHost)
 {
     static const QHash<QString, QString> kToHost = {
-        {QStringLiteral("save_file"),   QStringLiteral("host_write")},
-        {QStringLiteral("read_file"),   QStringLiteral("host_read")},
-        {QStringLiteral("list_files"),  QStringLiteral("host_list")},
-        {QStringLiteral("make_dir"),    QStringLiteral("host_mkdir")},
-        {QStringLiteral("delete_file"), QStringLiteral("host_delete")},
-        {QStringLiteral("rename_file"), QStringLiteral("host_move")},
+        {QStringLiteral("save_file"),   QStringLiteral("computer_write")},
+        {QStringLiteral("read_file"),   QStringLiteral("computer_read")},
+        {QStringLiteral("list_files"),  QStringLiteral("computer_list")},
+        {QStringLiteral("make_dir"),    QStringLiteral("computer_mkdir")},
+        {QStringLiteral("delete_file"), QStringLiteral("computer_delete")},
+        {QStringLiteral("rename_file"), QStringLiteral("computer_move")},
     };
     static const QHash<QString, QString> kToDevice = {
-        {QStringLiteral("host_write"),  QStringLiteral("save_file")},
-        {QStringLiteral("host_read"),   QStringLiteral("read_file")},
-        {QStringLiteral("host_list"),   QStringLiteral("list_files")},
-        {QStringLiteral("host_mkdir"),  QStringLiteral("make_dir")},
-        {QStringLiteral("host_delete"), QStringLiteral("delete_file")},
-        {QStringLiteral("host_move"),   QStringLiteral("rename_file")},
-        {QStringLiteral("host_copy"),   QStringLiteral("rename_file")},
+        {QStringLiteral("computer_write"),  QStringLiteral("save_file")},
+        {QStringLiteral("computer_read"),   QStringLiteral("read_file")},
+        {QStringLiteral("computer_list"),   QStringLiteral("list_files")},
+        {QStringLiteral("computer_mkdir"),  QStringLiteral("make_dir")},
+        {QStringLiteral("computer_delete"), QStringLiteral("delete_file")},
+        {QStringLiteral("computer_move"),   QStringLiteral("rename_file")},
+        {QStringLiteral("computer_copy"),   QStringLiteral("rename_file")},
     };
     return toHost ? kToHost.value(name) : kToDevice.value(name);
 }
@@ -5286,14 +5442,14 @@ static QString nikitaWrongMachine(const QString &path, bool deviceTool)
         if (p.startsWith(QLatin1String("~")) || p.startsWith(QLatin1String("/Users/"))
             || p.startsWith(QLatin1String("/home/")) || p.startsWith(QLatin1String("C:"))) {
             return QStringLiteral("that is a path on the computer, not on the Flipper. "
-                                  "Use the host_ tools for it (host_write, host_mkdir, host_delete).");
+                                  "Use the computer_ tools for it (computer_write, computer_mkdir, computer_delete).");
         }
         const QStringList seg = p.split(QLatin1Char('/'), Qt::SkipEmptyParts);
         if (seg.size() >= 2 && (seg.at(0) == QLatin1String("ext") || seg.at(0) == QLatin1String("int"))
             && kHomeNames.contains(seg.at(1), Qt::CaseInsensitive)) {
             return QStringLiteral("\"%1\" is a folder on the computer, not on the SD card -- "
                                   "there is no %1 under /ext. If the user meant their computer, "
-                                  "use host_write with ~/%1/... instead. If they really meant the "
+                                  "use computer_write with ~/%1/... instead. If they really meant the "
                                   "Flipper, pick a real card folder (/ext/apps, /ext/badusb, /ext/nfc, "
                                   "or just /ext).").arg(seg.at(1));
         }
@@ -5414,6 +5570,43 @@ static QString nikitaRenderScreen(const ScreenFrame &f)
     const int h = f.size.height();
     if (w <= 0 || h <= 0 || f.pixelData.isEmpty()) { return QString(); }
 
+    // DIAGNOSTIC: dump the raw framebuffer so the exact bytes the model reasons
+    // over can be inspected off-device and a proper text extractor developed
+    // against real data. Writes a tiny PBM (P4, 1bpp) next to a raw .bin. Gated
+    // on a marker DIRECTORY existing (AppData/screendump) rather than an env
+    // var, so the app can be launched the normal way (via LaunchServices, which
+    // keeps its Bluetooth TCC entitlement) instead of a raw exec that loses it.
+    {
+        static const QString dir = []() {
+            QString d = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                        + QStringLiteral("/screendump");
+            return QDir(d).exists() ? d : QString();
+        }();
+        if (!dir.isEmpty()) {
+        static int dumpN = 0;
+        const QString base = QStringLiteral("%1/frame_%2").arg(dir).arg(dumpN++, 3, 10, QLatin1Char('0'));
+        QFile raw(base + QStringLiteral(".bin"));
+        if (raw.open(QIODevice::WriteOnly)) { raw.write(f.pixelData); raw.close(); }
+        // PBM P4: 1 bit per pixel, MSB-first, rows padded to byte. Render from
+        // the same column-major bit layout the on() lambda below decodes.
+        QByteArray pbm = QStringLiteral("P4\n%1 %2\n").arg(w).arg(h).toLatin1();
+        for (int y = 0; y < h; ++y) {
+            unsigned char byte = 0; int bit = 0;
+            for (int x = 0; x < w; ++x) {
+                const int i = (y / 8) * w + x;
+                const bool lit = i >= 0 && i < f.pixelData.size()
+                              && ((static_cast<unsigned char>(f.pixelData.at(i)) >> (y % 8)) & 1);
+                if (lit) { byte |= (0x80 >> bit); }
+                if (++bit == 8) { pbm.append(char(byte)); byte = 0; bit = 0; }
+            }
+            if (bit) { pbm.append(char(byte)); }
+        }
+        QFile pf(base + QStringLiteral(".pbm"));
+        if (pf.open(QIODevice::WriteOnly)) { pf.write(pbm); pf.close(); }
+        nikitaLog(QStringLiteral("screen dump -> %1.pbm (%2x%3)").arg(base).arg(w).arg(h));
+        }
+    }
+
     auto on = [&](int x, int y) -> bool {
         const int i = (y / 8) * w + x;
         if (i < 0 || i >= f.pixelData.size()) { return false; }
@@ -5451,8 +5644,17 @@ static QString nikitaRenderScreen(const ScreenFrame &f)
     return out;
 }
 
-void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std::function<void(const QString &)> done)
+void NikitaBackend::runOneTool(const QString &rawName, const QJsonObject &args, std::function<void(const QString &)> done)
 {
+    // The computer-side tools were called host_* until the rename. Anything that
+    // learned a name back then still says host_: proven moves filed in
+    // actions-memory.txt, a conversation carried over from an older build. They
+    // mean the same tool, so translate rather than fail -- a stale name is not
+    // the user's mistake and there is nothing for them to fix.
+    const QString name = rawName.startsWith(QLatin1String("host_"))
+                       ? QStringLiteral("computer_") + rawName.mid(5)
+                       : rawName;
+
     // Every action the assistant takes is logged here rather than inside each
     // handler: one place, so a tool added later can't quietly skip the log.
     // Read-only lookups are noise, so only the ones that change something (or
@@ -5463,6 +5665,7 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
         QStringLiteral("remember"), QStringLiteral("forget")
     };
     m_turnRanAnyTool = true;   // a tool is actually executing this turn
+    m_turnToolsRun.insert(name);
 
     // The real access-filter barrier. The list offered to the model is already
     // pruned, but a small model invents tool names -- and an older conversation
@@ -5492,9 +5695,9 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
         QJsonObject fixed = args;
         fixed["command"] = args.value("command").toString();
         nikitaLogAs(assistantName(),
-                   QStringLiteral("run_cli -> host_run (that command is for this computer): %1")
+                   QStringLiteral("run_cli -> computer_run (that command is for this computer): %1")
                        .arg(args.value("command").toString().left(80)));
-        runOneTool(QStringLiteral("host_run"), fixed, done);
+        runOneTool(QStringLiteral("computer_run"), fixed, done);
         return;
     }
 
@@ -5506,9 +5709,9 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             QStringLiteral("rename_file")
         };
         const bool deviceTool = kDevicePathTools.contains(name);
-        const bool hostTool   = name.startsWith(QLatin1String("host_"))
-                                && name != QLatin1String("host_run")
-                                && name != QLatin1String("host_cd");
+        const bool hostTool   = name.startsWith(QLatin1String("computer_"))
+                                && name != QLatin1String("computer_run")
+                                && name != QLatin1String("computer_cd");
         if (deviceTool || hostTool) {
             const QString first = args.contains(QLatin1String("path"))
                                       ? args.value("path").toString()
@@ -5559,7 +5762,7 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
     {
         // Still needed after the log gate went away: the chat mirror below is
         // for host actions only, not for every Flipper read.
-        const bool isHost = name.startsWith(QLatin1String("host_"));
+        const bool isHost = name.startsWith(QLatin1String("computer_"));
         QStringList bits;
         for (auto it = args.begin(); it != args.end(); ++it) {
             QString v = it.value().toVariant().toString().simplified();
@@ -5585,7 +5788,7 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             // Into the chat before the model has written a word about it, and
             // into the SAME row the start opened -- the trail reads as a list
             // of what happened, not as every state each step passed through.
-            // Parsed, not substring-matched: a host_read of a log file full of
+            // Parsed, not substring-matched: a computer_read of a log file full of
             // the word "error" is a successful read.
             const QJsonObject parsed = QJsonDocument::fromJson(result.toUtf8()).object();
             const bool failed = parsed.contains(QStringLiteral("error"));
@@ -5596,7 +5799,7 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             // Recording it here, between one tool and the next, broke multi-step
             // work in two ways. The lesson pairs the tool with the user's WHOLE
             // message, so a two-part request ("make a folder AND put a file in
-            // it") got filed as "host_mkdir works for <the entire request>" --
+            // it") got filed as "computer_mkdir works for <the entire request>" --
             // and that line goes into the next round's system prompt, where it
             // reads as: this request is handled, by that one call. The model
             // then stopped and narrated a second step it never took.
@@ -5613,8 +5816,13 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             // works for that request" is worse than storing nothing: it teaches a
             // sequence that will not repeat. Navigation is decided live from the
             // screen, not from memory.
+            // run_ble joins them: it is self-contained (it backs out and opens
+            // in one call), so a stored "recipe" of run_ble calls only teaches
+            // the model to fire several opens in a row -- which is exactly how
+            // "open NFC" ended up also opening Infrared.
             const bool positionDependent = (name == QLatin1String("press_button")
-                                          || name == QLatin1String("read_screen"));
+                                          || name == QLatin1String("read_screen")
+                                          || name == QLatin1String("run_ble"));
             if (nikitaResultProves(result) && !positionDependent) {
                 m_pendingMoves.append(qMakePair(name, learnArgs));
             }
@@ -5637,9 +5845,9 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
     done = logged;
 
     // Host-workspace tools run on THIS computer, not the Flipper -- no device needed.
-    // Every host_* tool routes here. Matching on the prefix means a tool added
+    // Every computer_* tool routes here. Matching on the prefix means a tool added
     // to runHostTool can't be forgotten in this list and silently 404.
-    if (name.startsWith(QLatin1String("host_"))) {
+    if (name.startsWith(QLatin1String("computer_"))) {
         runHostTool(name, args, done);
         return;
     }
@@ -5733,6 +5941,76 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
             done(result);
         });
 
+    } else if (name == QLatin1String("run_ble")) {
+        // Loader over RPC -- the only deterministic way to open an app on a
+        // wireless link. Offered solely over BLE, so a call here on USB is a
+        // model mistake worth naming rather than silently doing over the cable.
+        if (!deviceOverBle()) {
+            done(QStringLiteral("{\"error\":\"run_ble is for Bluetooth links. This is USB -- use "
+                 "run_cli(loader open <App>) / run_cli(loader close) here.\"}"));
+            return;
+        }
+        Flipper::Zero::ProtobufSession *rpc = dev->rpc();
+        if (!rpc) { done(QStringLiteral("{\"error\":\"no RPC session\"}")); return; }
+        const QString action = args.value("action").toString().trimmed().toLower();
+        if (action == QLatin1String("close")) {
+            auto *op = rpc->appExit();
+            connect(op, &AbstractOperation::finished, this, [op, done]() {
+                done(op->isError()
+                    ? QStringLiteral("{\"error\":\"couldn't close the app: %1\"}").arg(op->errorString())
+                    : QStringLiteral("{\"closed\":true,\"note\":\"back at the desktop\"}"));
+            });
+        } else if (action == QLatin1String("open")) {
+            const QString appName = args.value("name").toString().trimmed();
+            if (appName.isEmpty()) {
+                done(QStringLiteral("{\"error\":\"open needs an app name (e.g. NFC, Infrared, Sub-GHz)\"}"));
+                return;
+            }
+            // RETURN TO THE DESKTOP WITH BACK, THEN START. App_Exit is not
+            // reliable here -- it replies SUCCESS the instant the exit is
+            // requested and the app then tears down asynchronously, so firing
+            // App_Start into that window gets it silently dropped (that is why
+            // switching from an already-open app kept failing). BACK presses go
+            // through the input pipe and actually walk the device out, one menu
+            // level at a time, all the way to the desktop -- and BACK at the
+            // desktop is a harmless no-op, so pressing it a few extra times is
+            // safe. It also clears a lock (back x3) on the way. Then App_Start,
+            // which is reliable from the desktop (the root->app case that always
+            // worked). App_Exit is still sent first as a clean best-effort.
+            rpc->appExit();
+            const int kBackouts = 6;   // enough to exit any app; extra are no-ops
+            auto step = std::make_shared<std::function<void(int)>>();
+            *step = [this, rpc, appName, done, step](int left) {
+                if (left <= 0) {
+                    // Small settle after the last back, then start.
+                    QTimer::singleShot(250, this, [this, rpc, appName, done]() {
+                        auto *op = rpc->appStart(appName.toUtf8());
+                        connect(op, &AbstractOperation::finished, this, [op, appName, done]() {
+                            if (op->isError()) {
+                                done(QStringLiteral("{\"error\":\"couldn't open %1: %2\"}")
+                                    .arg(appName, op->errorString()));
+                            } else {
+                                done(QStringLiteral("{\"opened\":\"%1\",\"note\":\"%1 is open and confirmed. "
+                                     "Do NOT read_screen to check -- this IS the confirmation.\"}").arg(appName));
+                            }
+                        });
+                    });
+                    return;
+                }
+                rpc->guiSendInput(InputEvent::Back, InputEvent::Press);
+                rpc->guiSendInput(InputEvent::Back, InputEvent::Short);
+                auto *bop = rpc->guiSendInput(InputEvent::Back, InputEvent::Release);
+                connect(bop, &AbstractOperation::finished, this, [this, step, left]() {
+                    // A gap between presses so the app has time to walk up one
+                    // level before the next back arrives.
+                    QTimer::singleShot(160, this, [step, left]() { (*step)(left - 1); });
+                });
+            };
+            (*step)(kBackouts);
+        } else {
+            done(QStringLiteral("{\"error\":\"action must be open or close\"}"));
+        }
+
     } else if (name == QLatin1String("run_cli")) {
         const QString command = args.value("command").toString().trimmed();
         if (command.isEmpty()) {
@@ -5770,9 +6048,25 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
         // Isolated one-shot: pauses RPC, runs the command, hands RPC back.
         m_cli->runOneShot(command, [this, done](bool ok, QString out) {
             QJsonObject r;
+            // The Flipper has ONE USB port and one mode at a time. qFlipper holds
+            // it as a serial port; a BadUSB/HID payload needs it as a keyboard.
+            // Over USB they collide -- "USB is locked, close companion app first"
+            // -- and forcing it crashes the device. The cable cannot be both.
+            if (out.contains(QStringLiteral("USB is locked"), Qt::CaseInsensitive)
+                || out.contains(QStringLiteral("close companion"), Qt::CaseInsensitive)) {
+                r["error"] = QStringLiteral(
+                    "This is a BadUSB/HID payload -- it needs the Flipper's USB port free to act as "
+                    "a keyboard, but this connection is USB and I am holding that port. It is not a "
+                    "bug and cannot be worked around over USB. To run it: plug the Flipper's USB into "
+                    "the TARGET machine, connect me over Bluetooth instead, then run it -- with the "
+                    "cable free, the payload types into the target and nothing locks. Tell the user "
+                    "this; do not retry over USB.");
+                done(QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact)));
+                return;
+            }
             if (ok) {
                 r["output"] = out;
-                // Same as host_run: remember a clean result so a later save can
+                // Same as computer_run: remember a clean result so a later save can
                 // pull it in via {{LAST_RESULT}} rather than the model retyping.
                 const QString trimmed = out.trimmed();
                 m_lastRunOutput = (trimmed.size() <= 4096) ? trimmed : QString();
@@ -5880,26 +6174,29 @@ void NikitaBackend::runOneTool(const QString &name, const QJsonObject &args, std
         if (times < 1) times = 1;
         if (times > NIKITA_MAX_PRESSES) times = NIKITA_MAX_PRESSES;
 
-        // OK and BACK, nothing else. The D-pad is gone on purpose: every attempt
-        // to walk a menu with up/down/left/right was a count made from a screen
-        // it could not reliably read, and a wrong count fires the wrong saved
-        // remote or opens the wrong app. Refusing here rather than only in the
-        // prompt is what makes it stick -- the schema no longer offers those
-        // buttons, and a model that asks for one anyway is told where to go.
+        // OK and BACK always work. The D-pad works ONLY over Bluetooth: on a
+        // cable the CLI is the deterministic way to navigate, and up/down/etc
+        // there was guesswork off an unreadable screen. Over BLE there is no
+        // CLI, so the D-pad is the only cursor there is.
+        const bool ble = deviceOverBle();
+        const bool dpad = (b == QLatin1String("up") || b == QLatin1String("down")
+                        || b == QLatin1String("left") || b == QLatin1String("right"));
         int key = -1;
         if (b == QLatin1String("ok") || b == QLatin1String("enter") || b == QLatin1String("center")) key = InputEvent::Ok;
         else if (b == QLatin1String("back")) key = InputEvent::Back;
+        else if (ble && b == QLatin1String("up"))    key = InputEvent::Up;
+        else if (ble && b == QLatin1String("down"))  key = InputEvent::Down;
+        else if (ble && b == QLatin1String("left"))  key = InputEvent::Left;
+        else if (ble && b == QLatin1String("right")) key = InputEvent::Right;
 
         if (key < 0) {
-            const bool dpad = (b == QLatin1String("up") || b == QLatin1String("down")
-                            || b == QLatin1String("left") || b == QLatin1String("right"));
-            done(dpad
-                ? QStringLiteral("{\"error\":\"'%1' is not available. There is no D-pad navigation: "
-                                 "menu walking is done through the CLI instead. To move between apps "
-                                 "use run_cli(loader open <App>) / run_cli(loader close); for files "
-                                 "use fls and fcat; to fire an IR signal use ir tx or ir universal. "
-                                 "press_button only does ok and back.\"}").arg(b)
-                : QStringLiteral("{\"error\":\"unknown button '%1' (only ok and back exist)\"}").arg(b));
+            done((dpad && !ble)
+                ? QStringLiteral("{\"error\":\"'%1' is a D-pad button and works only over Bluetooth. "
+                                 "This is a USB link, where menu walking is done through the CLI: "
+                                 "run_cli(loader open <App>) / run_cli(loader close) to move between "
+                                 "apps, fls/fcat for files, the ir_universal tool to fire a signal. "
+                                 "press_button over USB does ok and back only.\"}").arg(b)
+                : QStringLiteral("{\"error\":\"unknown button '%1'\"}").arg(b));
             return;
         }
 
@@ -6177,7 +6474,7 @@ bool NikitaBackend::agentReady() const
     return m_agentEnabled;
 }
 
-// Where a bare relative path lands, and the working directory host_run starts
+// Where a bare relative path lands, and the working directory computer_run starts
 // in. Never empty: an unconfigured workspace means home, not nowhere.
 QString NikitaBackend::agentBaseDir() const
 {
@@ -6185,8 +6482,8 @@ QString NikitaBackend::agentBaseDir() const
     return QDir::homePath();
 }
 
-// The agent's current folder: host_cd moves it, relative paths resolve
-// against it, host_run starts in it -- without it a model has no sense of
+// The agent's current folder: computer_cd moves it, relative paths resolve
+// against it, computer_run starts in it -- without it a model has no sense of
 // place and every path must be absolute.
 // "Desktop" is a different real path on every machine/locale; asking Qt is
 // the only way to be right on a stranger's computer. Empty if not a known name.
@@ -6227,7 +6524,7 @@ QString NikitaBackend::agentCwd() const
 }
 
 // Turn whatever the model said into an absolute path on this computer. No
-// workspace-root fence: host_run could always reach anywhere via a shell
+// workspace-root fence: computer_run could always reach anywhere via a shell
 // command anyway, so containment here only pushed mistakes onto `sh -c` where
 // they're harder to see. "~" expands; relative paths land under the workspace
 // (or home).
@@ -6279,7 +6576,7 @@ QString NikitaBackend::resolveAgentPath(const QString &rel, bool mustExist) cons
 
 // Paths a recursive delete must never target: root, any home folder, and
 // anything at depth 0/1 under / (/usr, /etc, /System...). Shared with the CLI
-// panel's "rm" -- host_delete is the less-trusted caller (a model picks the
+// panel's "rm" -- computer_delete is the less-trusted caller (a model picks the
 // path, not a person typing) so it gets the same guard, not a weaker one.
 static bool cliIsProtectedHostPath(const QString &absPath)
 {
@@ -6464,7 +6761,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         return QStringLiteral("{\"error\":\"no such path: %1\"}").arg(p);
     };
 
-    if (name == QLatin1String("host_list")) {
+    if (name == QLatin1String("computer_list")) {
         const QString abs = resolveAgentPath(args.value("path").toString(), true);
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
         QDir dir(abs);
@@ -6496,7 +6793,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         const QJsonObject res{{"path", abs}, {"entries", arr}};
         done(QString::fromUtf8(QJsonDocument(res).toJson(QJsonDocument::Compact)));
 
-    } else if (name == QLatin1String("host_read")) {
+    } else if (name == QLatin1String("computer_read")) {
         const QString abs = resolveAgentPath(args.value("path").toString(), true);
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
         QFile f(abs);
@@ -6513,7 +6810,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         if (out.isEmpty()) { out = QStringLiteral("(empty file)"); }
         done(out);
 
-    } else if (name == QLatin1String("host_write")) {
+    } else if (name == QLatin1String("computer_write")) {
         const QString abs = resolveAgentPath(args.value("path").toString(), false);
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
         const QByteArray bytes = substituteRunResult(args.value("content").toString()).toUtf8();
@@ -6555,7 +6852,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         if (bytes.size() > 400) { preview += QStringLiteral("\n...(truncated)"); }
         requestHostActionConfirm(QStringLiteral("write"), summary, preview, run, done);
 
-    } else if (name == QLatin1String("host_run")) {
+    } else if (name == QLatin1String("computer_run")) {
         const QString cmd = args.value("command").toString().trimmed();
         if (cmd.isEmpty()) { done(QStringLiteral("{\"error\":\"no command\"}")); return; }
         // An explicit cwd wins; otherwise the workspace, otherwise home.
@@ -6575,7 +6872,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         m_pendingHostRunDone = done;
         emit hostRunConfirmRequested(cmd, cwd.isEmpty() ? agentCwd() : cwd);
 
-    } else if (name == QLatin1String("host_cd")) {
+    } else if (name == QLatin1String("computer_cd")) {
         // Answers with no argument too, which makes it the pwd as well: one
         // tool for "where am I" and "go there", the way cd and pwd are one idea.
         const QString want = args.value("path").toString();
@@ -6608,7 +6905,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         };
         done(QString::fromUtf8(QJsonDocument(res).toJson(QJsonDocument::Compact)));
 
-    } else if (name == QLatin1String("host_mkdir")) {
+    } else if (name == QLatin1String("computer_mkdir")) {
         const QString abs = resolveAgentPath(args.value("path").toString(), false);
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
         const bool already = QFileInfo(abs).isDir();
@@ -6640,7 +6937,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
                                      QString(), run, done);
         }
 
-    } else if (name == QLatin1String("host_delete")) {
+    } else if (name == QLatin1String("computer_delete")) {
         // Resolved WITHOUT requiring existence, so a missing file comes back as
         // missing rather than as a bad path. They are different answers: a
         // delete that found nothing is not a delete, and there is no way for the
@@ -6693,8 +6990,8 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
                                      .arg(isDir ? QStringLiteral("folder") : QStringLiteral("file"), canon),
                                  QString(), run, done);
 
-    } else if (name == QLatin1String("host_move") || name == QLatin1String("host_copy")) {
-        const bool moving = (name == QLatin1String("host_move"));
+    } else if (name == QLatin1String("computer_move") || name == QLatin1String("computer_copy")) {
+        const bool moving = (name == QLatin1String("computer_move"));
         const QString from = resolveAgentPath(args.value("from").toString(), true);
         const QString to   = resolveAgentPath(args.value("to").toString(), false);
         if (from.isEmpty()) { done(badPath(args.value("from").toString())); return; }
@@ -6724,7 +7021,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
                                      .arg(moving ? QStringLiteral("Move") : QStringLiteral("Copy"), from, to),
                                  QString(), run, done);
 
-    } else if (name == QLatin1String("host_find")) {
+    } else if (name == QLatin1String("computer_find")) {
         const QString abs = resolveAgentPath(args.value("path").toString(), true);
         if (abs.isEmpty()) { done(badPath(args.value("path").toString())); return; }
         QString pattern = args.value("pattern").toString().trimmed();
@@ -6746,7 +7043,7 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
     }
 }
 
-// Always-allow by design: this fork runs Nikita with the on-screen host_run
+// Always-allow by design: this fork runs Nikita with the on-screen computer_run
 // confirmation permanently disabled, so every command executes immediately
 // with no prompt. That is a deliberate product choice, not an oversight --
 // know that any command a model decides to run (including one steered by
@@ -6768,7 +7065,7 @@ void NikitaBackend::rememberHostRunAllowed(const QString &cmd)
     }
 }
 
-// A person answered the on-screen dialog host_run raised. Nothing here runs
+// A person answered the on-screen dialog computer_run raised. Nothing here runs
 // twice: the pending state is cleared before the command is ever spawned, so
 // a stray second click (or a stale click after the turn moved on) is a no-op
 // rather than a second execution.
@@ -6790,8 +7087,8 @@ void NikitaBackend::answerHostRunConfirm(bool allow, bool alwaysAllow)
     executeHostRun(cmd, cwd, done);
 }
 
-// Gate shared by host_write/host_mkdir/host_move/host_copy/host_delete. Unlike
-// host_run's always-allow list (one exact command string), approval here is
+// Gate shared by computer_write/computer_mkdir/computer_move/computer_copy/computer_delete. Unlike
+// computer_run's always-allow list (one exact command string), approval here is
 // remembered by KIND: the arguments (paths, file contents) are different on
 // every call, so "always allow" can only sensibly mean "always allow this
 // VERB", not "always allow this exact call again". `run` has already computed
@@ -6810,7 +7107,7 @@ void NikitaBackend::requestHostActionConfirm(const QString &kind, const QString 
 }
 
 // Always-allow by design -- see hostRunAlwaysAllowed(). Same story for
-// host_write/host_mkdir/host_move/host_copy/host_delete: no prompt, ever.
+// computer_write/computer_mkdir/computer_move/computer_copy/computer_delete: no prompt, ever.
 bool NikitaBackend::hostActionAlwaysAllowed(const QString &kind) const
 {
     Q_UNUSED(kind);
@@ -6868,7 +7165,7 @@ void NikitaBackend::executeHostRun(const QString &cmd, const QString &cwd,
     // LOGS fix above). Read incrementally and log complete lines as they
     // arrive so the LOGS panel shows it's actually working, instead of
     // waiting for readAll() at the very end.
-    nikitaLog(QStringLiteral("host_run: %1").arg(cmd));
+    nikitaLog(QStringLiteral("computer_run: %1").arg(cmd));
     auto outBuf = std::make_shared<QByteArray>();
     auto lineBuf = std::make_shared<QByteArray>();
     auto lastLogged = std::make_shared<QString>();
@@ -6887,7 +7184,7 @@ void NikitaBackend::executeHostRun(const QString &cmd, const QString &cwd,
             // last thing shown.
             if (!line.isEmpty() && line != *lastLogged) {
                 *lastLogged = line;
-                nikitaLog(QStringLiteral("host_run: %1").arg(line));
+                nikitaLog(QStringLiteral("computer_run: %1").arg(line));
             }
         }
     });
@@ -7744,7 +8041,7 @@ bool NikitaBackend::adoptSkillsIfSkillsFile(const QString &path, const QString &
                                       Qt::CaseInsensitive) != 0) {
         return false;
     }
-    m_skills = content.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    m_skills = nikitaSanitizeSkills(content.split(QLatin1Char('\n'), Qt::SkipEmptyParts));
     while (m_skills.size() > 24) { m_skills.removeFirst(); }
 
     // Persist the local copy directly, allowing empty -- saveProvenMoves()
@@ -9044,22 +9341,6 @@ const char *const kHostPassthrough[] = {
     "sha256sum", "ssh", "tar", "traceroute", "unzip", "which", "xxd", "zip",
 };
 
-// Which of the pass-through commands actually exist on this computer. They are
-// forwarded to a program of the same name, so "listed" and "works" are two
-// different things: nmap, docker or dig are only there if you installed them.
-// `help` says which ones are missing rather than letting you find out by
-// running one and reading a spawn error.
-QString cliMissingPassthrough()
-{
-    QStringList missing;
-    for (const char *name : kHostPassthrough) {
-        const QString n = QString::fromLatin1(name);
-        if (QStandardPaths::findExecutable(n).isEmpty()) { missing += n; }
-    }
-    missing.sort();
-    return missing.join(QLatin1Char(' '));
-}
-
 // Your user name on this computer. $USER is unset in a GUI process launched
 // from Finder or a .desktop file, so fall back to the home folder's name, which
 // is right on every platform this app ships to.
@@ -9728,19 +10009,10 @@ QString cliFormatHelp(const QString &raw, const QString &promptText)
 
     QString block;
     block += QStringLiteral("  (help <command> for details)\n");
-    block += QStringLiteral("  (f-prefixed acts on the Flipper, bare acts on this computer)\n");
     block += QStringLiteral("------ Flipper ------\n");
     block += grid(flipperCmds);
     block += QStringLiteral("------ Computer ------\n");
     block += grid(deviceCmds);
-    // Listed above, but only usable if the program is installed here.
-    {
-        const QString missing = cliMissingPassthrough();
-        if (!missing.isEmpty()) {
-            block += QStringLiteral("  (not installed on this computer: ") + missing
-                   + QStringLiteral(")\n");
-        }
-    }
     block += QStringLiteral("------ Firmware ------\n");
     block += grid(stock);
 
@@ -11653,19 +11925,10 @@ QString FlipperCli::cliOfflineHelp()
 
     QString out = QStringLiteral("Available commands:\n");
     out += QStringLiteral("  (help <command> for details)\n");
-    out += QStringLiteral("  (f-prefixed acts on the Flipper, bare acts on this computer)\n");
     out += QStringLiteral("------ Flipper ------\n");
     out += grid(flipperCmds);
     out += QStringLiteral("------ Computer ------\n");
     out += grid(deviceCmds);
-    // Listed above, but only usable if the program is installed here.
-    {
-        const QString missing = cliMissingPassthrough();
-        if (!missing.isEmpty()) {
-            out += QStringLiteral("  (not installed on this computer: ") + missing
-                   + QStringLiteral(")\n");
-        }
-    }
     out += QStringLiteral("------ Firmware ------\n");
     out += QStringLiteral("  (connect a Flipper to list these)\n");
     return out;

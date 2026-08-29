@@ -37,6 +37,24 @@ Item {
         } else {
             App.updateStatusChanged.connect(askForSelfUpdate);
         }
+        // Come straight back to the Flipper you last used over Bluetooth, with
+        // no scanning or picking. Only when there is a remembered device, BLE is
+        // built in, and nothing is connected yet -- a cable, if present, wins and
+        // this stays quiet. A short delay lets the USB detector report first so
+        // an attached Flipper is not raced by a needless scan.
+        if (Nikita.hasBle && Ble.hasSavedDevice) {
+            autoReconnectTimer.start();
+        }
+    }
+
+    Timer {
+        id: autoReconnectTimer
+        interval: 1500
+        onTriggered: {
+            if (Backend.backendState === ApplicationBackend.WaitingForDevices) {
+                Ble.autoConnect();
+            }
+        }
     }
 
     width: baseWidth

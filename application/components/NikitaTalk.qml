@@ -328,6 +328,12 @@ Rectangle {
     // assistant was switched on, so an erase only held until the app restarted.
     Connections {
         target: Nikita
+        // A queued message just started its turn -- show it as a "you" bubble
+        // now, in step with the turn, so queued questions read like normal ones
+        // instead of appearing only in the "queued (N)" strip and then vanishing.
+        function onQueuedMessageStarting(text) {
+            root.appendMessage("you", text);
+        }
         function onHistoryCleared() {
             chatModel.clear();
             root.streamIdx = -1;
@@ -364,13 +370,13 @@ Rectangle {
     // Same fix modelManager already uses below: root.parent is the overlay
     // NikitaTalk sits inside, which fills mainContent -- the actual content
     // area of the window -- so centering there reads as centered on screen.
-    HostRunConfirmDialog {
+    ComputerRunConfirmDialog {
         id: hostRunConfirmDialog
         radius: root.radius
         parent: root.parent ? root.parent : root
     }
 
-    HostActionConfirmDialog {
+    ComputerActionConfirmDialog {
         id: hostActionConfirmDialog
         radius: root.radius
         parent: root.parent ? root.parent : root
@@ -384,14 +390,14 @@ Rectangle {
 
     Connections {
         target: Nikita
-        // host_run is waiting on screen: nothing runs on this computer until
+        // computer_run is waiting on screen: nothing runs on this computer until
         // the command is answered here.
         function onHostRunConfirmRequested(command, cwd) {
             hostRunConfirmDialog.openWithCommand(function(allow, always) {
                 Nikita.answerHostRunConfirm(allow, always);
             }, command, cwd);
         }
-        // Same idea for host_write/host_mkdir/host_move/host_copy/host_delete:
+        // Same idea for computer_write/computer_mkdir/computer_move/computer_copy/computer_delete:
         // nothing touches a file on this computer until it's answered here.
         function onHostActionConfirmRequested(kind, summary, detail) {
             hostActionConfirmDialog.openWithAction(function(allow, always) {
@@ -816,7 +822,16 @@ Rectangle {
             // the user was trying to scroll up, and the fight between the two
             // read as the list shaking up and down.
             function followEnd() {
-                if (stickToBottom) { positionViewAtEnd(); }
+                if (!stickToBottom) { return; }
+                // positionViewAtEnd is the ONLY correct way to pin a ListView to
+                // the bottom -- it respects delegate virtualization. Setting
+                // contentY by hand strands the view at a position where the
+                // ListView has not created delegates, so messages blank out and
+                // flicker back in as you scroll. The debounce timer below keeps
+                // this from firing every streamed token, which is what caused
+                // the twitch that tempted the hand-rolled version in the first
+                // place.
+                positionViewAtEnd();
             }
 
             // Decided from what the USER does, not from every contentY change.
@@ -827,8 +842,16 @@ Rectangle {
             onMovementEnded: stickToBottom = (contentY + height) >= (contentHeight - 24)
             onFlickEnded: stickToBottom = (contentY + height) >= (contentHeight - 24)
 
-            onCountChanged: Qt.callLater(followEnd)
-            onContentHeightChanged: Qt.callLater(followEnd)
+            // Debounced rather than per-change: a streaming answer resizes its
+            // delegate on every token, and one correction after the burst is
+            // both smoother and cheaper than one per frame.
+            Timer {
+                id: followTimer
+                interval: 40
+                onTriggered: listView.followEnd()
+            }
+            onCountChanged: followTimer.restart()
+            onContentHeightChanged: followTimer.restart()
 
             // ---- live turn status, as the list's footer ------------------
             // Directly under the last message, flowing with the conversation --
@@ -1031,7 +1054,18 @@ Rectangle {
                     Text {
                         id: msgCopyBtn
                         property bool done: false
-                        visible: msgHover.hovered || done
+                        // opacity, not visible, and a FIXED width. Toggling
+                        // visible on hover added/removed a row child, which
+                        // reflowed the delegate and changed the ListView's
+                        // contentHeight -- and a contentHeight change nudges the
+                        // scroll position, so every hover made the chat twitch.
+                        // Kept permanently laid out at a fixed size, it fades in
+                        // and out without touching layout, and "copy"->"copied"
+                        // (wider) no longer changes the row width either.
+                        width: 44
+                        horizontalAlignment: Text.AlignLeft
+                        opacity: (msgHover.hovered || done) ? 1 : 0
+                        Behavior on opacity { NumberAnimation { duration: 90 } }
                         text: done ? "copied" : "copy"
                         color: done ? "#39ff14"
                                     : (msgCopyMouse.containsMouse ? Theme.color.lightorange2 : Theme.color.mediumorange4)

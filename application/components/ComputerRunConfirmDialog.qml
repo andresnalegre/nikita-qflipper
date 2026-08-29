@@ -4,7 +4,7 @@ import QtQuick.Controls 2.15
 
 import Theme 1.0
 
-// Gate for host_run: NIKITA cannot execute a shell command on this computer
+// Gate for computer_run: NIKITA cannot execute a shell command on this computer
 // until a person sees the literal command here and presses Run. Modeled on
 // ConfirmationDialog.qml (same openWithMessage-style callback pattern), with
 // the command text and the "always allow" checkbox this action needs.

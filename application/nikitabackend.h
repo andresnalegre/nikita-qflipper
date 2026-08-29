@@ -182,10 +182,10 @@ public:
     Q_INVOKABLE void openFileForEdit(const QString &path);          // read a file into the editor
     Q_INVOKABLE void clearHistory();                                // wipe the chat conversation
     Q_INVOKABLE void writeFile(const QString &path, const QString &content); // save edits back
-    // A host_run call is waiting on screen for a person to approve or refuse
+    // A computer_run call is waiting on screen for a person to approve or refuse
     // it. Called from the confirmation dialog's Run/Cancel buttons.
     Q_INVOKABLE void answerHostRunConfirm(bool allow, bool alwaysAllow);
-    // Same idea for the other mutating host_* tools (write/mkdir/move/copy/
+    // Same idea for the other mutating computer_* tools (write/mkdir/move/copy/
     // delete); one shared dialog gates all of them. See requestHostActionConfirm().
     Q_INVOKABLE void answerHostActionConfirm(bool allow, bool alwaysAllow);
     // The user's choice when a Flipper save would overwrite an existing file:
@@ -303,6 +303,9 @@ signals:
     void apiKeyChanged();
     void canRateChanged();
     void queuedChanged();
+    // Emitted the instant a queued message is dequeued to run, so the chat can
+    // draw its "you" bubble in step with the turn instead of never showing it.
+    void queuedMessageStarting(const QString &text);
     void turnStatusChanged();
     // One tool call, as its own line in the chat rather than as part of the
     // reply text. `seq` identifies the call for the whole of its life, so the
@@ -328,13 +331,13 @@ signals:
     void fileSaved(const QString &path);           // editor: file written
     void fileEditError(const QString &message);    // editor: read/write failed
     void partialReceived(const QString &text);   // live-typing: reply text so far
-    // Every host_* tool call, as it happens, for the chat to show inline.
+    // Every computer_* tool call, as it happens, for the chat to show inline.
     void hostActionRan(const QString &summary);
-    // host_run wants to execute `command` (in `cwd`) on this computer and is
+    // computer_run wants to execute `command` (in `cwd`) on this computer and is
     // waiting for a person to say yes. Nothing runs until answerHostRunConfirm
     // is called back.
     void hostRunConfirmRequested(const QString &command, const QString &cwd);
-    // One of the other mutating host_* tools (write/mkdir/move/copy/delete)
+    // One of the other mutating computer_* tools (write/mkdir/move/copy/delete)
     // wants to act and is waiting for a person to say yes. `kind` is the verb
     // ("write"/"mkdir"/"move"/"copy"/"delete"), `summary` is a one-line
     // description for the dialog title, `detail` is optional extra context
@@ -393,7 +396,7 @@ private:
     // finalizeStream()/runToolCalls() calls THIS, never the backend directly,
     // so a mid-turn retry and a tool-result round trip go the same way.
     void redispatch();
-    void runOneTool(const QString &name, const QJsonObject &args,
+    void runOneTool(const QString &rawName, const QJsonObject &args,
                     std::function<void(const QString &)> done); // one async RPC tool
     void ensureFlipperDir(const QByteArray &dirPath,
                           std::function<void()> done);           // mkdir -p on the SD card
@@ -405,7 +408,7 @@ private:
     // Where relative paths land when nothing else says otherwise. Never empty:
     // an unconfigured workspace means home.
     QString agentBaseDir() const;
-    // The folder the agent is standing in. host_cd walks it, it survives the
+    // The folder the agent is standing in. computer_cd walks it, it survives the
     // whole conversation, and every turn's prompt states it, so the model
     // never has to spend a call asking where it is.
     QString agentCwd() const;
@@ -420,15 +423,15 @@ private:
                         std::function<void(const QString &)> done);
     bool hostRunAlwaysAllowed(const QString &cmd) const;
     void rememberHostRunAllowed(const QString &cmd);
-    // A host_run call waiting on the on-screen confirmation dialog. One at a
+    // A computer_run call waiting on the on-screen confirmation dialog. One at a
     // time: runToolCalls() only starts the next tool after this one's done()
-    // fires, so a second host_run can never arrive while this is still set.
+    // fires, so a second computer_run can never arrive while this is still set.
     QString m_pendingHostRunCmd;
     QString m_pendingHostRunCwd;
     std::function<void(const QString &)> m_pendingHostRunDone;
 
-    // Shared confirmation gate for host_write/host_mkdir/host_move/host_copy/
-    // host_delete. Unlike host_run's always-allow list (one exact command
+    // Shared confirmation gate for computer_write/computer_mkdir/computer_move/computer_copy/
+    // computer_delete. Unlike computer_run's always-allow list (one exact command
     // string), this remembers by KIND, since paths differ on every call.
     // `run` is the already-resolved mutation; `done` reports back on decline.
     // Flipper save with an overwrite guard: stat the path, and if a file is
@@ -528,6 +531,10 @@ private:
     // for nothing new is a loop, and looping -- not a step count -- is what
     // ends a turn.
     QSet<QString> m_turnCallSigs;
+    // Tool NAMES that actually executed this turn -- so a claim of arrival can be
+    // checked against whether the tool that would produce it (run_ble, a
+    // confirming read_screen) was really called.
+    QSet<QString> m_turnToolsRun;
     int        m_repeatRounds = 0;
     // Rounds this turn that died on the output-token ceiling with nothing to
     // show for them. The model spends its whole budget reasoning over the
@@ -638,7 +645,7 @@ private:
     int        m_apiRateRetry = 0;  // 429 retries used this turn (see NIKITA_API_MAX_RATE_RETRIES)
     int        m_activeToolSeq = 0; // the call currently running, so its result
                                     // rewrites the row its start opened
-    // Trimmed stdout of the most recent command this turn (host_run or run_cli),
+    // Trimmed stdout of the most recent command this turn (computer_run or run_cli),
     // so a script that must contain a command's result can be filled in by the
     // code -- via the {{LAST_RESULT}} token -- instead of the model retyping the
     // number by hand and risking a transcription error.

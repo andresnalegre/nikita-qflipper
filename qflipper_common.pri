@@ -34,7 +34,7 @@ GIT_VERSION = $$(GIT_VERSION)
 isEmpty(GIT_VERSION) {
     GIT_VERSION = $$system("git describe --tags --abbrev=0","lines", HAS_VERSION)
     !equals(HAS_VERSION, 0) {
-        GIT_VERSION = 2.0.0
+        GIT_VERSION = 2.0.3
     }
 }
 # Release tags are named "V.X.Y.Z" on GitHub; strip the leading "V." so

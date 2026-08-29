@@ -1,5 +1,7 @@
 #include "blespike.h"
 
+#include <QSettings>
+
 #include <QVariantMap>
 #include <QLowEnergyDescriptor>
 #include <QBluetoothAddress>
@@ -34,6 +36,10 @@ BleSpike::BleSpike(QObject *parent)
     connect(m_agent, &QBluetoothDeviceDiscoveryAgent::deviceDiscovered, this, &BleSpike::onDeviceDiscovered);
     connect(m_agent, &QBluetoothDeviceDiscoveryAgent::finished, this, [this]() {
         setScanning(false);
+        if (m_autoConnecting) {
+            m_autoConnecting = false;
+            log(QStringLiteral("auto-reconnect: saved Flipper not in range."));
+        }
         log(QStringLiteral("scan finished (%1 device(s)).").arg(m_found.size()));
     });
     connect(m_agent, &QBluetoothDeviceDiscoveryAgent::errorOccurred, this,
@@ -116,6 +122,20 @@ void BleSpike::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
     if (!looksFlipper && !m_scanAll) { return; }
     m_found.append(info);
     m_isFlipper.append(looksFlipper);
+    // Silent reconnect: the moment the remembered Flipper shows up, grab it and
+    // stop looking. Matches on the UUID first, the address second.
+    if (m_autoConnecting && looksFlipper && !m_savedId.isEmpty()) {
+        const QString id = info.deviceUuid().toString();
+        const QString addr = info.address().toString();
+        if (id == m_savedId || (!addr.isEmpty() && addr == m_savedId)) {
+            m_autoConnecting = false;
+            m_agent->stop();
+            log(QStringLiteral("auto-reconnect: found it, connecting…"));
+            connectDevice(m_found.size() - 1);
+            emit devicesChanged();
+            return;
+        }
+    }
     log(QStringLiteral("  found: %1  %2%3").arg(
             info.name().isEmpty() ? QStringLiteral("(unnamed)") : info.name(),
             info.address().toString(),
@@ -381,8 +401,49 @@ void BleSpike::connectDevice(int index)
         return new BleTransport(info, parent);
     };
 
+    // Remember this Flipper so we can come straight back to it next time. The
+    // UUID is the per-host stable id CoreBluetooth hands out (the MAC is hidden
+    // on macOS); on platforms that expose a real address it is saved too.
+    {
+        QSettings st;
+        const QString id = info.deviceUuid().toString();
+        st.setValue(QStringLiteral("nikita/bleDeviceId"),
+                    id.isEmpty() ? info.address().toString() : id);
+        st.setValue(QStringLiteral("nikita/bleDeviceName"), name);
+    }
+
     m_reg->connectBleDevice(name, factory);
     setSessionActive(true);
+}
+
+bool BleSpike::hasSavedDevice() const
+{
+    return !QSettings().value(QStringLiteral("nikita/bleDeviceId")).toString().isEmpty();
+}
+
+QString BleSpike::savedDeviceName() const
+{
+    return QSettings().value(QStringLiteral("nikita/bleDeviceName")).toString();
+}
+
+void BleSpike::forgetSaved()
+{
+    QSettings st;
+    st.remove(QStringLiteral("nikita/bleDeviceId"));
+    st.remove(QStringLiteral("nikita/bleDeviceName"));
+    m_autoConnecting = false;
+}
+
+void BleSpike::autoConnect()
+{
+    if (m_scanning || (m_reg && m_reg->hasBleDevice())) { return; }
+    m_savedId = QSettings().value(QStringLiteral("nikita/bleDeviceId")).toString();
+    if (m_savedId.isEmpty()) { return; }
+    m_autoConnecting = true;
+    log(QStringLiteral("auto-reconnect: looking for %1…")
+            .arg(savedDeviceName().isEmpty() ? QStringLiteral("your Flipper") : savedDeviceName()));
+    // A Flipper-only scan is enough and is quieter than the full sweep.
+    startScan(false);
 }
 
 void BleSpike::disconnectAll()
