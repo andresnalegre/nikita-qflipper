@@ -72,7 +72,7 @@ private slots:
     void onSessionStatusChanged();
 
 private:
-    static const QString &branchToChannelName(const QByteArray &branchName);
+    static const QString &branchToChannelName(const QByteArray &branchName, const QByteArray &version);
 
     // Null between a failed session and the retry that replaces it, so every
     // use has to check first.

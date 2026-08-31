@@ -135,6 +135,12 @@ void Application::onCurrentDeviceChanged()
     if(auto *dev = m_backend.device()) {
         auto *st = dev->deviceState();
         const auto push = [this, st]() {
+            // Origin first, and deliberately so. setDeviceVersion() is what
+            // resolves which source is running and kicks off the first fetch,
+            // and it resolves from the origin -- so setting the version while
+            // the origin is still empty makes that first answer fall back to
+            // the version string, which reads a Nikita device as "Official".
+            m_firmware.setDeviceOrigin(st->deviceInfo().firmware.origin);
             m_firmware.setDeviceVersion(st->deviceInfo().firmware.version);
             m_firmware.setDeviceCommit(st->deviceInfo().firmware.commit);
             m_firmware.setDeviceChannel(st->deviceInfo().firmware.channel);
@@ -150,6 +156,7 @@ void Application::onCurrentDeviceChanged()
         push();
     } else {
         m_firmware.setDeviceVersion(QString());
+        m_firmware.setDeviceOrigin(QString());
     }
 }
 

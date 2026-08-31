@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QRegularExpression>
 
 using namespace Flipper::Updates;
 
@@ -121,10 +122,28 @@ qint64 VersionInfo::compare(const VersionInfo &other) const
 
 qint64 VersionInfo::toNumericValue(const QString &version)
 {
-    int ret = 0;
+    qint64 ret = 0;
 
     // Get rid of the possible -rcxx suffix
-    const auto tokens = version.split('-').first().split('.');
+    auto tokens = version.split('-').first().split('.');
+
+    // Every firmware but the official one stamps a name in front of the number
+    // -- "nkt-001", "mntm-012", "unlshd-084". Splitting on '-' leaves the name
+    // as the only token, which is not a number, so upstream's parse bailed and
+    // EVERY such version compared equal to every other: an update was never
+    // offered on any fork, because "newer" could not be expressed.
+    //
+    // So when the leading token is a name rather than a number, drop it and
+    // read the number that follows it instead.
+    static const QRegularExpression namePrefix(QStringLiteral("^[A-Za-z]+$"));
+    if(!tokens.isEmpty() && namePrefix.match(tokens.first()).hasMatch()) {
+        const auto parts = version.split('-');
+        if(parts.size() < 2) return std::numeric_limits<qint64>::min();
+        tokens = parts.at(1).split('.');
+    }
+
+    if(tokens.isEmpty()) return std::numeric_limits<qint64>::min();
+
     for(const auto &token : tokens) {
         bool ok; const auto val = token.toInt(&ok);
 

@@ -684,7 +684,14 @@ class FirmwareStore : public QObject
     // The version string the Flipper reports. Set from QML; every source in
     // sources() is then tagged as installed / up to date / neither, so the UI
     // can offer UPDATE instead of INSTALL for the firmware already running.
+    // Written from QML alongside deviceVersion (see MainWindow.qml). Both come
+    // off the same DeviceInfo, and the origin has to arrive first or the
+    // identity is decided from the version alone -- which cannot tell a fork
+    // from the official firmware.
+    Q_PROPERTY(QString deviceOrigin READ deviceOrigin WRITE setDeviceOrigin NOTIFY changed)
     Q_PROPERTY(QString deviceVersion READ deviceVersion WRITE setDeviceVersion NOTIFY changed)
+    // What to call the running firmware on screen -- not always its version.
+    Q_PROPERTY(QString deviceLabel READ deviceLabel NOTIFY changed)
     // Resolved from deviceVersion, for the main screen: which source is running,
     // what its newest build is, and whether that differs from what is installed.
     Q_PROPERTY(int installedIndex READ installedIndex NOTIFY changed)
@@ -725,6 +732,8 @@ public:
     QVariantList sources() const;
     bool busy() const { return m_busy; }
     QString deviceVersion() const { return m_deviceVersion; }
+    QString deviceOrigin() const { return m_deviceOrigin; }
+    QString deviceLabel() const;
     void setDeviceVersion(const QString &v);
     // A rolling channel names builds by commit hash, so the hash is the only
     // thing that can match what the device reports against what a feed offers.
@@ -733,6 +742,10 @@ public:
     // installedFromChannel() only knows what this app flashed; this is always
     // true, so it is what a cleared pick can be restored to.
     void setDeviceChannel(const QString &c);
+    // device_info's firmware_origin_fork -- the firmware naming itself. The
+    // only reliable answer to "which of these sources is running"; see
+    // installedIndex().
+    void setDeviceOrigin(const QString &o);
     void setDeviceDate(const QDate &d);
 
     // Which source the running firmware came from, by the shape of its version
@@ -811,6 +824,10 @@ private:
     QString channelVersion(const Source &s, const QString &ch) const;
     int distinctChannelCount(const Source &s) const;   // 1 when every channel is the same build
     void setBusy(bool value);
+    // Recompute (and, when it changes, report) which source is running. Called
+    // whenever the version or the origin changes, because they arrive
+    // independently and either one alone can be misleading.
+    void noteDeviceIdentity();
 
     QNetworkAccessManager m_net;
     QList<Source> m_sources;
@@ -819,6 +836,9 @@ private:
     QString m_deviceVersion;
     QString m_deviceCommit;
     QString m_deviceChannel;
+    QString m_deviceOrigin;
+    QString m_identityLogged;   // last identity reported, to avoid repeating it
+    bool m_identityDeferred = false;   // waiting one event-loop turn for the origin
     QDate   m_deviceDate;
     bool m_fetchedOnce = false;
     int m_selected = -1;

@@ -10,6 +10,26 @@
 namespace Flipper {
 namespace Updates {
 
+// The update feed this app treats as its own.
+//
+// Nikita firmware is what this fork is built around, so it -- not the official
+// firmware -- is what the main update path offers. Everything else (Official,
+// Momentum, Unleashed, RogueMaster, ARF, Xero) stays one click away in the
+// firmware store panel, which installs any of them through the same path.
+//
+// Served straight out of the firmware repo rather than from a dedicated update
+// server: the release workflow regenerates it and commits it, so there is no
+// host to keep alive and no second place for the version to drift.
+constexpr auto NIKITA_UPDATE_DIRECTORY =
+    "https://raw.githubusercontent.com/andresnalegre/Nikita-V8/main/firmware/directory.json";
+
+constexpr auto OFFICIAL_UPDATE_DIRECTORY =
+    "https://update.flipperzero.one/firmware/directory.json";
+
+// device_info's firmware_origin_fork for a Nikita build. Set by FIRMWARE_ORIGIN
+// in the firmware's fbt_options.py; the two must stay in step.
+constexpr auto NIKITA_FIRMWARE_ORIGIN = "Nikita-V8";
+
 class FileInfo
 {
     Q_GADGET

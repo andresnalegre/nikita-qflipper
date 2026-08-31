@@ -191,7 +191,9 @@ void VCPDeviceInfoHelper::fetchDeviceInfoLegacy()
             operation->value(QByteArrayLiteral("firmware_version")),
             operation->value(QByteArrayLiteral("firmware_commit")),
             operation->value(QByteArrayLiteral("firmware_branch")),
-            branchToChannelName(operation->value(QByteArrayLiteral("firmware_branch"))),
+            branchToChannelName(operation->value(QByteArrayLiteral("firmware_branch")),
+                                operation->value(QByteArrayLiteral("firmware_version"))),
+            operation->value(QByteArrayLiteral("firmware_origin_fork")),
             QDateTime::fromString(operation->value(QByteArrayLiteral("firmware_build_date")), "dd-MM-yyyy").date()
         };
 
@@ -257,7 +259,9 @@ void VCPDeviceInfoHelper::fetchDeviceInfoProperty()
             operation->value(QByteArrayLiteral("firmware.version")),
             operation->value(QByteArrayLiteral("firmware.commit.hash")),
             operation->value(QByteArrayLiteral("firmware.branch.name")),
-            branchToChannelName(operation->value(QByteArrayLiteral("firmware.branch.name"))),
+            branchToChannelName(operation->value(QByteArrayLiteral("firmware.branch.name")),
+                                operation->value(QByteArrayLiteral("firmware.version"))),
+            operation->value(QByteArrayLiteral("firmware.origin.fork")),
             QDateTime::fromString(operation->value(QByteArrayLiteral("firmware.build.date")), "dd-MM-yyyy").date()
         };
 
@@ -421,7 +425,21 @@ void VCPDeviceInfoHelper::onSessionStatusChanged()
     }
 }
 
-const QString &VCPDeviceInfoHelper::branchToChannelName(const QByteArray &branchName)
+// Which release channel the running build came from.
+//
+// Upstream read this off the branch name alone, which works for the official
+// firmware (whose release builds are branched "1.4.3") and for nothing else.
+// Nikita tags its releases "nkt-001" / "nkt-001-rc" / "nkt-001-dev", and the
+// build stamps that tag into BOTH the branch (WORKFLOW_BRANCH_OR_TAG) and the
+// version (DIST_SUFFIX) -- so the version is checked as a fallback, and a
+// Nikita release lands on a real channel instead of "custom".
+//
+// A local Nikita build still reports version "v8" on branch "main": neither
+// shape matches, so it stays "custom", which is what it is. That is separate
+// from *which firmware* it is -- that comes from firmware_origin_fork, never
+// from these strings.
+const QString &VCPDeviceInfoHelper::branchToChannelName(const QByteArray &branchName,
+                                                        const QByteArray &version)
 {
     static const auto DEVELOPMENT = QStringLiteral("development");
     static const auto RELEASE_CANDIDATE = QStringLiteral("release-candidate");
@@ -429,19 +447,26 @@ const QString &VCPDeviceInfoHelper::branchToChannelName(const QByteArray &branch
     static const auto CUSTOM = QStringLiteral("custom");
 
     const QRegExp validVersion(QStringLiteral("^\\d+\\.\\d+\\.\\d+(-rc)?$"));
+    // "nkt-001", "nkt-001-rc", "nkt-001-dev"
+    const QRegExp nikitaVersion(QStringLiteral("^nkt-\\d+(-rc|-dev)?$"));
 
-    if(validVersion.exactMatch(branchName)) {
-        if(validVersion.cap(1).isEmpty()) {
-            return RELEASE;
-        } else {
-            return RELEASE_CANDIDATE;
+    for(const auto &candidate : {branchName, version}) {
+        if(validVersion.exactMatch(candidate)) {
+            return validVersion.cap(1).isEmpty() ? RELEASE : RELEASE_CANDIDATE;
+
+        } else if(nikitaVersion.exactMatch(candidate)) {
+            const auto suffix = nikitaVersion.cap(1);
+            if(suffix == QStringLiteral("-dev")) {
+                return DEVELOPMENT;
+            }
+            return suffix.isEmpty() ? RELEASE : RELEASE_CANDIDATE;
+
+        } else if(candidate == QByteArrayLiteral("dev")) {
+            return DEVELOPMENT;
         }
-
-    } else if(branchName == QByteArrayLiteral("dev")) {
-        return DEVELOPMENT;
-    } else {
-        return CUSTOM;
     }
+
+    return CUSTOM;
 }
 
 using namespace STM32;

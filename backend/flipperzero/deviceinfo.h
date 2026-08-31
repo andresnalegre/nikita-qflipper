@@ -53,6 +53,12 @@ struct SoftwareInfo {
     Q_PROPERTY(QString commit MEMBER commit)
     Q_PROPERTY(QString branch MEMBER branch)
     Q_PROPERTY(QString channel MEMBER channel)
+    // Which firmware this build is, as the device itself declares it
+    // (device_info's firmware_origin_fork: "Official", "Unleashed",
+    // "Nikita-V8"...). The version string alone cannot tell a fork apart --
+    // Nikita reports "v8", Xero reports a plain "1.4.2-xero.2" -- so anything
+    // deciding "which firmware is this" reads this rather than guessing.
+    Q_PROPERTY(QString origin MEMBER origin)
     Q_PROPERTY(QDate date MEMBER date)
 
 public:
@@ -60,6 +66,7 @@ public:
     QString commit;
     QString branch;
     QString channel;
+    QString origin;
     QDate date;
 
     // Needed in order to work with QVariant (+ operator== for Qt 6.7's moc).

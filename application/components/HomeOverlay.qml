@@ -498,7 +498,9 @@ AbstractOverlay {
                            ? Firmware.installedLatest.split("-")[0]
                            : Firmware.installedLatest;
                 }
-                return Firmware.deviceVersion;
+                // Not deviceVersion: a locally built Nikita reports "v8",
+                // which named nothing and read as if that were the firmware.
+                return Firmware.deviceLabel;
             }
 
             let str;

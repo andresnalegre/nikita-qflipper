@@ -78,8 +78,23 @@ Item {
             id: values
 
             TextLabel {
-                text: !deviceInfo ? text : deviceInfo.firmware.branch === "dev" ?
-                       deviceInfo.firmware.commit : deviceInfo.firmware.version
+                // Name the firmware, which is not always its version. Official
+                // dev builds all report the version "dev", so the commit is the
+                // only thing identifying one. A locally built Nikita reports
+                // "v8" -- which named nothing, and read here as though the
+                // firmware were called that -- so its own name is shown.
+                // "nkt-001", "unlshd-084" and "1.4.3" already name their build
+                // and are left alone.
+                text: {
+                    if(!deviceInfo) { return text; }
+                    var fw = deviceInfo.firmware;
+                    if(fw.branch === "dev") { return fw.commit; }
+                    var selfNaming = /^[A-Za-z]+-\d|^\d+\.\d+/;
+                    if(fw.origin && (!fw.version || !selfNaming.test(fw.version))) {
+                        return fw.origin;
+                    }
+                    return fw.version;
+                }
 
                 visible: extraFields
             }

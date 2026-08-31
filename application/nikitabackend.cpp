@@ -43,6 +43,7 @@
 #include <QPointer>
 
 #include "applicationbackend.h"
+#include "flipperupdates.h"   // NIKITA_UPDATE_DIRECTORY, NIKITA_FIRMWARE_ORIGIN
 #include "backenderror.h"   // BackendError::OperationError
 #include "deviceregistry.h"
 #include "abstractoperation.h"
@@ -8330,9 +8331,18 @@ FirmwareStore::FirmwareStore(QObject *parent)
     const QStringList git = { QStringLiteral("release"), QStringLiteral("dev") };
 
     // fields: name, kind, locator, blurb, channels, wantChannel, latest, tgzUrl, status, raw
+    //
+    // Nikita is first because this app is the Nikita desktop client: its own
+    // firmware is the default offer, and every other firmware here is an
+    // import away. Order is what the panel renders, so first is where the eye
+    // lands.
     m_sources = {
+        { QStringLiteral("Nikita"),      Kind::DirJson,
+          QString::fromLatin1(Flipper::Updates::NIKITA_UPDATE_DIRECTORY),
+          QStringLiteral("This ecosystem's own firmware. Unleashed, plus the Nikita agent."),
+                                                                        {},  rel, {}, {}, {}, {}, {} },
         { QStringLiteral("Official"),    Kind::DirJson,
-          QStringLiteral("https://update.flipperzero.one/firmware/directory.json"),
+          QString::fromLatin1(Flipper::Updates::OFFICIAL_UPDATE_DIRECTORY),
           QStringLiteral("The original Flipper Devices firmware."),      {},  rel, {}, {}, {}, {}, {} },
         { QStringLiteral("Momentum"),    Kind::DirJson,
           QStringLiteral("https://up.momentum-fw.dev/firmware/directory.json"),
@@ -8381,26 +8391,91 @@ void FirmwareStore::setBusy(bool value)
     emit busyChanged();
 }
 
+// The version and the origin arrive from different places and in no fixed
+// order: QML writes the version through the deviceVersion property as the main
+// screen binds, while the origin only ever comes from C++ once device_info has
+// been read. Whichever lands first used to decide the identity on its own --
+// and the version alone reads a Nikita device as "Official", which it can never
+// be. So both setters funnel through here, and the answer is recomputed each
+// time either changes.
+// What to call the running firmware on screen.
+//
+// The version string is the right label only when it names the build it came
+// from: "nkt-001", "unlshd-084" and "1.4.3" all do. A locally built Nikita
+// reports "v8", which names nothing and read on the home screen as if the
+// firmware were called that -- so the firmware's own name is shown instead.
+QString FirmwareStore::deviceLabel() const
+{
+    const QString version = m_deviceVersion.trimmed();
+    if (m_deviceOrigin.isEmpty()) { return version; }
+
+    // A release tag ("nkt-001") or a plain semantic version ("1.4.3").
+    static const QRegularExpression selfNaming(
+        QStringLiteral("^[A-Za-z]+-\\d|^\\d+\\.\\d+"));
+
+    if (version.isEmpty() || !selfNaming.match(version).hasMatch()) {
+        return m_deviceOrigin;
+    }
+    return version;
+}
+
+void FirmwareStore::noteDeviceIdentity()
+{
+    const QString version = m_deviceVersion.trimmed();
+    if (version.isEmpty()) { return; }
+
+    // The version and the origin are two separate writes, and nothing orders
+    // them: they are bound independently from QML, whose evaluation order is
+    // its own business -- observed here writing the version a full 12ms before
+    // the origin, the reverse of the order they are declared in.
+    //
+    // Concluding from whichever arrives first is what made a Nikita device
+    // read as "Official": the version alone cannot tell a fork from the
+    // official firmware. So when the version is known and the origin is not,
+    // give the pending write one turn of the event loop to land before
+    // deciding. If it never comes -- older firmware, or one that does not
+    // report an origin at all -- the next pass falls through to the
+    // version-shape rules, which is the best that can be done then.
+    if (m_deviceOrigin.isEmpty() && !m_identityDeferred) {
+        m_identityDeferred = true;
+        QTimer::singleShot(0, this, [this]() {
+            m_identityDeferred = false;
+            noteDeviceIdentity();
+        });
+        return;
+    }
+
+    const int i = installedIndex();
+    const QString source = (i >= 0) ? m_sources.at(i).name
+                                    : QStringLiteral("no matching source");
+
+    // Log only when the conclusion actually changes, so the second setter is
+    // silent when it had nothing to add -- but speaks up when it corrects the
+    // first one.
+    if (source != m_identityLogged) {
+        m_identityLogged = source;
+        nikitaLog(QStringLiteral("firmware: device reports %1 (origin %2) -> %3, shown as \"%4\"")
+                 .arg(version,
+                      m_deviceOrigin.isEmpty() ? QStringLiteral("unreported") : m_deviceOrigin,
+                      source,
+                      deviceLabel()));
+    }
+
+    // The main screen needs to know whether an update exists before the user
+    // ever opens the store panel, so the first time a device reports in, go
+    // fetch. Without this the button would have nothing to compare against.
+    if (!m_fetchedOnce) {
+        m_fetchedOnce = true;
+        refreshIfStale();
+    }
+}
+
 void FirmwareStore::setDeviceVersion(const QString &v)
 {
     if (m_deviceVersion == v) { return; }
     m_deviceVersion = v;
     emit changed();
-
-    // The main screen needs to know whether an update exists before the user
-    // ever opens the store panel, so the first time a device reports in, go
-    // fetch. Without this the button would have nothing to compare against.
-    if (!m_deviceVersion.trimmed().isEmpty()) {
-        const int i = installedIndex();
-        nikitaLog(QStringLiteral("firmware: device reports %1 -> %2")
-                 .arg(m_deviceVersion.trimmed(),
-                      i >= 0 ? m_sources.at(i).name : QStringLiteral("no matching source")));
-    }
-
-    if (!m_deviceVersion.trimmed().isEmpty() && !m_fetchedOnce) {
-        m_fetchedOnce = true;
-        refreshIfStale();
-    }
+    noteDeviceIdentity();
 }
 
 void FirmwareStore::setDeviceCommit(const QString &c)
@@ -8408,6 +8483,16 @@ void FirmwareStore::setDeviceCommit(const QString &c)
     if (m_deviceCommit == c) { return; }
     m_deviceCommit = c;
     emit changed();
+}
+
+void FirmwareStore::setDeviceOrigin(const QString &o)
+{
+    if (m_deviceOrigin == o) { return; }
+    m_deviceOrigin = o;
+    // installedIndex() reads this, and everything the panel shows about the
+    // running firmware is derived from that index.
+    emit changed();
+    noteDeviceIdentity();
 }
 
 void FirmwareStore::setDeviceChannel(const QString &c)
@@ -8691,17 +8776,34 @@ bool FirmwareStore::updateAvailable() const
     return channelSwitchPending();
 }
 
-// Each firmware stamps its version with a recognisable shape, so the running
-// build can be traced back to the source it came from without asking the device
-// anything extra. Unknown shapes fall through to Official, which is where a
-// plain "1.4.3" or a bare commit hash comes from.
+// Which source the running build came from.
+//
+// The device answers this itself -- device_info's firmware_origin_fork is the
+// firmware naming itself -- so that is asked first and trusted. It is the only
+// thing that is always right: Nikita builds report version "v8" locally and
+// "nkt-001" when released, and no version-shape rule covers both. Guessing
+// from the version used to land a Nikita device on "Official", which is the
+// one answer it can never be.
+//
+// The version-shape rules stay as the fallback, for the firmwares that do not
+// report a distinguishable origin (Xero reports "Official"; a device reached
+// before device_info has been read reports nothing at all).
 int FirmwareStore::installedIndex() const
 {
+    // Anything Nikita, however it is versioned, is Nikita.
+    if (m_deviceOrigin.compare(QLatin1String(Flipper::Updates::NIKITA_FIRMWARE_ORIGIN),
+                               Qt::CaseInsensitive) == 0) {
+        for (int i = 0; i < m_sources.size(); ++i) {
+            if (m_sources.at(i).name == QLatin1String("Nikita")) { return i; }
+        }
+    }
+
     const QString v = m_deviceVersion.trimmed();
     if (v.isEmpty()) { return -1; }
 
     QString want;
-    if (v.startsWith(QLatin1String("mntm"), Qt::CaseInsensitive))        { want = QStringLiteral("Momentum"); }
+    if (v.startsWith(QLatin1String("nkt-"), Qt::CaseInsensitive))        { want = QStringLiteral("Nikita"); }
+    else if (v.startsWith(QLatin1String("mntm"), Qt::CaseInsensitive))   { want = QStringLiteral("Momentum"); }
     else if (v.startsWith(QLatin1String("unlshd"), Qt::CaseInsensitive)) { want = QStringLiteral("Unleashed"); }
     // The feed publishes "RM0722-..." but the device answers "rm-420", so this
     // has to be case-insensitive or a RogueMaster Flipper is read as Official.

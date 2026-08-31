@@ -1312,11 +1312,25 @@ Item {
         }
     }
 
-    // Hand the running firmware version to the store so it can tell which row
-    // is the one already installed. Deliberately at root scope: this used to
-    // live inside the store overlay, which is only visible while the panel is
-    // open: one refactor of that Item into a Loader and the version would
-    // quietly stop arriving, taking the update check with it.
+    // Hand the running firmware to the store so it can tell which row is the one
+    // already installed. Deliberately at root scope: this used to live inside
+    // the store overlay, which is only visible while the panel is open: one
+    // refactor of that Item into a Loader and the version would quietly stop
+    // arriving, taking the update check with it.
+    //
+    // Origin is bound BEFORE version, and the order matters. The store settles
+    // the identity whenever either changes, and the version on its own cannot
+    // tell a fork from the official firmware -- Nikita reports "v8" locally and
+    // "nkt-001" when released, neither of which is distinguishable by shape.
+    // Binding version first made the panel read a Nikita device as "Official"
+    // until the origin caught up a moment later.
+    Binding {
+        target: Firmware
+        property: "deviceOrigin"
+        value: (Backend.deviceState && Backend.deviceState.info && Backend.deviceState.info.firmware)
+               ? Backend.deviceState.info.firmware.origin : ""
+    }
+
     Binding {
         target: Firmware
         property: "deviceVersion"
@@ -1386,12 +1400,17 @@ Item {
                     color: Theme.color.mediumorange4; font.family: "Share Tech Mono"; font.pixelSize: 12
                     // The version itself gets the same green it has on the main
                     // screen, so the two places agree at a glance.
+                    // Firmware.deviceLabel rather than the raw version: a
+                    // locally built Nikita reports "v8", which names nothing
+                    // and read here as if that were the firmware's name.
                     text: (Backend.deviceState && Backend.deviceState.info && Backend.deviceState.info.firmware)
                           ? ("Flipper Version : <font color=\"" + Theme.color.lightgreen + "\">"
                              + (Backend.deviceState.info.firmware.version === "unknown"
                                 && Backend.deviceState.info.firmware.commit.length > 0
                                 ? Backend.deviceState.info.firmware.commit
-                                : Backend.deviceState.info.firmware.version) + "</font>")
+                                : (Firmware.deviceLabel.length > 0
+                                   ? Firmware.deviceLabel
+                                   : Backend.deviceState.info.firmware.version)) + "</font>")
                           : "Connect your Flipper to flash. Latest builds are shown below."
                 }
 
