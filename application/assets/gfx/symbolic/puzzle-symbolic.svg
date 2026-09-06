@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="26"
+   height="26"
+   viewBox="0 0 26 26"
+   fill="none"
+   version="1.1"
+   id="svg-puzzle"
+   xmlns="http://www.w3.org/2000/svg">
+  <!-- The same jigsaw piece the iOS app uses on its Apps tab, so the two
+       clients name the same thing with the same shape: knob on top, knob on
+       the right, socket on the left.
+       That icon's artboard is 43x24 with the piece off to one side, so the
+       offset is baked into the coordinates below and the viewBox is left at the
+       plain 0 0 26 26 the other icons in this folder use.
+       Outline rather than a solid, to carry the same weight as the info,
+       wrench and file icons beside it, which are all line art. -->
+  <path
+     id="puzzle-piece"
+     d="M 18.8298 6.0 C 18.8298 6.4091 18.7597 6.8018 18.6307 7.1667 L 22.3298 7.1667 C 22.9742 7.1667 23.4965 7.689 23.4965 8.3333 V 12.0325 C 23.1316 11.9035 22.7389 11.8333 22.3298 11.8333 C 20.3968 11.8333 18.8298 13.4003 18.8298 15.3333 C 18.8298 17.2663 20.3968 18.8333 22.3298 18.8333 C 22.7389 18.8333 23.1316 18.7632 23.4965 18.6342 V 22.3333 C 23.4965 22.9777 22.9742 23.5 22.3298 23.5 H 8.3298 C 7.6855 23.5 7.1632 22.9777 7.1632 22.3333 V 18.6342 C 6.7983 18.7632 6.4056 18.8333 5.9965 18.8333 C 4.0635 18.8333 2.4965 17.2663 2.4965 15.3333 C 2.4965 13.4003 4.0635 11.8333 5.9965 11.8333 C 6.4056 11.8333 6.7983 11.9035 7.1632 12.0325 V 8.3333 C 7.1632 7.689 7.6855 7.1667 8.3298 7.1667 L 12.029 7.1667 C 11.9 6.8018 11.8298 6.4091 11.8298 6.0 C 11.8298 4.067 13.3968 2.5 15.3298 2.5 C 17.2628 2.5 18.8298 4.067 18.8298 6.0 Z"
+     fill="none"
+     stroke="#ffffff"
+     stroke-width="1.8"
+     stroke-linecap="round"
+     stroke-linejoin="round" />
+</svg>

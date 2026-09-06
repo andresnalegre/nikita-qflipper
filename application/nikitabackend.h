@@ -659,6 +659,12 @@ private:
     QString    m_lastTurnCost;     // "8m 36s · 4.8k tokens", frozen when the turn ends
     QTimer     m_turnTicker;
     QNetworkReply *m_currentReply = nullptr;
+    // Set by stopThinking() and cleared only when a NEW turn starts. Every
+    // point that would continue the current turn -- the next tool in the batch,
+    // the callback of the tool already in flight, the round that follows it --
+    // checks this. Aborting the HTTP reply alone stopped the model talking and
+    // left the machinery running.
+    bool m_turnAborted = false;
     // Set by stopThinking() right before it aborts/kills, so the finish
     // handler can tell "the user stopped this" apart from a genuine error.
     bool m_userStoppedThinking = false;
@@ -849,6 +855,157 @@ private:
     // for the whole machine, and four of them are fetched per refresh. Opening
     // the panel used to spend that budget every time.
     QDateTime m_lastFetch;
+};
+
+// Flipper's own app catalog, in the desktop app.
+//
+// The same source the phone app installs from (catalog.flipperzero.one), so an
+// app published there can be installed from here without going near a browser
+// or unzipping anything by hand.
+//
+// The catalog only publishes builds for the OFFICIAL firmware's SDKs and
+// rejects any request naming one it does not have -- which is every custom
+// firmware, this one included, since it runs ahead of the official release.
+// So the catalog is asked what it does serve and the newest of those is used;
+// see resolveApi(). The firmware accepts apps built one API generation back
+// for exactly this reason.
+class AppCatalog : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool open READ isOpen WRITE setOpen NOTIFY changed)
+    Q_PROPERTY(QVariantList apps READ apps NOTIFY changed)
+    Q_PROPERTY(bool busy READ busy NOTIFY changed)
+    Q_PROPERTY(QString status READ status NOTIFY changed)
+    Q_PROPERTY(QString output READ output NOTIFY changed)
+    Q_PROPERTY(QString query READ query WRITE setQuery NOTIFY changed)
+    // Categories with how many apps each holds, for the filter tiles, and
+    // which one is currently picked ("" = all).
+    Q_PROPERTY(QVariantList categories READ categories NOTIFY changed)
+    Q_PROPERTY(QString selectedCategory READ selectedCategory NOTIFY changed)
+    Q_PROPERTY(int totalCount READ totalCount NOTIFY changed)
+    // Installed / not installed, decided by walking /ext/apps on the card and
+    // matching "<alias>.fap" -- the name install() writes. Until that walk has
+    // finished once, installedKnown is false and the two filters are offered
+    // greyed rather than lying about a count.
+    Q_PROPERTY(int installFilter READ installFilter NOTIFY changed)
+    Q_PROPERTY(bool installedKnown READ installedKnown NOTIFY changed)
+    Q_PROPERTY(int installedCount READ installedCount NOTIFY changed)
+    Q_PROPERTY(int notInstalledCount READ notInstalledCount NOTIFY changed)
+    // Both come off the device; without them the catalog cannot be asked
+    // anything, so the panel says so rather than showing an empty list.
+    Q_PROPERTY(QString deviceTarget READ deviceTarget WRITE setDeviceTarget NOTIFY changed)
+    Q_PROPERTY(QString deviceApi READ deviceApi WRITE setDeviceApi NOTIFY changed)
+    Q_PROPERTY(QString resolvedApi READ resolvedApi NOTIFY changed)
+
+public:
+    explicit AppCatalog(QObject *parent = nullptr);
+
+    bool isOpen() const { return m_open; }
+    void setOpen(bool value);
+    QVariantList apps() const;
+    bool busy() const { return m_busy; }
+    QString status() const { return m_status; }
+    QString output() const { return m_output; }
+    QString query() const { return m_query; }
+    void setQuery(const QString &value);
+    QString deviceTarget() const { return m_deviceTarget; }
+    void setDeviceTarget(const QString &value);
+    QString deviceApi() const { return m_deviceApi; }
+    void setDeviceApi(const QString &value);
+    QString resolvedApi() const { return m_resolvedApi; }
+
+    QVariantList categories() const;
+    QString selectedCategory() const { return m_selectedCategory; }
+    int totalCount() const { return m_apps.size(); }
+
+    Q_INVOKABLE void selectCategory(const QString &name);
+    // 0 = every app, 1 = only what is on the card, 2 = only what is not.
+    Q_INVOKABLE void setInstallFilter(int mode);
+    Q_INVOKABLE void rescanInstalled();
+    // Launch an installed app on the device. Uses the path the scan actually
+    // found the .fap at, so an app sitting in a folder other than its catalog
+    // category still opens.
+    Q_INVOKABLE void launch(int index);
+    // Same launch, after the user has agreed to close whatever is running.
+    Q_INVOKABLE void launchClosingCurrent(int index);
+    // Delete the .fap from the card. Only ever the file this panel would have
+    // written: no folders, nothing it did not put there.
+    Q_INVOKABLE void uninstall(int index);
+    void setAppBackend(ApplicationBackend *backend) { m_appBackend = backend; }
+    int installFilter() const { return m_installFilter; }
+    bool installedKnown() const { return m_installedKnown; }
+    int installedCount() const;
+    int notInstalledCount() const;
+    Q_INVOKABLE void refresh();
+    void refreshIfNeeded();   // only if empty or aged out
+    Q_INVOKABLE void install(int index);
+    Q_INVOKABLE void clearOutput();
+
+signals:
+    void changed();
+    // Handed to the file manager, which already knows how to put a local file
+    // on the card. Nothing here re-implements the upload.
+    void readyToInstall(const QString &localFile, const QString &remoteDir);
+    // The device refused the launch because it already has an app open. The
+    // panel asks whether to close it; launchClosingCurrent() is the yes.
+    void launchNeedsAppClosed(int index, const QString &name);
+
+private:
+    struct App {
+        QString id;
+        QString name;
+        QString alias;
+        QString versionId;
+        QString categoryId;
+        QString category;
+        QString version;
+        QString description;
+        QString icon;       // 10x10 pixel-art PNG, served by the catalog
+        QString author;
+        int     downloads = 0;
+    };
+
+    void appendOutput(const QString &line);
+    void setBusy(bool value);
+    void setStatus(const QString &value);
+    // The catalogue is ~430 entries and changes rarely; keeping it on disk is
+    // what makes the panel open with a list already in it instead of a spinner.
+    QString cachePath() const;
+    void saveCache() const;
+    bool loadCache();
+    void resolveApi(std::function<void()> then);   // pick an API the catalog serves
+    void fetchCategories(std::function<void()> then);
+    void fetchApps();
+    // /ext/apps holds one folder per category; the walk lists the top level and
+    // then each folder it finds, so it costs one request per category and never
+    // touches the file manager's own path history.
+    void scanInstalled();
+    void sendAppStart(int index, bool closeCurrent);
+    void scanNextAppDir();
+    bool isInstalled(const App &a) const { return m_installedFaps.contains(a.alias + QStringLiteral(".fap")); }
+    QString installedPath(const App &a) const { return m_installedFaps.value(a.alias + QStringLiteral(".fap")); }
+
+    QNetworkAccessManager m_net;
+    QList<App> m_apps;
+    QHash<QString, QString> m_categories;      // id -> name
+    QHash<QString, QString> m_categoryIcons;   // name -> icon URL
+    bool m_open = false;
+    bool m_busy = false;
+    QString m_status;
+    QString m_output;
+    QString m_query;
+    QString m_selectedCategory;
+    QString m_deviceTarget;
+    QString m_deviceApi;
+    QString m_resolvedApi;
+    QDateTime m_fetchedAt;      // when the cached list was downloaded
+    QString m_cacheDeviceApi;   // the device API the cache was built for
+    ApplicationBackend *m_appBackend = nullptr;
+    QHash<QString, QString> m_installedFaps;   // ".fap" file name -> full path on the card
+    QStringList m_scanQueue;         // category folders still to list
+    bool m_scanning = false;
+    bool m_installedKnown = false;
+    int m_installFilter = 0;
 };
 
 class QSerialPort;

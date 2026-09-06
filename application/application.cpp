@@ -7,6 +7,9 @@
 #include <QDateTime>
 #include <QTranslator>
 #include <QQmlContext>
+#include <QNetworkDiskCache>
+#include <QNetworkAccessManager>
+#include <QStandardPaths>
 #include <QQuickWindow>
 #include <QFontDatabase>
 #include <QLoggingCategory>
@@ -145,6 +148,10 @@ void Application::onCurrentDeviceChanged()
             m_firmware.setDeviceCommit(st->deviceInfo().firmware.commit);
             m_firmware.setDeviceChannel(st->deviceInfo().firmware.channel);
             m_firmware.setDeviceDate(st->deviceInfo().firmware.date);
+            // The app catalog is keyed by hardware target and firmware API;
+            // without both it cannot ask for anything.
+            m_apps.setDeviceTarget(st->deviceInfo().hardware.target);
+            m_apps.setDeviceApi(st->deviceInfo().firmware.api);
             // The official picker is a persisted preference rather than something
             // the store owns, so it needs pointing at the running build on its
             // own. Same reason as the fork picker: opening on a channel the
@@ -168,6 +175,9 @@ void Application::initConnections()
 
     m_nikita.setAppBackend(&m_backend);
     m_cli.setAppBackend(&m_backend);
+    // The catalog reads /ext/apps to tell installed from not, so it needs the
+    // same device handle the assistant and the CLI panel use.
+    m_apps.setAppBackend(&m_backend);
     m_nikita.setCli(&m_cli);   // give the assistant access to the Flipper CLI (run_cli)
 
 #ifdef HZUI_BLE
@@ -252,6 +262,7 @@ void Application::initQmlTypes()
     qmlRegisterSingletonInstance("QFlipper", 1, 0, "Nikita", &m_nikita);
     qmlRegisterSingletonInstance("QFlipper", 1, 0, "Firmware", &m_firmware);
     qmlRegisterSingletonInstance("QFlipper", 1, 0, "Cli", &m_cli);
+    qmlRegisterSingletonInstance("QFlipper", 1, 0, "Apps", &m_apps);
 #ifdef HZUI_BLE
     qmlRegisterSingletonInstance("QFlipper", 1, 0, "Ble", &m_ble);
 #endif
@@ -261,6 +272,19 @@ void Application::initQmlTypes()
 
 void Application::initImports()
 {
+    // Give QML's networking a disk cache, so the app-catalog icons -- a few
+    // hundred small PNGs and SVGs fetched from the catalog -- are downloaded
+    // once and read from disk on every later launch, instead of being pulled
+    // again each time the Apps panel is opened.
+    {
+        auto *cache = new QNetworkDiskCache(&m_engine);
+        cache->setCacheDirectory(
+            QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
+            + QStringLiteral("/qml-network"));
+        cache->setMaximumCacheSize(64 * 1024 * 1024);
+        m_engine.networkAccessManager()->setCache(cache);
+    }
+
     m_engine.addImportPath(":/imports");
     m_engine.addImportPath(":/styles");
 }

@@ -161,7 +161,13 @@ void LegacyUpdateOperation::downloadRadioFirmware()
 void LegacyUpdateOperation::correctOptionBytes()
 {
     auto *file = m_helper->file(FirmwareHelper::FileIndex::OptionBytes);
-    registerSubOperation(m_recovery->fixOptionBytes(file));
+
+    if(file) {
+        registerSubOperation(m_recovery->fixOptionBytes(file));
+    } else {
+        // Fork bundle path has no ob.data reference; restore OS boot mode.
+        registerSubOperation(m_recovery->setOSBootMode());
+    }
 }
 
 void LegacyUpdateOperation::exitRecovery()

@@ -59,6 +59,10 @@ struct SoftwareInfo {
     // Nikita reports "v8", Xero reports a plain "1.4.2-xero.2" -- so anything
     // deciding "which firmware is this" reads this rather than guessing.
     Q_PROPERTY(QString origin MEMBER origin)
+    // The firmware's exported API version ("88.4"), as major.minor. Flipper's
+    // app catalog is keyed by it: a .fap is built against one API and the
+    // loader refuses anything too far from what the firmware exposes.
+    Q_PROPERTY(QString api MEMBER api)
     Q_PROPERTY(QDate date MEMBER date)
 
 public:
@@ -67,6 +71,7 @@ public:
     QString branch;
     QString channel;
     QString origin;
+    QString api;
     QDate date;
 
     // Needed in order to work with QVariant (+ operator== for Qt 6.7's moc).

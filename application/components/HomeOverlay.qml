@@ -31,6 +31,22 @@ AbstractOverlay {
 
     onDeviceInfoChanged: tabs.currentIndex = 0;
 
+    // One owner for the screen stream. The file manager and the app catalog
+    // both talk to the device over the same serial link, and a stream running
+    // underneath either of them is enough to kill an in-flight transfer -- so
+    // the stream is off for both, decided here rather than in each page, where
+    // "I am hidden now" turned into "start streaming" as one page handed over
+    // to the other.
+    readonly property bool streamWanted: overlay.visible &&
+                                         tabs.currentIndex !== fileManagerTab.TabBar.index &&
+                                         tabs.currentIndex !== appsTab.TabBar.index
+    onStreamWantedChanged: applyStreamState()
+    function applyStreamState() {
+        if(Backend.backendState === ApplicationBackend.Ready) {
+            Backend.screenStreamer.isEnabled = streamWanted;
+        }
+    }
+
     // Shown for a few seconds right after a cable becomes the active link. Only
     // a real transition counts: this stays false for a device that was on USB
     // from the start, which needs no announcement.
@@ -122,12 +138,13 @@ AbstractOverlay {
         anchors.topMargin: -2
 
         currentIndex: tabs.currentIndex
-        backgroundColor: Qt.rgba(0, 0, 0, fileManagerTab.checked)
+        backgroundColor: Qt.rgba(0, 0, 0, (fileManagerTab.checked || appsTab.checked) ? 1 : 0)
 
         items: [
             DeviceInfo { id: deviceInfoPane },
             DeviceActions { id: deviceActions },
             FileManager { id: fileManager; messageDialog: messageDialog; confirmationDialog: confirmationDialog; },
+            AppsPane { id: appsPane; confirmationDialog: confirmationDialog },
             DeveloperActions { id: developerActions }
         ]
     }
@@ -179,6 +196,24 @@ AbstractOverlay {
 
             ToolTip {
                 text: qsTr("File manager")
+                visible: parent.hovered
+            }
+        }
+
+        // The app catalog is a tab page of its own, in the same frame as the
+        // file manager -- it sits at this button's index in the TabPane above.
+        TabButton {
+            id: appsTab
+            enabled: Backend.deviceState && !Backend.deviceState.isRecoveryMode
+
+            icon.source: "qrc:/assets/gfx/symbolic/puzzle-symbolic.svg"
+            icon.width: 25
+            icon.height: 25
+
+            onClicked: tabs.currentIndex = appsTab.TabBar.index
+
+            ToolTip {
+                text: qsTr("Apps")
                 visible: parent.hovered
             }
         }
@@ -831,6 +866,7 @@ AbstractOverlay {
     }
 
     Component.onCompleted: {
+        applyStreamState();
         deviceActions.backupAction.triggered.connect(backupDevice);
         deviceActions.restoreAction.triggered.connect(restoreDevice);
         deviceActions.formatAction.triggered.connect(formatDevice);

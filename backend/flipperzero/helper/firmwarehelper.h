@@ -7,6 +7,7 @@
 #include "flipperupdates.h"
 
 class QFile;
+class TarZipArchive;
 
 namespace Flipper {
 namespace Zero {
@@ -23,7 +24,13 @@ class FirmwareHelper : public AbstractOperationHelper
         PreparingRadioFirmware,
         FetchingScripts,
         PreparingOptionBytes,
-        FetchingAssets
+        FetchingAssets,
+        // Fork path: the release publishes a single self-contained update_tgz
+        // (firmware.dfu + radio.bin + resources) instead of the separate
+        // full_dfu / core2_firmware_tgz / scripts_tgz / resources_tgz files the
+        // official channel serves. Fetch that one bundle and split it locally.
+        FetchingBundle,
+        ExtractingBundle
     };
 
 public:
@@ -34,7 +41,8 @@ public:
         ScriptsTgz,
         AssetsTgz,
         RadioFirmware,
-        OptionBytes
+        OptionBytes,
+        UpdateBundle
     };
 
     FirmwareHelper(DeviceState *deviceState, const Updates::VersionInfo &versionInfo, QObject *parent = nullptr);
@@ -53,14 +61,17 @@ private:
     void prepareOptionBytes();
     void fetchAssets();
 
+    void extractBundle();
+    bool writeExtractedFile(FileIndex index, const QByteArray &data);
+
     void fetchFile(FileIndex index, const Updates::FileInfo &fileInfo);
 
     DeviceState *m_deviceState;
     Updates::VersionInfo m_versionInfo;
     QMap<FileIndex, QFile*> m_files;
     bool m_hasRadioUpdate;
+    bool m_bundleMode;
 };
 
 }
 }
-

@@ -88,6 +88,7 @@ private:
     NikitaBackend m_nikita;
     FirmwareStore m_firmware;
     FlipperCli m_cli;
+    AppCatalog m_apps;
 #ifdef HZUI_BLE
     BleSpike m_ble;
 #endif

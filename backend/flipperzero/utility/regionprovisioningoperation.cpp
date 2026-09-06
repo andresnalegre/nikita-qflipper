@@ -137,7 +137,19 @@ void RegionProvisioningOperation::generateRegionData()
         return;
     }
 
-    const auto regionData = rpc()->pluginInstance()->regionBands(countryCode, bands);
+    // The protobuf plugin can fail to load in some packaged builds; calling
+    // through a null pluginInstance() segfaults mid-repair. Region provisioning
+    // only sets the sub-GHz region and is optional, so if the plugin is missing
+    // skip it gracefully and let the repair finish instead of crashing.
+    auto *plugin = rpc() ? rpc()->pluginInstance() : nullptr;
+    if(!plugin) {
+        qCDebug(CATEGORY_DEBUG) << "Protobuf plugin unavailable; skipping region provisioning";
+        m_regionDataFile->close();
+        finish();
+        return;
+    }
+
+    const auto regionData = plugin->regionBands(countryCode, bands);
 
     if(regionData.isEmpty()) {
         finishWithError(BackendError::UnknownError, QStringLiteral("Failed to encode region data"));

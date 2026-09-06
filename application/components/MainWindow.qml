@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Window 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Controls 2.15
+import QtQuick.Effects
 
 import Qt.labs.platform 1.1 as Pf
 
@@ -203,7 +204,10 @@ Item {
             id: portToggle
             anchors.top: mainContent.top
             anchors.left: mainContent.left
-            anchors.leftMargin: 195
+            // Just clear of the tab strip, which is four icons wide since the
+            // apps tab was added: at 195 the label ran under the last one, and
+            // much beyond this it drifts away from it.
+            anchors.leftMargin: 222
             anchors.topMargin: 36
 
             visible: mainWindow.homeVisible

@@ -73,11 +73,19 @@ ApplicationBackend::FirmwareUpdateState ApplicationBackend::firmwareUpdateState(
         return FirmwareUpdateState::ErrorOccured;
     }
 
-    const auto &latestVersion = m_firmwareUpdateRegistry->latestVersion();
-
-    if (device()->canRepair(latestVersion)) {
+    // A device in recovery (DFU) can always be repaired, and canRepair()
+    // ignores its version argument (it only checks isRecoveryMode()). Answer
+    // here, before touching the update registry's latestVersion(): a
+    // custom-firmware device (e.g. Nikita-V8) can leave the registry with no
+    // matching channel, and evaluating latestVersion() on that path crashed
+    // qFlipper the instant a DFU device was detected. Repair does not need it.
+    if (device()->canRepair(Updates::VersionInfo())) {
         return FirmwareUpdateState::CanRepair;
-    } else if(device()->canUpdate(latestVersion)) {
+    }
+
+    const auto latestVersion = m_firmwareUpdateRegistry->latestVersion();
+
+    if(device()->canUpdate(latestVersion)) {
         return FirmwareUpdateState::CanUpdate;
     } else if(device()->canInstall(latestVersion)) {
         return FirmwareUpdateState::CanInstall;

@@ -50,10 +50,12 @@ Item {
         selectedList = a;
     }
 
+    // The screen stream is not this page's call any more -- HomeOverlay owns it
+    // for every tab that shares the serial link. Deciding it here meant that
+    // leaving the file manager for the app catalog switched streaming back on,
+    // and the stream then fought an app install for the same wire: the upload
+    // landed and the RPC session died on the very next request.
     onVisibleChanged: {
-        if(Backend.backendState === ApplicationBackend.Ready) {
-            Backend.screenStreamer.isEnabled = !visible
-        }
         if(visible) {
             fileView.forceActiveFocus();
         }

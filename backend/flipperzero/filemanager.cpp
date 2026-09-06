@@ -172,7 +172,22 @@ void FileManager::upload(const QList<QUrl> &urlList)
 
 void FileManager::uploadTo(const QString &remoteDirName, const QList<QUrl> &urlList)
 {
-    pushd(remoteDirName);
+    // The history holds one path SEGMENT per entry, so an absolute destination
+    // cannot be pushed whole: { "", "/ext/apps/Games" } joins to
+    // "//ext/apps/Games". The firmware writes to that path happily enough, but
+    // the Storage List that follows the upload takes its storage service down
+    // and the USB link goes with it -- an install that reached the card still
+    // ended on the error screen. Pushing it whole was also relative to wherever
+    // the file manager happened to be, so the same call from /ext/nikita aimed
+    // at "/nikita/ext/apps/Games".
+    if(remoteDirName.startsWith(QLatin1Char('/'))) {
+        m_forwardHistory.clear();
+        m_history = QStringList{QString()};
+        m_history.append(remoteDirName.split(QLatin1Char('/'), Qt::SkipEmptyParts));
+    } else {
+        pushd(remoteDirName);
+    }
+
     upload(urlList);
 }
 

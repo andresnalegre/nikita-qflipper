@@ -108,7 +108,16 @@ void FullRepairOperation::downloadFirmware()
 void FullRepairOperation::correctOptionBytes()
 {
     auto *file = m_helper->file(FirmwareHelper::FileIndex::OptionBytes);
-    registerSubOperation(m_recovery->fixOptionBytes(file));
+
+    if(file) {
+        registerSubOperation(m_recovery->fixOptionBytes(file));
+    } else {
+        // Fork bundle path: update_tgz ships no ob.data option-bytes reference.
+        // Restore OS boot mode directly (nBOOT0/nSWBOOT0) -- that is the bit a
+        // recovered device needs so it boots from flash instead of dropping
+        // back into DFU, which is exactly what left it stuck "only in DFU mode".
+        registerSubOperation(m_recovery->setOSBootMode());
+    }
 }
 
 void FullRepairOperation::downloadAssets()
@@ -119,6 +128,16 @@ void FullRepairOperation::downloadAssets()
     }
 
     auto *file = m_helper->file(FirmwareHelper::FileIndex::AssetsTgz);
+
+    if(!file) {
+        // Bundle path: the release ships resources in the firmware's own .ths
+        // format (applied by the on-device updater), not a qFlipper assets tgz,
+        // so there is nothing to upload here. The device already booted the new
+        // firmware; skip cleanly instead of failing on an uncompress error.
+        advanceOperationState();
+        return;
+    }
+
     registerSubOperation(m_utility->downloadAssets(file));
 }
 

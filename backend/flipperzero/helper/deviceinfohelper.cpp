@@ -194,6 +194,9 @@ void VCPDeviceInfoHelper::fetchDeviceInfoLegacy()
             branchToChannelName(operation->value(QByteArrayLiteral("firmware_branch")),
                                 operation->value(QByteArrayLiteral("firmware_version"))),
             operation->value(QByteArrayLiteral("firmware_origin_fork")),
+            QStringLiteral("%1.%2").arg(
+                QString::fromLatin1(operation->value(QByteArrayLiteral("firmware_api_major"))),
+                QString::fromLatin1(operation->value(QByteArrayLiteral("firmware_api_minor")))),
             QDateTime::fromString(operation->value(QByteArrayLiteral("firmware_build_date")), "dd-MM-yyyy").date()
         };
 
@@ -262,6 +265,9 @@ void VCPDeviceInfoHelper::fetchDeviceInfoProperty()
             branchToChannelName(operation->value(QByteArrayLiteral("firmware.branch.name")),
                                 operation->value(QByteArrayLiteral("firmware.version"))),
             operation->value(QByteArrayLiteral("firmware.origin.fork")),
+            QStringLiteral("%1.%2").arg(
+                QString::fromLatin1(operation->value(QByteArrayLiteral("firmware.api.major"))),
+                QString::fromLatin1(operation->value(QByteArrayLiteral("firmware.api.minor")))),
             QDateTime::fromString(operation->value(QByteArrayLiteral("firmware.build.date")), "dd-MM-yyyy").date()
         };
 

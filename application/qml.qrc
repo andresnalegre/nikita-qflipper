@@ -97,6 +97,8 @@
         <file>assets/icons/qFlipper.ico</file>
         <file>assets/icons/qFlipper.png</file>
         <file>assets/gfx/symbolic/file-symbolic.svg</file>
+        <file>assets/gfx/symbolic/puzzle-symbolic.svg</file>
+        <file>components/AppsPane.qml</file>
         <file>components/FileManager.qml</file>
         <file>components/FileManagerDelegate.qml</file>
         <file>assets/gfx/symbolic/arrow-back-small.svg</file>

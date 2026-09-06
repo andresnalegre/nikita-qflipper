@@ -3555,6 +3555,8 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
         return;
     }
     m_deviceContext = deviceContext;
+    // A new turn is the only thing that lifts a stop.
+    m_turnAborted = false;
     m_toolRounds = 0;
     // Prose the model emits ALONGSIDE a tool call, accumulated across every
     // round of this turn. dispatchTurn() wipes m_streamContent at the top of
@@ -3700,11 +3702,59 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
 // process triggers the SAME finish handler a normal completion would, and
 // m_userStoppedThinking is what tells that handler this was a stop, not a
 // failure, so there is exactly one place that decides what the chat sees.
+// STOP means stop -- the Ctrl-C reading, not "stop talking".
+//
+// Aborting m_currentReply only ended the HTTP request. A tool already in
+// flight kept running, and when it returned its callback walked on to the next
+// tool in the batch and then asked the model for another round, so a turn
+// stopped during a slow tool carried on for minutes with the button apparently
+// doing nothing. The flag below is what every continuation point now checks;
+// the abort is just the fastest way to end the one thing that can be ended
+// from outside.
+//
+// The turn is dropped, not unwound: whatever a running tool already did to the
+// device stays done. There is no undo for a signal that has been sent.
 void NikitaBackend::stopThinking()
 {
     if (!m_thinking) { return; }
+
+    m_turnAborted = true;
     m_userStoppedThinking = true;
+
+    const bool hadReply = (m_currentReply != nullptr);
     if (m_currentReply) { m_currentReply->abort(); }
+
+    // Anything typed while the turn ran was queued to run after it. The user
+    // just said no to the turn; running its queue next would be the opposite
+    // of what the button means.
+    if (!m_queued.isEmpty()) { m_queued.clear(); emit queuedChanged(); }
+
+    // Close the row of whichever tool was showing as running, so the trail does
+    // not keep a step spinning that nobody is waiting for any more.
+    if (m_activeToolSeq > 0) {
+        emit toolActivity(m_activeToolSeq, QStringLiteral("stopped"),
+                          QString(), true, true);
+        m_activeToolSeq = 0;
+    }
+
+    // Immediately, rather than when the aborted request happens to report back:
+    // the button has to answer the click, and a turn that is over should not
+    // still be drawing a STOP.
+    setTurnStatus(QString());
+    setThinking(false);
+    nikitaLogAs(assistantName(), QStringLiteral("stopped by the user"));
+
+    // Who says so depends on what was running. An aborted request comes back
+    // through onStreamFinished(), which keeps whatever prose had already
+    // streamed and says "Stopped." only when there was none -- better than
+    // anything that can be decided here. With no request in flight, though --
+    // stopped while a tool was working, which is the case the button was
+    // failing at -- nothing else is coming, so this is the only place that can
+    // close the turn on screen.
+    if (!hadReply) {
+        m_userStoppedThinking = false;
+        emit errorOccurred(QStringLiteral("Stopped."));
+    }
 }
 
 void NikitaBackend::redispatch()
@@ -3883,6 +3933,10 @@ QJsonObject NikitaBackend::normaliseApiReply(const QJsonObject &resp)
 
 void NikitaBackend::dispatchTurn()
 {
+    // A stopped turn asks for nothing more. Cheapest possible guard, and it
+    // covers every caller: the tool loop, the retries, and redispatch().
+    if (m_turnAborted) { return; }
+
     // Re-read the cache before every request. m_memory is only a copy, and the
     // file underneath it can move for reasons this object never sees; paying a
     // small file read per turn is cheaper than shipping a stale fact list.
@@ -5257,6 +5311,10 @@ void NikitaBackend::appendContinuationNudge()
 
 void NikitaBackend::runToolCalls(const QJsonArray &toolCalls, int index)
 {
+    // The batch is abandoned where it stands. Tools already run keep their
+    // results in the history; the ones never reached are answered at the wire
+    // boundary by toOpenAiMessages(), so the next message is still well formed.
+    if (m_turnAborted) { return; }
     if (index == 0 && !toolCalls.isEmpty()) { setTurnStatus(QStringLiteral("getting to work")); }
     if (index >= toolCalls.size()) {
         // A small model treats one successful tool as the whole job done. Asked
@@ -5332,6 +5390,10 @@ void NikitaBackend::runToolCalls(const QJsonArray &toolCalls, int index)
                       nikitaToolDetail(name, args), false, false);
 
     runOneTool(name, args, [this, toolCalls, index, name, args](const QString &result) {
+        // The tool could not be called off, but its result no longer leads
+        // anywhere: no next tool, and no round asking the model what to do with
+        // it. This is the check that actually makes STOP feel like STOP.
+        if (m_turnAborted) { return; }
         // Remember if a tool failed this turn. Small models cheerfully report
         // "Created folder /sdcard/MARIO" even when make_dir came back with
         // {"error":"No such path..."} -- the tool did the right thing and
@@ -14286,4 +14348,744 @@ void FlipperCli::setActive(bool v)
 void FlipperCli::setStatus(const QString &s)
 {
     if (m_status != s) { m_status = s; emit statusChanged(); }
+}
+// ============================ AppCatalog ============================
+
+// Where the apps come from. The same catalog the phone app uses.
+static const char *APP_CATALOG_BASE = "https://catalog.flipperzero.one/api/v0";
+
+AppCatalog::AppCatalog(QObject *parent)
+    : QObject(parent)
+{
+    m_net.setRedirectPolicy(QNetworkRequest::NoLessSafeRedirectPolicy);
+    // Load before anything asks: the panel should open with a list in it.
+    loadCache();
+}
+
+// Where the catalogue is kept between runs.
+QString AppCatalog::cachePath() const
+{
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dir);
+    return dir + QStringLiteral("/appcatalog.json");
+}
+
+void AppCatalog::saveCache() const
+{
+    QJsonArray apps;
+    for (const App &a : m_apps) {
+        QJsonObject o;
+        o.insert(QStringLiteral("id"), a.id);
+        o.insert(QStringLiteral("name"), a.name);
+        o.insert(QStringLiteral("alias"), a.alias);
+        o.insert(QStringLiteral("versionId"), a.versionId);
+        o.insert(QStringLiteral("category"), a.category);
+        o.insert(QStringLiteral("version"), a.version);
+        o.insert(QStringLiteral("description"), a.description);
+        o.insert(QStringLiteral("icon"), a.icon);
+        o.insert(QStringLiteral("author"), a.author);
+        o.insert(QStringLiteral("downloads"), a.downloads);
+        apps.append(o);
+    }
+
+    QJsonObject icons;
+    for (auto it = m_categoryIcons.constBegin(); it != m_categoryIcons.constEnd(); ++it) {
+        icons.insert(it.key(), it.value());
+    }
+
+    QJsonObject root;
+    root.insert(QStringLiteral("fetchedAt"), QDateTime::currentSecsSinceEpoch());
+    root.insert(QStringLiteral("target"), m_deviceTarget);
+    root.insert(QStringLiteral("api"), m_resolvedApi);
+    // What the device was reporting when this was built, so a cache made for a
+    // different firmware is not reused as though it still applied.
+    root.insert(QStringLiteral("deviceApi"), m_deviceApi);
+    root.insert(QStringLiteral("apps"), apps);
+    root.insert(QStringLiteral("categoryIcons"), icons);
+
+    QFile f(cachePath());
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) { return; }
+    f.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+}
+
+bool AppCatalog::loadCache()
+{
+    QFile f(cachePath());
+    if (!f.open(QIODevice::ReadOnly)) { return false; }
+
+    const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+    const QJsonArray apps = root.value(QStringLiteral("apps")).toArray();
+    if (apps.isEmpty()) { return false; }
+
+    m_apps.clear();
+    for (const QJsonValue &v : apps) {
+        const QJsonObject o = v.toObject();
+        App a;
+        a.id = o.value(QStringLiteral("id")).toString();
+        a.name = o.value(QStringLiteral("name")).toString();
+        a.alias = o.value(QStringLiteral("alias")).toString();
+        a.versionId = o.value(QStringLiteral("versionId")).toString();
+        a.category = o.value(QStringLiteral("category")).toString();
+        a.version = o.value(QStringLiteral("version")).toString();
+        a.description = o.value(QStringLiteral("description")).toString();
+        a.icon = o.value(QStringLiteral("icon")).toString();
+        a.author = o.value(QStringLiteral("author")).toString();
+        a.downloads = o.value(QStringLiteral("downloads")).toInt();
+        if (!a.name.isEmpty()) { m_apps.append(a); }
+    }
+
+    const QJsonObject icons = root.value(QStringLiteral("categoryIcons")).toObject();
+    for (auto it = icons.constBegin(); it != icons.constEnd(); ++it) {
+        m_categoryIcons.insert(it.key(), it.value().toString());
+    }
+
+    m_resolvedApi = root.value(QStringLiteral("api")).toString();
+    m_cacheDeviceApi = root.value(QStringLiteral("deviceApi")).toString();
+    m_fetchedAt = QDateTime::fromSecsSinceEpoch(
+        root.value(QStringLiteral("fetchedAt")).toVariant().toLongLong());
+
+    setStatus(QStringLiteral("%1 apps").arg(m_apps.size()));
+    return !m_apps.isEmpty();
+}
+
+void AppCatalog::setOpen(bool value)
+{
+    if (value == m_open) { return; }
+    m_open = value;
+    emit changed();
+    // Opens with whatever is cached, always. The fetch already happened when
+    // the device reported in; this is only a backstop for the case where that
+    // never ran (no device seen yet this session).
+    if (m_open) { refreshIfNeeded(); scanInstalled(); }
+}
+
+void AppCatalog::setQuery(const QString &value)
+{
+    if (m_query == value) { return; }
+    m_query = value;
+    emit changed();
+}
+
+void AppCatalog::setDeviceTarget(const QString &value)
+{
+    if (m_deviceTarget == value) { return; }
+    m_deviceTarget = value;
+    emit changed();
+}
+
+void AppCatalog::setDeviceApi(const QString &value)
+{
+    if (m_deviceApi == value) { return; }
+    m_deviceApi = value;
+    // Only drop the resolved API when the device is genuinely reporting
+    // something else. Clearing it unconditionally blanked the header on every
+    // connect, because the cache had just supplied a perfectly good value.
+    if (value != m_cacheDeviceApi) { m_resolvedApi.clear(); }
+    emit changed();
+
+    // Load now, not when the panel is first opened. The device reporting in is
+    // the earliest moment the catalogue can be asked anything, and doing it
+    // here means the panel is already populated whenever it is opened --
+    // there is no first-open wait to sit through.
+    if (!m_deviceApi.isEmpty()) { refreshIfNeeded(); }
+}
+
+// Fetch only when there is nothing cached, or what is cached has aged out.
+// Everything else opens straight from disk.
+void AppCatalog::refreshIfNeeded()
+{
+    if (m_busy) { return; }
+
+    static const qint64 maxAgeSecs = 24 * 60 * 60;
+    const bool stale = !m_fetchedAt.isValid()
+        || m_fetchedAt.secsTo(QDateTime::currentDateTime()) > maxAgeSecs;
+
+    if (m_apps.isEmpty() || stale) { refresh(); return; }
+
+    // The list is current, but the API it is served under is resolved again
+    // every time rather than trusted from the cache. install() builds its
+    // download URL from it, so a stale pick is not a cosmetic problem: it
+    // silently fetches every app for the wrong firmware generation, and the
+    // Flipper refuses them one by one with "App Too Old". The SDK list is a
+    // few dozen lines and the catalog does publish new ones.
+    m_resolvedApi.clear();
+    resolveApi([this]() {
+        m_cacheDeviceApi = m_deviceApi;
+        saveCache();
+        emit changed();
+    });
+}
+
+void AppCatalog::setBusy(bool value)
+{
+    if (m_busy == value) { return; }
+    m_busy = value;
+    emit changed();
+}
+
+void AppCatalog::setStatus(const QString &value)
+{
+    if (m_status == value) { return; }
+    m_status = value;
+    emit changed();
+}
+
+void AppCatalog::clearOutput()
+{
+    m_output.clear();
+    emit changed();
+}
+
+void AppCatalog::appendOutput(const QString &line)
+{
+    m_output += line + QLatin1Char('\n');
+    emit changed();
+}
+
+QVariantList AppCatalog::apps() const
+{
+    QVariantList out;
+    for (int i = 0; i < m_apps.size(); ++i) {
+        const App &a = m_apps.at(i);
+        // The index carried here is into the FULL list, so install(index)
+        // stays correct however the view is filtered.
+        if (!m_selectedCategory.isEmpty() && a.category != m_selectedCategory) { continue; }
+        // The installed/not-installed split only filters once the card has
+        // actually been read; before that every app passes, so an unscanned
+        // device shows the catalogue rather than an empty list.
+        if (m_installedKnown && m_installFilter != 0) {
+            const bool on = isInstalled(a);
+            if (m_installFilter == 1 && !on) { continue; }
+            if (m_installFilter == 2 && on) { continue; }
+        }
+        QVariantMap m;
+        m.insert(QStringLiteral("index"), i);
+        m.insert(QStringLiteral("installed"), isInstalled(a));
+        m.insert(QStringLiteral("name"), a.name);
+        m.insert(QStringLiteral("alias"), a.alias);
+        m.insert(QStringLiteral("category"), a.category);
+        m.insert(QStringLiteral("version"), a.version);
+        m.insert(QStringLiteral("description"), a.description);
+        m.insert(QStringLiteral("icon"), a.icon);
+        m.insert(QStringLiteral("author"), a.author);
+        m.insert(QStringLiteral("downloads"), a.downloads);
+        out.append(m);
+    }
+    return out;
+}
+
+// The filter tiles: every category that actually has apps, with its count.
+// Counted from what was fetched rather than asked for separately -- the whole
+// catalogue for this target arrives in one response, so the numbers are exact
+// and cost nothing.
+QVariantList AppCatalog::categories() const
+{
+    QMap<QString, int> counts;   // QMap so the tiles come out alphabetical
+    for (const App &a : m_apps) {
+        if (a.category.isEmpty()) { continue; }
+        counts[a.category] += 1;
+    }
+
+    QVariantList out;
+    for (auto it = counts.constBegin(); it != counts.constEnd(); ++it) {
+        QVariantMap m;
+        m.insert(QStringLiteral("name"), it.key());
+        m.insert(QStringLiteral("count"), it.value());
+        m.insert(QStringLiteral("icon"), m_categoryIcons.value(it.key()));
+        m.insert(QStringLiteral("selected"), it.key() == m_selectedCategory);
+        out.append(m);
+    }
+    return out;
+}
+
+// Picking the category already showing clears it, so the tiles double as their
+// own "show everything" without needing a separate control.
+void AppCatalog::selectCategory(const QString &name)
+{
+    const QString next = (m_selectedCategory == name) ? QString() : name;
+    if (next == m_selectedCategory) { return; }
+    m_selectedCategory = next;
+    emit changed();
+}
+
+void AppCatalog::setInstallFilter(int mode)
+{
+    if (mode < 0 || mode > 2) { return; }
+    if (mode == m_installFilter) { return; }
+    m_installFilter = mode;
+    emit changed();
+    // Asking for either half is also the moment to make sure the answer is
+    // current: apps come and go on the card outside this panel.
+    if (m_installFilter != 0) { scanInstalled(); }
+}
+
+int AppCatalog::installedCount() const
+{
+    int n = 0;
+    for (const App &a : m_apps) { if (isInstalled(a)) { ++n; } }
+    return n;
+}
+
+int AppCatalog::notInstalledCount() const
+{
+    return m_apps.size() - installedCount();
+}
+
+// The Loader's own AppStart, the same request the CLI's "loader open" ends up
+// making. Nothing here presses buttons: the Flipper switches to the app
+// wherever it happens to be, and a locked device still obeys.
+void AppCatalog::launch(int index)
+{
+    if (index < 0 || index >= m_apps.size()) { return; }
+    const App &a = m_apps.at(index);
+
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    const bool ready = m_appBackend && dev &&
+                       m_appBackend->backendState() == ApplicationBackend::BackendState::Ready;
+    if (!ready) {
+        setStatus(QStringLiteral("No Flipper connected"));
+        appendOutput(QStringLiteral("! %1: no device").arg(a.name));
+        return;
+    }
+
+    const QString path = installedPath(a);
+    if (path.isEmpty()) {
+        setStatus(QStringLiteral("%1 is not on the card").arg(a.name));
+        return;
+    }
+
+    sendAppStart(index, false);
+}
+
+void AppCatalog::launchClosingCurrent(int index)
+{
+    sendAppStart(index, true);
+}
+
+void AppCatalog::sendAppStart(int index, bool closeCurrent)
+{
+    if (index < 0 || index >= m_apps.size()) { return; }
+    const App &a = m_apps.at(index);
+
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    const bool ready = m_appBackend && dev &&
+                       m_appBackend->backendState() == ApplicationBackend::BackendState::Ready;
+    if (!ready) { return; }
+
+    const QString path = installedPath(a);
+    if (path.isEmpty()) { return; }
+
+    const auto start = [this, dev, index, path, name = a.name]() {
+        // The reply is not waited on for the success case: the Loader answers
+        // an AppStart only once the app is done starting, and an app that puts
+        // a dialog of its own on screen first leaves the request outstanding
+        // until somebody presses a button on the device.
+        setStatus(QStringLiteral("Opened %1 -- check the Flipper").arg(name));
+        auto *op = dev->rpc()->appStart(path.toUtf8());
+        connect(op, &AbstractOperation::finished, this, [this, op, index, name]() {
+            if (!op->isError()) { return; }
+            qCInfo(LOG_NIKITA) << "app start" << name << "reply:" << op->errorString();
+            // The device says something else already has the screen. That is a
+            // question for the user, not a failure to report at them.
+            if (op->errorString().contains(QStringLiteral("already running"))) {
+                setStatus(QString());
+                emit launchNeedsAppClosed(index, name);
+            }
+        });
+    };
+
+    if (!closeCurrent) { start(); return; }
+
+    setStatus(QStringLiteral("Closing the running app..."));
+    auto *exitOp = dev->rpc()->appExit();
+    connect(exitOp, &AbstractOperation::finished, this, [this, exitOp, start, name = a.name]() {
+        if (exitOp->isError()) {
+            setStatus(QStringLiteral("Could not close the running app"));
+            appendOutput(QStringLiteral("! %1: %2").arg(name, exitOp->errorString()));
+            return;
+        }
+        start();
+    });
+}
+
+void AppCatalog::uninstall(int index)
+{
+    if (index < 0 || index >= m_apps.size()) { return; }
+    const App &a = m_apps.at(index);
+
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    const bool ready = m_appBackend && dev &&
+                       m_appBackend->backendState() == ApplicationBackend::BackendState::Ready;
+    if (!ready) {
+        setStatus(QStringLiteral("No Flipper connected"));
+        return;
+    }
+
+    const QString path = installedPath(a);
+    // Only a .fap, and only one the scan actually found. Never recursive: this
+    // removes a file the panel installed, and nothing else on the card is any
+    // of its business.
+    if (path.isEmpty() || !path.endsWith(QStringLiteral(".fap"))) {
+        setStatus(QStringLiteral("%1 is not on the card").arg(a.name));
+        return;
+    }
+
+    setStatus(QStringLiteral("Removing %1...").arg(a.name));
+    auto *op = dev->rpc()->storageRemove(path.toUtf8(), false);
+    connect(op, &AbstractOperation::finished, this,
+            [this, op, name = a.name, key = a.alias + QStringLiteral(".fap")]() {
+        if (op->isError()) {
+            setStatus(QStringLiteral("Could not remove %1").arg(name));
+            appendOutput(QStringLiteral("! %1: %2").arg(name, op->errorString()));
+            return;
+        }
+        m_installedFaps.remove(key);
+        setStatus(QStringLiteral("Removed %1").arg(name));
+        emit changed();
+    });
+}
+
+void AppCatalog::rescanInstalled()
+{
+    m_installedKnown = false;
+    scanInstalled();
+}
+
+// Walk /ext/apps: list the top level, then each category folder it holds. One
+// request per folder, on the same RPC session the rest of the app uses, and
+// deliberately NOT through FileManager -- that would drag the user's file
+// browser to a different directory as a side effect of opening this panel.
+void AppCatalog::scanInstalled()
+{
+    if (m_scanning) { return; }
+
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    const bool ready = m_appBackend && dev &&
+                       m_appBackend->backendState() == ApplicationBackend::BackendState::Ready;
+    if (!ready) { return; }
+
+    m_scanning = true;
+    m_installedFaps.clear();
+    m_scanQueue.clear();
+
+    auto *op = dev->rpc()->storageList(QByteArrayLiteral("/ext/apps"));
+    connect(op, &AbstractOperation::finished, this, [this, op]() {
+        if (!op->isError()) {
+            for (const FileInfo &f : op->files()) {
+                const QString name = QString::fromUtf8(f.name);
+                if (f.type == FileType::Directory) {
+                    m_scanQueue.append(name);
+                } else if (name.endsWith(QStringLiteral(".fap"))) {
+                    m_installedFaps.insert(name, QStringLiteral("/ext/apps/") + name);
+                }
+            }
+        }
+        scanNextAppDir();
+    });
+}
+
+void AppCatalog::scanNextAppDir()
+{
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (m_scanQueue.isEmpty() || !dev) {
+        m_scanning = false;
+        m_installedKnown = true;
+        emit changed();
+        return;
+    }
+
+    const QString dir = QStringLiteral("/ext/apps/") + m_scanQueue.takeFirst();
+    auto *op = dev->rpc()->storageList(dir.toUtf8());
+    connect(op, &AbstractOperation::finished, this, [this, op, dir]() {
+        if (!op->isError()) {
+            for (const FileInfo &f : op->files()) {
+                const QString name = QString::fromUtf8(f.name);
+                if (f.type != FileType::Directory && name.endsWith(QStringLiteral(".fap"))) {
+                    m_installedFaps.insert(name, dir + QLatin1Char('/') + name);
+                }
+            }
+        }
+        scanNextAppDir();
+    });
+}
+
+// Which API version to ask the catalog about.
+//
+// The device's own if the catalog serves it, otherwise the newest it does.
+// Everything else here depends on this, so it runs first and hands control on
+// through `then` rather than returning.
+void AppCatalog::resolveApi(std::function<void()> then)
+{
+    if (!m_resolvedApi.isEmpty()) { then(); return; }
+
+    QNetworkRequest req(QUrl(QString::fromLatin1(APP_CATALOG_BASE) + QStringLiteral("/0/sdk")));
+    auto *reply = m_net.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, then]() {
+        reply->deleteLater();
+        const QString target = m_deviceTarget.isEmpty() ? QStringLiteral("f7") : m_deviceTarget;
+
+        if (reply->error() != QNetworkReply::NoError) {
+            appendOutput(QStringLiteral("! sdk list: %1").arg(reply->errorString()));
+            m_resolvedApi = m_deviceApi;    // try the device's own and let it fail loudly
+            then();
+            return;
+        }
+
+        // What the Flipper's loader actually checks before running a .fap is
+        // the API MAJOR: it must equal the firmware's, and the app's minor must
+        // not be ahead of it. Anything else gets "App Too Old" / "App Too New"
+        // on the device.
+        //
+        // This used to take the catalog's own is_latest_release instead, which
+        // is the SDK of the current OFFICIAL firmware. On a device running
+        // ahead of that release -- this one, API 88, against a catalog whose
+        // release SDK is 87.1 -- that handed back 87 builds for every single
+        // app, and the firmware met every one of them with "App Too Old". The
+        // catalog serves 88.2; it was simply never being asked for it.
+        const auto parseApi = [](const QString &api, int *major, int *minor) {
+            const QStringList parts = api.split(QLatin1Char('.'));
+            if (parts.size() != 2) { return false; }
+            bool okMajor = false, okMinor = false;
+            *major = parts.at(0).toInt(&okMajor);
+            *minor = parts.at(1).toInt(&okMinor);
+            return okMajor && okMinor;
+        };
+
+        int devMajor = -1, devMinor = -1;
+        const bool devKnown = parseApi(m_deviceApi, &devMajor, &devMinor);
+
+        const QJsonArray sdks = QJsonDocument::fromJson(reply->readAll()).array();
+        QString fit;                       // same major, minor <= the device's
+        int fitMinor = -1;
+        QString fallback;                  // best of the rest, highest first
+        int fbMajor = -1, fbMinor = -1;
+        bool deviceServed = false;
+
+        for (const QJsonValue &v : sdks) {
+            const QJsonObject o = v.toObject();
+            if (o.value(QStringLiteral("target")).toString() != target) { continue; }
+            const QString api = o.value(QStringLiteral("api")).toString();
+            if (api == m_deviceApi) { deviceServed = true; }
+
+            int major = -1, minor = -1;
+            if (!parseApi(api, &major, &minor)) { continue; }
+
+            if (devKnown && major == devMajor && minor <= devMinor && minor > fitMinor) {
+                fit = api;
+                fitMinor = minor;
+            }
+            if (major > fbMajor || (major == fbMajor && minor > fbMinor)) {
+                fbMajor = major; fbMinor = minor;
+                fallback = api;
+            }
+        }
+
+        if (deviceServed) {
+            m_resolvedApi = m_deviceApi;
+        } else if (!fit.isEmpty()) {
+            m_resolvedApi = fit;
+        } else if (!fallback.isEmpty()) {
+            // No build for this firmware's generation at all. The apps will
+            // still install and the device will still warn -- say why.
+            m_resolvedApi = fallback;
+            appendOutput(QStringLiteral(
+                "> catalog serves no SDK %1 for %2 -- using %3, so the Flipper "
+                "will warn that apps are too old")
+                .arg(m_deviceApi.isEmpty() ? QStringLiteral("(unknown)") : m_deviceApi,
+                     target, fallback));
+        } else {
+            m_resolvedApi = m_deviceApi;
+        }
+
+        qCInfo(LOG_NIKITA) << "app catalog: device API" << m_deviceApi
+                           << "target" << target << "-> using SDK" << m_resolvedApi;
+        emit changed();
+        then();
+    });
+}
+
+void AppCatalog::fetchCategories(std::function<void()> then)
+{
+    if (!m_categories.isEmpty()) { then(); return; }
+
+    QNetworkRequest req(QUrl(QString::fromLatin1(APP_CATALOG_BASE)
+                             + QStringLiteral("/0/category?limit=100")));
+    auto *reply = m_net.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, then]() {
+        reply->deleteLater();
+        if (reply->error() == QNetworkReply::NoError) {
+            const QJsonArray cats = QJsonDocument::fromJson(reply->readAll()).array();
+            for (const QJsonValue &v : cats) {
+                const QJsonObject o = v.toObject();
+                const QString name = o.value(QStringLiteral("name")).toString();
+                m_categories.insert(o.value(QStringLiteral("_id")).toString(), name);
+                // 24x24 SVGs, filled black like the app icons -- recoloured
+                // white in the tile for the same reason.
+                m_categoryIcons.insert(name, o.value(QStringLiteral("icon_uri")).toString());
+            }
+        }
+        then();
+    });
+}
+
+void AppCatalog::refresh()
+{
+    if (m_busy) { return; }
+    setBusy(true);
+    // Only announce loading when there is nothing on screen to keep looking
+    // at. A background refresh over a cached list must not blank it.
+    if (m_apps.isEmpty()) { setStatus(QStringLiteral("Loading...")); }
+
+    resolveApi([this]() {
+        fetchCategories([this]() {
+            fetchApps();
+        });
+    });
+}
+
+void AppCatalog::fetchApps()
+{
+    const QString target = m_deviceTarget.isEmpty() ? QStringLiteral("f7") : m_deviceTarget;
+
+    QJsonObject body;
+    body.insert(QStringLiteral("limit"), 500);
+    body.insert(QStringLiteral("target"), target);
+    if (!m_resolvedApi.isEmpty()) { body.insert(QStringLiteral("api"), m_resolvedApi); }
+    if (!m_query.trimmed().isEmpty()) { body.insert(QStringLiteral("query"), m_query.trimmed()); }
+
+    QNetworkRequest req(QUrl(QString::fromLatin1(APP_CATALOG_BASE)
+                             + QStringLiteral("/1/application")));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+
+    auto *reply = m_net.post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        setBusy(false);
+
+        if (reply->error() != QNetworkReply::NoError) {
+            const QByteArray payload = reply->readAll();
+            setStatus(QStringLiteral("Catalog error"));
+            appendOutput(QStringLiteral("! %1").arg(reply->errorString()));
+            if (!payload.isEmpty()) {
+                appendOutput(QStringLiteral("  %1").arg(QString::fromUtf8(payload.left(300))));
+            }
+            emit changed();
+            return;
+        }
+
+        const QJsonArray arr = QJsonDocument::fromJson(reply->readAll()).array();
+        // Built alongside the current list and swapped in at the end, so a
+        // refresh never empties the panel mid-flight.
+        QList<App> fetched;
+        for (const QJsonValue &v : arr) {
+            const QJsonObject o = v.toObject();
+            const QJsonObject cur = o.value(QStringLiteral("current_version")).toObject();
+
+            App a;
+            a.id = o.value(QStringLiteral("_id")).toString();
+            a.alias = o.value(QStringLiteral("alias")).toString();
+            a.categoryId = o.value(QStringLiteral("category_id")).toString();
+            a.category = m_categories.value(a.categoryId);
+            a.versionId = cur.value(QStringLiteral("_id")).toString();
+            a.name = cur.value(QStringLiteral("name")).toString();
+            a.version = cur.value(QStringLiteral("version")).toString();
+            a.description = cur.value(QStringLiteral("short_description")).toString();
+            a.icon = cur.value(QStringLiteral("icon_uri")).toString();
+            a.author = o.value(QStringLiteral("author")).toString();
+            a.downloads = o.value(QStringLiteral("downloads")).toInt();
+
+            if (a.name.isEmpty() || a.versionId.isEmpty()) { continue; }
+            fetched.append(a);
+        }
+
+        std::sort(fetched.begin(), fetched.end(), [](const App &l, const App &r) {
+            return l.name.compare(r.name, Qt::CaseInsensitive) < 0;
+        });
+
+        // An empty result is a failure of some kind, not a catalogue with
+        // nothing in it -- keep what was cached rather than wiping it.
+        if (fetched.isEmpty() && !m_apps.isEmpty()) {
+            appendOutput(QStringLiteral("! refresh returned nothing -- keeping the cached list"));
+            emit changed();
+            return;
+        }
+
+        m_apps = fetched;
+        m_selectedCategory.clear();
+        m_fetchedAt = QDateTime::currentDateTime();
+        m_cacheDeviceApi = m_deviceApi;
+        saveCache();
+
+        setStatus(QStringLiteral("%1 apps").arg(m_apps.size()));
+        appendOutput(QStringLiteral("> %1 apps available").arg(m_apps.size()));
+        emit changed();
+    });
+}
+
+void AppCatalog::install(int index)
+{
+    if (index < 0 || index >= m_apps.size()) { return; }
+    if (m_busy) { return; }
+
+    const App a = m_apps.at(index);
+    const QString target = m_deviceTarget.isEmpty() ? QStringLiteral("f7") : m_deviceTarget;
+
+    setBusy(true);
+    setStatus(QStringLiteral("Downloading %1...").arg(a.name));
+    appendOutput(QStringLiteral("> downloading %1 %2").arg(a.name, a.version));
+
+    const QString url = QString::fromLatin1(APP_CATALOG_BASE)
+        + QStringLiteral("/0/application/version/%1/build/compatible?target=%2&api=%3")
+              .arg(a.versionId, target, m_resolvedApi);
+
+    auto *reply = m_net.get(QNetworkRequest(QUrl(url)));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, a]() {
+        reply->deleteLater();
+        setBusy(false);
+
+        if (reply->error() != QNetworkReply::NoError) {
+            setStatus(QStringLiteral("Download failed"));
+            appendOutput(QStringLiteral("! %1: %2").arg(a.name, reply->errorString()));
+            return;
+        }
+
+        const QByteArray fap = reply->readAll();
+        // A .fap is an ELF object; anything else means the catalog handed back
+        // an error page, and writing that to the card would look like success.
+        if (!fap.startsWith("\x7f" "ELF")) {
+            setStatus(QStringLiteral("Download failed"));
+            appendOutput(QStringLiteral("! %1: not an app bundle (%2 bytes)")
+                         .arg(a.name).arg(fap.size()));
+            return;
+        }
+
+        const QString dir = QDir::tempPath() + QStringLiteral("/nikita-apps");
+        QDir().mkpath(dir);
+        const QString local = QStringLiteral("%1/%2.fap").arg(dir, a.alias);
+
+        QFile f(local);
+        if (!f.open(QIODevice::WriteOnly)) {
+            setStatus(QStringLiteral("Cannot write download"));
+            appendOutput(QStringLiteral("! %1: %2").arg(a.name, f.errorString()));
+            return;
+        }
+        f.write(fap);
+        f.close();
+
+        const QString remote = a.category.isEmpty()
+            ? QStringLiteral("/ext/apps")
+            : QStringLiteral("/ext/apps/%1").arg(a.category);
+
+        appendOutput(QStringLiteral("> %1 KiB -> %2/%3.fap")
+                     .arg(fap.size() / 1024).arg(remote, a.alias));
+        setStatus(QStringLiteral("Installing %1...").arg(a.name));
+        // The upload is about to put exactly this name on the card, so the
+        // tiles can say so without paying for another walk of /ext/apps. The
+        // changed() is what makes the row redraw: setStatus() above fired
+        // before this insert, so without it the list kept saying INSTALL for an
+        // app that had just landed.
+        m_installedFaps.insert(a.alias + QStringLiteral(".fap"), remote + QLatin1Char('/') + a.alias + QStringLiteral(".fap"));
+        emit changed();
+        emit readyToInstall(local, remote);
+    });
 }
