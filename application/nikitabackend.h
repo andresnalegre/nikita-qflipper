@@ -429,6 +429,22 @@ private:
     QString m_pendingHostRunCmd;
     QString m_pendingHostRunCwd;
     std::function<void(const QString &)> m_pendingHostRunDone;
+    // True when the command waiting on the confirm dialog is a bridge_run --
+    // one aimed at the REMOTE computer through the Flipper's SD mailbox, not at
+    // this machine. Same one-at-a-time guarantee as m_pendingHostRunCmd.
+    bool m_pendingBridgeRun = false;
+
+    // bridge_run: reach the computer that has the Flipper cabled (running
+    // bridge.py --mailbox), from here, over BLE. Mirrors the iOS app's
+    // MailboxMachineBridge -- leave "<id>.<base64(command)>" at
+    // /ext/nikita/bridge/req and wait for the same id to come back at
+    // /ext/nikita/bridge/res. Only offered on a wireless link (over a cable
+    // this machine IS that computer, so computer_run is the honest tool).
+    void runBridgeCommand(const QString &command,
+                          std::function<void(const QString &)> done);
+    void pollBridgeResult(const QByteArray &resPath, const QString &id,
+                          qint64 deadlineMs,
+                          std::function<void(const QString &)> done);
 
     // Shared confirmation gate for computer_write/computer_mkdir/computer_move/computer_copy/
     // computer_delete. Unlike computer_run's always-allow list (one exact command

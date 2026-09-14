@@ -32,6 +32,7 @@
 #include <QFileInfo>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QRandomGenerator>
 #include <QDebug>
 #include <QLoggingCategory>
 #include <QGuiApplication>
@@ -208,6 +209,9 @@ static const NikitaFilterGroup NIKITA_FILTERS[] = {
     { "computer_run",       "Computer: run commands",
       "Execute terminal commands on this computer. The widest access on this list.",
       "computer_run" },
+    { "bridge_run",         "Remote computer: run commands",
+      "Execute terminal commands on the far computer the Flipper is cabled to, over Bluetooth.",
+      "bridge_run" },
 };
 static const int NIKITA_FILTER_COUNT = int(sizeof(NIKITA_FILTERS) / sizeof(NIKITA_FILTERS[0]));
 
@@ -356,6 +360,7 @@ THE SD CARD -- A STARTING MAP, NOT A TRUTH. These are the folders the firmware c
 - NAVIGATE THE CARD WITH THE CLI, ALWAYS: fls (list), fcat (read), fstat, ftree, fmkdir, frm, fmv, fmd5, fdf. Every one of them reaches the Flipper, and BOTH spellings work through run_cli -- "fls /ext/nfc", "ls /ext/nfc" and "storage list /ext/nfc" are the same command. Paths are absolute or resolve against /ext; there is no current folder through run_cli, so no fcd. Reading a file before acting on it is never wasted: it is how you learn the exact names inside it instead of guessing.
 - WHICH TOOLS YOU HAVE DEPENDS ON THE LINK, and you will only ever be handed the ones that work. Over a CABLE the CLI (run_cli) and ir_universal do everything deterministically -- that is your main instrument. Over BLUETOOTH there is no CLI -- the terminal is USB-only -- so run_cli and ir_universal are gone; there you drive the device with run_ble (open/close apps by name), the file tools (list_files/read_file for anything on the SD card), and press_button(ok/back) for confirming or leaving what is already up. There is no screen reading on either link. Do not ask for a tool that is not in your list.
 - OVER BLUETOOTH, FILES AND THE SCREEN ARE THE WHOLE TOOLBOX. Everything that goes through the CLI -- firing an IR signal, gpio, subghz, nfc, rfid, led, vibro, power -- needs the cable. If the user asks for one of those on a wireless link, say so plainly in one line and offer the cable; do not go hunting for a way round it.
+- TWO COMPUTERS, TWO TOOLS. computer_run (and the other computer_* tools) run on THIS machine -- the one you are running on. bridge_run runs on the FAR machine -- the computer the Flipper is physically cabled to, reached over Bluetooth through the SD-card mailbox. bridge_run only exists on a wireless link (over a cable this machine already IS that computer). It needs a helper running there: `python3 bridge.py --mailbox --allow-host`; if bridge_run reports no answer, that helper is not running -- tell the user to start it, do not retry in a loop. Never confuse the two: "run X on the other computer / on the target" is bridge_run, "run X here / on my machine" is computer_run.
 - THE CLI IS HOW YOU NAVIGATE ON A CABLE. All of it. Moving between apps, finding files, reading them, firing a signal -- run_cli does every one deterministically, from wherever the device is. On USB you do not walk menus, and press_button is only OK and BACK.
 - OVER BLUETOOTH, OPEN APPS WITH run_ble, NOT WITH BUTTONS. run_ble(open, "NFC") opens the NFC app in one deterministic RPC call -- no D-pad, no counting. run_ble(close) returns to the desktop. It switches apps cleanly too (it exits the current one first), so to go from Sub-GHz to NFC you just call run_ble(open, NFC) -- you do NOT press back yourself. When run_ble reports opened, the app IS open: say so and stop. That report IS the confirmation -- there is nothing to double-check and no screen to read.
 - DO NOT INVENT AN APP FROM A VAGUE WORD. "open my saved ones", "the codes" do not name an app -- do not map them to one. When the word is not clearly one of the real apps, ask which app, or treat it as a FOLDER and use the file tools.
@@ -990,6 +995,20 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
             }}
         }}
     };
+    const QJsonObject bridgeRun{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "bridge_run"},
+            {"description", "Run a shell command on the REMOTE computer that has this Flipper plugged in, reached over Bluetooth through the SD-card mailbox. This is NOT this machine -- computer_run is this machine; bridge_run is the far one, the computer the Flipper is cabled to. It needs a helper running there: `python3 bridge.py --mailbox --allow-host`. Returns that computer's stdout/stderr. If nothing answers, the helper is not running -- say so, do not retry in a loop. Every call is confirmed on screen before it runs, because it executes on someone else's machine."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"command", QJsonObject{{"type", "string"}, {"description", "The command line to run on the remote computer, e.g. whoami or uname -a"}}}
+                }},
+                {"required", QJsonArray{"command"}}
+            }}
+        }}
+    };
     const QJsonObject saveFile{
         {"type", "function"},
         {"function", QJsonObject{
@@ -1132,6 +1151,7 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         tools.append(pressButton);
         tools.append(runCli);
         tools.append(runBle);
+        tools.append(bridgeRun);
     }
 
     if (!agent) { return tools; }
@@ -1317,7 +1337,8 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
                                 || n == QLatin1String("ir_universal"));
             // run_ble is the mirror image: it uses App RPC, which only exists
             // over the wireless link, so it is dropped on a cable.
-            const bool bleOnly = (n == QLatin1String("run_ble"));
+            const bool bleOnly = (n == QLatin1String("run_ble")
+                              || n == QLatin1String("bridge_run"));
             if (overBle) {
                 if (needsCli) { continue; }
             } else {
@@ -6073,6 +6094,27 @@ void NikitaBackend::runOneTool(const QString &rawName, const QJsonObject &args, 
             done(QStringLiteral("{\"error\":\"action must be open or close\"}"));
         }
 
+    } else if (name == QLatin1String("bridge_run")) {
+        // A command for the REMOTE computer, over the SD mailbox. Only reaches
+        // here on a BLE link (the transport filter drops it on a cable). It
+        // runs on someone else's machine, so it always waits for the on-screen
+        // confirmation first -- reusing computer_run's dialog and pending slot,
+        // flagged so answerHostRunConfirm() sends it down the mailbox instead
+        // of QProcess.
+        const QString cmd = args.value("command").toString().trimmed();
+        if (cmd.isEmpty()) { done(QStringLiteral("{\"error\":\"no command\"}")); return; }
+        if (!deviceOverBle()) {
+            done(QStringLiteral("{\"error\":\"bridge_run reaches a remote computer over Bluetooth. "
+                 "This is a USB link -- this machine IS the one with the Flipper, so use "
+                 "computer_run here.\"}"));
+            return;
+        }
+        m_pendingBridgeRun = true;
+        m_pendingHostRunCmd = cmd;
+        m_pendingHostRunCwd.clear();
+        m_pendingHostRunDone = done;
+        emit hostRunConfirmRequested(cmd, QStringLiteral("remote computer (via the Flipper)"));
+
     } else if (name == QLatin1String("run_cli")) {
         const QString command = args.value("command").toString().trimmed();
         if (command.isEmpty()) {
@@ -6444,6 +6486,98 @@ void NikitaBackend::writeFlipperFile(const QByteArray &path, const QString &cont
             buf->deleteLater();
             done(result);
         });
+    });
+}
+
+// bridge_run's engine: the same SD-card mailbox the iOS app uses, driven from
+// here over BLE. Leave "<id>.<base64(command)>" at /ext/nikita/bridge/req and
+// wait for the answer carrying the same id at /ext/nikita/bridge/res. The
+// helper on the far computer (bridge.py --mailbox) does the executing; all this
+// side does is write one file and poll another.
+void NikitaBackend::runBridgeCommand(const QString &command,
+                                     std::function<void(const QString &)> done)
+{
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (!dev) { done(QStringLiteral("{\"error\":\"the Flipper was disconnected\"}")); return; }
+
+    const QByteArray req = "/ext/nikita/bridge/req";
+    const QByteArray res = "/ext/nikita/bridge/res";
+    const QString id = QString::number(
+        QRandomGenerator::global()->bounded(1u, 0xffffffffu));
+    // The mailbox runs a bare command on the FLIPPER's shell and only a
+    // "host ..." command on the far COMPUTER. bridge_run is the computer tool,
+    // so it carries the host prefix -- added here so the model never has to
+    // know the wire format (and never double-prefixes an already-hosted one).
+    const QString hosted = command.startsWith(QLatin1String("host "))
+        ? command : (QStringLiteral("host ") + command);
+    const QString payload = id + QLatin1Char('.')
+        + QString::fromLatin1(hosted.toUtf8().toBase64());
+
+    // Clear any stale answer first, so a leftover from a previous round can
+    // never be read as this command's result. Then write the request, then
+    // poll -- each step waits for the last, since the one BLE link is serial.
+    auto *rm = dev->rpc()->storageRemove(res, false);
+    connect(rm, &AbstractOperation::finished, this,
+            [this, req, res, id, payload, done]() {
+        // A missing res is the normal case, not an error worth surfacing.
+        writeFlipperFile(req, payload, [this, res, id, done](const QString &wrote) {
+            if (wrote.contains(QLatin1String("\"error\""))) {
+                done(wrote); // the write itself failed -- report it verbatim
+                return;
+            }
+            const qint64 deadline =
+                QDateTime::currentMSecsSinceEpoch() + 30000; // 30s
+            pollBridgeResult(res, id, deadline, done);
+        });
+    });
+}
+
+void NikitaBackend::pollBridgeResult(const QByteArray &resPath, const QString &id,
+                                     qint64 deadlineMs,
+                                     std::function<void(const QString &)> done)
+{
+    if (QDateTime::currentMSecsSinceEpoch() > deadlineMs) {
+        done(QStringLiteral("{\"error\":\"No answer from the bridge. Start it on the computer "
+             "holding the Flipper:  python3 bridge.py --mailbox --allow-host\"}"));
+        return;
+    }
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (!dev) { done(QStringLiteral("{\"error\":\"the Flipper was disconnected\"}")); return; }
+
+    QBuffer *buf = new QBuffer(this);
+    buf->open(QIODevice::ReadWrite);
+    auto *op = dev->rpc()->storageRead(resPath, buf);
+    connect(op, &AbstractOperation::finished, this,
+            [this, op, buf, resPath, id, deadlineMs, done]() {
+        const bool err = op->isError();
+        const QByteArray body = err ? QByteArray() : buf->data().trimmed();
+        buf->deleteLater();
+
+        // No file yet (read errors while the helper has not written it):
+        // wait and look again until the deadline.
+        auto retry = [this, resPath, id, deadlineMs, done]() {
+            QTimer::singleShot(500, this, [this, resPath, id, deadlineMs, done]() {
+                pollBridgeResult(resPath, id, deadlineMs, done);
+            });
+        };
+        if (err) { retry(); return; }
+
+        const int dot = body.indexOf('.');
+        const QByteArray head = dot < 0 ? body : body.left(dot);
+        if (QString::fromLatin1(head) != id) {
+            // A stale answer, or the helper mid-write -- not ours yet.
+            retry();
+            return;
+        }
+
+        // Ours. Clear it so the next command starts clean, then decode.
+        Flipper::FlipperZero *d = m_appBackend ? m_appBackend->device() : nullptr;
+        if (d) { d->rpc()->storageRemove(resPath, false); }
+
+        const QByteArray b64 = dot < 0 ? QByteArray() : body.mid(dot + 1);
+        const QByteArray out = QByteArray::fromBase64(b64);
+        const QString text = QString::fromUtf8(out);
+        done(text.isEmpty() ? QStringLiteral("(no output)") : text);
     });
 }
 
@@ -7137,12 +7271,21 @@ void NikitaBackend::answerHostRunConfirm(bool allow, bool alwaysAllow)
     const QString cmd = m_pendingHostRunCmd;
     const QString cwd = m_pendingHostRunCwd;
     const auto done = m_pendingHostRunDone;
+    const bool bridge = m_pendingBridgeRun;
     m_pendingHostRunCmd.clear();
     m_pendingHostRunCwd.clear();
     m_pendingHostRunDone = nullptr;
+    m_pendingBridgeRun = false;
 
     if (!allow) {
         done(QStringLiteral("{\"error\":\"the user declined to run this command\"}"));
+        return;
+    }
+    // A bridge command runs on the far computer through the mailbox, never on
+    // this one. "Always allow" is deliberately ignored for it: a remembered
+    // yes must not silently execute on a machine that is not even ours.
+    if (bridge) {
+        runBridgeCommand(cmd, done);
         return;
     }
     if (alwaysAllow) { rememberHostRunAllowed(cmd); }
