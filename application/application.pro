@@ -40,6 +40,16 @@ SOURCES += \
         screencanvas.cpp \
         systemfiledialog.cpp
 
+# Native voice input. On macOS the recognizer is Speech.framework, driven from
+# macspeech.mm (Obj-C++); other platforms get a no-op stub so the class links.
+HEADERS += macspeech.h
+macx {
+    OBJECTIVE_SOURCES += macspeech.mm
+    LIBS += -framework Speech -framework AVFoundation -framework Foundation
+} else {
+    SOURCES += macspeech_stub.cpp
+}
+
 RESOURCES += qml.qrc
 
 TRANSLATIONS += \

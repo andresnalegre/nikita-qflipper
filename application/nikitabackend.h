@@ -28,6 +28,7 @@ class QProcess;
 class FlipperCli;   // defined below; NikitaBackend holds a pointer for run_cli
 class McpClient;   // application/mcpclient.h -- the MCP tool servers
 class NikitaTaskAgent; // application/nikitataskagent.h -- parallel Nikita fragments
+class MacSpeech;   // application/macspeech.h -- native voice input (macOS)
 
 class NikitaBackend : public QObject
 {
@@ -261,6 +262,15 @@ public:
     // Stage every readable text file in a folder (bounded), for "Add folder".
     Q_INVOKABLE QString stageFolderFromPath(const QString &path);
 
+    // ---- voice input (macOS Speech) ---------------------------------------
+    // Talk to Nikita instead of typing. micLevels feeds the live waveform.
+    Q_PROPERTY(bool dictating READ dictating NOTIFY dictatingChanged)
+    Q_PROPERTY(QVariantList micLevels READ micLevels NOTIFY micLevelsChanged)
+    Q_INVOKABLE void startDictation();
+    Q_INVOKABLE void stopDictation();
+    bool dictating() const;
+    QVariantList micLevels() const { return m_micLevels; }
+
     // ---- the "+" menu: quick commands, learned skills, plugins -------------
     // QUICK COMMANDS: a catalog of ready-made prompts the user can pick instead
     // of typing. Seeded with defaults, extendable, persisted.
@@ -410,6 +420,11 @@ signals:
     void mcpChanged();
     void agentTasksChanged();
     void stagedAttachmentsChanged();
+    void dictatingChanged();
+    void micLevelsChanged();
+    void dictationPartial(const QString &text);
+    void dictationFinal(const QString &text);
+    void dictationError(const QString &message);
     void quickCommandsChanged();
     void skillsChanged();
     void skillLearnStatus(const QString &message, bool busy);
@@ -620,6 +635,11 @@ private:
     bool     m_buddyBaselined = false; // wrote the id:0 baseline req.json once
     void pollBuddyMailbox();
     void writeBuddyReply(uint32_t id, const QString &text);
+    // Voice input (macOS Speech). Owned; the waveform reads m_micLevels.
+    MacSpeech *m_speech = nullptr;
+    QVariantList m_micLevels;
+    static constexpr int kMaxMicLevels = 48;
+
     // Files/images staged for the next send(): each a QJsonObject with kind,
     // filename, mime, and either dataURL (images) or text (text files).
     QJsonArray m_stagedAttachments;

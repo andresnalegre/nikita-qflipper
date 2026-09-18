@@ -57,5 +57,9 @@
 	<string>qFlipper needs access to removable volumes to read and write the Flipper Zero's microSD card when it is mounted.</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>NIKITA runs the shell commands you approve on screen; some of them ask other apps to do the work.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NIKITA uses the microphone so you can talk to it instead of typing.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>NIKITA transcribes what you say on-device so you can dictate messages.</string>
 </dict>
 </plist>

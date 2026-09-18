@@ -311,6 +311,8 @@ Rectangle {
     }
 
     function sendCurrent() {
+        // Close the mic first so the last words land before the turn starts.
+        if(Nikita.dictating) { Nikita.stopDictation(); }
         var t = input.text.trim();
         // An attachment on its own ("look at this") is a valid turn, so send is
         // allowed with empty text as long as something is staged.
@@ -1714,6 +1716,53 @@ Rectangle {
             }
         }
 
+        // ---- live voice waveform (only while dictating) --------------------
+        Rectangle {
+            visible: root.viewState !== "min" && Nikita.dictating
+            Layout.fillWidth: true
+            Layout.preferredHeight: 40
+            radius: 6
+            color: "#120818"
+            border.width: 1
+            border.color: Theme.color.lightorange2
+            Row {
+                id: waveRow
+                anchors.centerIn: parent
+                width: parent.width - 16
+                height: parent.height - 12
+                spacing: 3
+                layoutDirection: Qt.RightToLeft
+                Repeater {
+                    model: Nikita.micLevels
+                    Rectangle {
+                        width: Math.max(2, (waveRow.width - waveRow.spacing * 47) / 48)
+                        height: Math.max(3, modelData * waveRow.height)
+                        anchors.verticalCenter: parent.verticalCenter
+                        radius: width / 2
+                        color: Theme.color.lightorange2
+                    }
+                }
+            }
+            Text {
+                anchors.centerIn: parent
+                visible: Nikita.micLevels.length === 0
+                text: "listening…"
+                color: Theme.color.mediumorange1
+                font.family: "Share Tech Mono"; font.pixelSize: 12
+            }
+        }
+
+        // Feed the recognizer's words into the input box as they arrive, so the
+        // user watches their message appear and can send when they stop.
+        Connections {
+            target: Nikita
+            function onDictationPartial(text) { input.text = text; }
+            function onDictationFinal(text) { input.text = text; }
+            function onDictationError(message) {
+                root.appendMessage("nikita", message);
+            }
+        }
+
         // ---- staged attachments strip (only when something is attached) ----
         Flow {
             visible: root.viewState !== "min" && attachModel.count > 0
@@ -1837,6 +1886,38 @@ Rectangle {
                     MenuItem {
                         text: "🔌  Plugins"
                         onTriggered: pluginPanel.open = true
+                    }
+                }
+            }
+
+            // Talk instead of type. Records with a live waveform above; the
+            // recognised words stream into the box as you speak.
+            Rectangle {
+                Layout.preferredWidth: 30
+                Layout.preferredHeight: 30
+                radius: 6
+                color: Nikita.dictating ? "#3a1020"
+                        : (micMouse.containsMouse ? Theme.color.mediumorange2
+                                                  : "transparent")
+                border.width: 1
+                border.color: Nikita.dictating ? "#ff4466"
+                                               : Theme.color.mediumorange2
+                enabled: root.hasModel
+                opacity: root.hasModel ? 1.0 : 0.4
+                Text {
+                    anchors.centerIn: parent
+                    text: Nikita.dictating ? "■" : "🎤"
+                    color: Nikita.dictating ? "#ff4466" : Theme.color.lightorange2
+                    font.pixelSize: Nikita.dictating ? 12 : 14
+                }
+                MouseArea {
+                    id: micMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (Nikita.dictating) { Nikita.stopDictation(); }
+                        else { Nikita.startDictation(); }
                     }
                 }
             }

@@ -18,6 +18,7 @@
 #include <QNetworkReply>
 #include <QRegularExpression>
 #include <QUuid>
+#include "macspeech.h"
 #include <QFile>
 #include <QDir>
 #include <QDirIterator>
@@ -2025,6 +2026,23 @@ NikitaBackend::NikitaBackend(QObject *parent)
     : QObject(parent)
 {
     m_net.setTransferTimeout(0);
+
+    // Voice input: forward the native recognizer's events to QML-facing signals
+    // and keep a rolling window of loudness for the waveform.
+    m_speech = new MacSpeech(this);
+    connect(m_speech, &MacSpeech::level, this, [this](float v) {
+        m_micLevels.append(v);
+        while (m_micLevels.size() > kMaxMicLevels) { m_micLevels.removeFirst(); }
+        emit micLevelsChanged();
+    });
+    connect(m_speech, &MacSpeech::partial, this, &NikitaBackend::dictationPartial);
+    connect(m_speech, &MacSpeech::finalText, this, &NikitaBackend::dictationFinal);
+    connect(m_speech, &MacSpeech::errorText, this, &NikitaBackend::dictationError);
+    connect(m_speech, &MacSpeech::listeningChanged, this, [this](bool on) {
+        if (!on) { m_micLevels.clear(); emit micLevelsChanged(); }
+        emit dictatingChanged();
+    });
+
     loadHistory();
     loadExtras();
     loadFilters();
@@ -5007,6 +5025,21 @@ QString NikitaBackend::stageFolderFromPath(const QString &path)
         if (note.startsWith(QStringLiteral("attached"))) { ++staged; }
     }
     return QStringLiteral("attached %1 file(s) from %2").arg(staged).arg(dir.dirName());
+}
+
+bool NikitaBackend::dictating() const
+{
+    return m_speech && m_speech->listening();
+}
+
+void NikitaBackend::startDictation()
+{
+    if (m_speech) { m_speech->start(); }
+}
+
+void NikitaBackend::stopDictation()
+{
+    if (m_speech) { m_speech->stop(); }
 }
 
 void NikitaBackend::runCallPlugin(const QJsonObject &args,
