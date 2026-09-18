@@ -234,6 +234,18 @@ Rectangle {
     // with no name left the assistant without one too.
     readonly property string aiName: "Nikita"
 
+    // ---- themed line icons (no emojis) -----------------------------------
+    // Thin-stroke magenta line art matching the whole panel's CRT look, drawn
+    // as inline SVG so there are no image assets to ship. The stroke colour is
+    // the theme's #fd8cff (encoded %23fd8cff for the data URI).
+    readonly property string icAttach: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjZmQ4Y2ZmJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHBhdGggZD0nTTIxIDguNWwtOS4yIDkuMmE0IDQgMCAwIDEtNS43LTUuN2w5LTlhMi42IDIuNiAwIDAgMSAzLjcgMy43bC04LjYgOC42YTEuMiAxLjIgMCAwIDEtMS43LTEuN2w3LjktNy45Jy8+PC9zdmc+"
+    readonly property string icFolder: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjZmQ4Y2ZmJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHBhdGggZD0nTTMgN2EyIDIgMCAwIDEgMi0yaDRsMiAyaDhhMiAyIDAgMCAxIDIgMnY4YTIgMiAwIDAgMS0yIDJINWEyIDIgMCAwIDEtMi0yeicvPjwvc3ZnPg=="
+    readonly property string icBolt: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjZmQ4Y2ZmJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHBhdGggZD0nTTEzIDJMNCAxNGg3bC0xIDggOS0xMmgtN3onLz48L3N2Zz4="
+    readonly property string icSkill: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjZmQ4Y2ZmJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHBhdGggZD0nTTEyIDNsMiA2IDYgMi02IDItMiA2LTItNi02LTIgNi0yeicvPjwvc3ZnPg=="
+    readonly property string icPlug: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjZmQ4Y2ZmJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHBhdGggZD0nTTkgM3Y1TTE1IDN2NU03IDhoMTB2M2E1IDUgMCAwIDEtMTAgMHpNMTIgMTZ2NScvPjwvc3ZnPg=="
+    readonly property string icMic: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjZmQ4Y2ZmJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHJlY3QgeD0nOScgeT0nMycgd2lkdGg9JzYnIGhlaWdodD0nMTEnIHJ4PSczJy8+PHBhdGggZD0nTTUgMTFhNyA3IDAgMCAwIDE0IDBNMTIgMTh2MycvPjwvc3ZnPg=="
+    readonly property string icDoc: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHZpZXdCb3g9JzAgMCAyNCAyNCcgZmlsbD0nbm9uZScgc3Ryb2tlPScjZmQ4Y2ZmJyBzdHJva2Utd2lkdGg9JzInIHN0cm9rZS1saW5lY2FwPSdyb3VuZCcgc3Ryb2tlLWxpbmVqb2luPSdyb3VuZCc+PHBhdGggZD0nTTYgMmg4bDQgNHYxNkg2ek0xNCAydjRoNCcvPjwvc3ZnPg=="
+
     x: viewState === "max" ? 14 : dockX
     y: viewState === "max" ? 78 : dockY
     width:  viewState === "max" ? ((parent ? parent.width  : 804) - 28) : dockW
@@ -323,7 +335,7 @@ Rectangle {
         if(attachModel.count > 0) {
             var names = [];
             for(var i = 0; i < attachModel.count; i++)
-                names.push("📎 " + attachModel.get(i).name);
+                names.push("\u00bb " + attachModel.get(i).name);
             shown = (t.length > 0 ? t + "\n" : "") + names.join("  ");
         }
         appendMessage("you", shown);
@@ -534,11 +546,11 @@ Rectangle {
         function onModelChanged() { root.greetIfReady(); }
         // Feedback from the manual save panel (model-free save straight to SD).
         function onScriptSaved(path) {
-            root.appendMessage("nikita", "✅ Salvo em " + path);
+            root.appendMessage("nikita", "Saved to " + path);
             listView.followEnd();
         }
         function onScriptSaveError(message) {
-            root.appendMessage("nikita", "⚠️ Couldn't save: " + message);
+            root.appendMessage("nikita", "Couldn't save: " + message);
             listView.followEnd();
         }
     }
@@ -1546,7 +1558,7 @@ Rectangle {
                             Text {
                                 anchors.right: parent.right
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: "⧉ copy"
+                                text: "copy"
                                 color: copyBtn.containsMouse ? Theme.color.lightorange2 : Theme.color.mediumorange1
                                 font.family: "Share Tech Mono"; font.pixelSize: 12
                                 MouseArea {
@@ -1791,10 +1803,11 @@ Rectangle {
                             clip: true
                             anchors.verticalCenter: parent.verticalCenter
                         }
-                        Text {
+                        Image {
                             visible: !model.isImage
-                            text: "📄"
-                            font.pixelSize: 16
+                            source: root.icDoc
+                            sourceSize.width: 18; sourceSize.height: 18
+                            width: 18; height: 18
                             anchors.verticalCenter: parent.verticalCenter
                         }
                         Text {
@@ -1867,24 +1880,46 @@ Rectangle {
                 Menu {
                     id: plusMenu
                     y: -implicitHeight - 4
-                    MenuItem {
-                        text: "📎  Add files or photos"
+                    component NikitaMenuItem: MenuItem {
+                        id: mi
+                        property string iconSrc: ""
+                        property string label: ""
+                        implicitHeight: 34
+                        contentItem: Row {
+                            spacing: 10
+                            leftPadding: 4
+                            Image {
+                                source: mi.iconSrc
+                                sourceSize.width: 18; sourceSize.height: 18
+                                width: 18; height: 18
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Text {
+                                text: mi.label
+                                color: Theme.color.lightorange2
+                                font.family: "Share Tech Mono"; font.pixelSize: 13
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                        }
+                    }
+                    NikitaMenuItem {
+                        iconSrc: root.icAttach; label: "Add files or photos"
                         onTriggered: attachDialog.open()
                     }
-                    MenuItem {
-                        text: "📁  Add folder"
+                    NikitaMenuItem {
+                        iconSrc: root.icFolder; label: "Add folder"
                         onTriggered: folderDialog.open()
                     }
-                    MenuItem {
-                        text: "⚡  Quick commands"
+                    NikitaMenuItem {
+                        iconSrc: root.icBolt; label: "Quick commands"
                         onTriggered: quickPanel.open = true
                     }
-                    MenuItem {
-                        text: "✦  Add New Skill"
+                    NikitaMenuItem {
+                        iconSrc: root.icSkill; label: "Add New Skill"
                         onTriggered: skillPanel.open = true
                     }
-                    MenuItem {
-                        text: "🔌  Plugins"
+                    NikitaMenuItem {
+                        iconSrc: root.icPlug; label: "Plugins"
                         onTriggered: pluginPanel.open = true
                     }
                 }
@@ -1904,11 +1939,19 @@ Rectangle {
                                                : Theme.color.mediumorange2
                 enabled: root.hasModel
                 opacity: root.hasModel ? 1.0 : 0.4
-                Text {
+                // Stop square while listening; otherwise the themed mic icon.
+                Rectangle {
+                    visible: Nikita.dictating
                     anchors.centerIn: parent
-                    text: Nikita.dictating ? "■" : "🎤"
-                    color: Nikita.dictating ? "#ff4466" : Theme.color.lightorange2
-                    font.pixelSize: Nikita.dictating ? 12 : 14
+                    width: 11; height: 11; radius: 2
+                    color: "#ff4466"
+                }
+                Image {
+                    visible: !Nikita.dictating
+                    anchors.centerIn: parent
+                    source: root.icMic
+                    sourceSize.width: 17; sourceSize.height: 17
+                    width: 17; height: 17
                 }
                 MouseArea {
                     id: micMouse
@@ -2374,8 +2417,14 @@ Rectangle {
                 spacing: 10
                 RowLayout {
                     Layout.fillWidth: true
+                    spacing: 8
+                    Image {
+                        source: root.icBolt
+                        sourceSize.width: 18; sourceSize.height: 18
+                        Layout.preferredWidth: 18; Layout.preferredHeight: 18
+                    }
                     Text {
-                        text: "⚡  Quick commands"
+                        text: "Quick commands"
                         color: Theme.color.lightorange2
                         font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true
                     }
@@ -2528,8 +2577,14 @@ Rectangle {
                 anchors.fill: parent; anchors.margins: 14; spacing: 10
                 RowLayout {
                     Layout.fillWidth: true
+                    spacing: 8
+                    Image {
+                        source: root.icSkill
+                        sourceSize.width: 18; sourceSize.height: 18
+                        Layout.preferredWidth: 18; Layout.preferredHeight: 18
+                    }
                     Text {
-                        text: "✦  Add New Skill"
+                        text: "Add New Skill"
                         color: Theme.color.lightorange2
                         font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true
                     }
@@ -2656,8 +2711,14 @@ Rectangle {
                 anchors.fill: parent; anchors.margins: 14; spacing: 8
                 RowLayout {
                     Layout.fillWidth: true
+                    spacing: 8
+                    Image {
+                        source: root.icPlug
+                        sourceSize.width: 18; sourceSize.height: 18
+                        Layout.preferredWidth: 18; Layout.preferredHeight: 18
+                    }
                     Text {
-                        text: "🔌  Plugins"
+                        text: "Plugins"
                         color: Theme.color.lightorange2
                         font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true
                     }
