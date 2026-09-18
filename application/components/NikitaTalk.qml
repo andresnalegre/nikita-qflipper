@@ -1879,15 +1879,19 @@ Rectangle {
                 }
                 Menu {
                     id: plusMenu
+                    // Snug to the widest label ("Add files or photos") -- no
+                    // clipping, no empty space. This is the width you approved.
+                    width: 218
                     y: -implicitHeight - 4
                     component NikitaMenuItem: MenuItem {
                         id: mi
                         property string iconSrc: ""
                         property string label: ""
                         implicitHeight: 34
+                        implicitWidth: 218
                         contentItem: Row {
-                            spacing: 10
-                            leftPadding: 4
+                            spacing: 9
+                            leftPadding: 6
                             Image {
                                 source: mi.iconSrc
                                 sourceSize.width: 18; sourceSize.height: 18
