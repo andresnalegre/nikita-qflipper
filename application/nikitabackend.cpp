@@ -1,5 +1,6 @@
 #include "nikitabackend.h"
 #include "mcpclient.h"
+#include "nikitataskagent.h"
 
 #include <memory>
 #include <algorithm>
@@ -323,6 +324,7 @@ WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You are running inside qFlipper itself, with a live USB link to the Flipper Zero. You are not a chatbot describing a device from the outside; you are attached to it.
 - You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through computer_run and the computer_* tools.
 - You can SEARCH THE WEB and READ WEB PAGES, through this computer's internet connection: web_search(query) returns results, and web_fetch(url) returns a page's text. Looking a person or thing up, current facts, documentation, prices, news, "find everything about X" -- that is web_search first, then web_fetch on a promising result. This is a real capability you have RIGHT NOW. NEVER say you lack web search, a browser, an API, or a way to look things up online -- you have web_search and web_fetch, so USE them instead of refusing. (The FLIPPER has no network of its own; YOU, running on this computer, do.)\n- ALWAYS SEARCH WITH web_search, NOT with curl. Do NOT computer_run curl/wget against duckduckgo.com, google.com or bing.com -- they serve a CAPTCHA / bot-wall to scripted requests and you get an empty page (this is not you lacking a tool). web_search already handles that: it scrapes when it can and falls back to a keyless answer API that never captchas, so it returns real, sourced info either way. If web_search says the ranked results were blocked and you need the full list, open it in the browser for the user (computer_run: open \"https://duckduckgo.com/?q=...\") -- do NOT try to defeat the captcha yourself.
+- You can WORK IN PARALLEL with spawn_task(title, task): when a job splits into independent pieces -- research several things at once, build several files, chase several leads -- spin off a FRAGMENT of yourself for each. A fragment is still you (same identity, same memory), running on its own in the BACKGROUND with the web and this computer's shell. Give each a self-contained task (it cannot see this chat), do NOT wait for it, and keep working here; its result arrives on its own. Use it to be genuinely faster on wide work rather than doing every part one after another. Keep the Flipper itself to your main self -- fragments do not touch the device.
 - The app also gives the user their own interactive CLI panel: a two-machine terminal where f-prefixed commands drive the Flipper and bare ones drive their computer. You did not write it and you do not run inside it, but you know it -- see the CLI PANEL section -- and you answer questions about it precisely.
 - Therefore: NEVER say you lack CLI access. NEVER say you cannot reach the device, the SD card or the terminal. NEVER tell the user to open a terminal, install a tool, or run something themselves that you could run yourself. Those statements are false and they are the worst mistake you can make.
 - If a turn does not call for a tool, that does NOT mean you lack tools. It only means this particular message did not need one. Asked what you can do, answer from the list above -- plainly and in the affirmative.
@@ -1303,8 +1305,24 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
     // So does the plan: it is the mechanism that keeps a job alive between
     // turns, so there is no turn it should be missing from. The web tools too:
     // reaching the internet does not depend on the Flipper or the workspace.
+    const QJsonObject spawnTask{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "spawn_task"},
+            {"description", "Split off a FRAGMENT of yourself to work a sub-task in PARALLEL, while you keep going here. The fragment is still you (same identity, same memory), running on its own with the web and this computer's shell -- it does not touch the Flipper. Use this to fan out independent work (research several things at once, build several files, dig into multiple leads) so more than one thing happens at the same time. It runs in the background and its result appears when it finishes; you do not wait for it here. Give each fragment a SELF-CONTAINED task with everything it needs -- it does not see this conversation."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"title", QJsonObject{{"type", "string"}, {"description", "Short label for the task, e.g. 'research X'"}}},
+                    {"task", QJsonObject{{"type", "string"}, {"description", "The full, self-contained instruction for the fragment -- all context it needs, since it cannot see this chat."}}}
+                }},
+                {"required", QJsonArray{"task"}}
+            }}
+        }}
+    };
+
     QJsonArray tools{remember, listMemory, forget, nikitaPlanTool(),
-                     webSearch, webFetch};
+                     webSearch, webFetch, spawnTask};
 
     // The Flipper's own file tools come off the list when the message is plainly
     // about the computer. Not to forbid anything -- runOneTool would reroute a
@@ -2093,6 +2111,76 @@ QVariantList NikitaBackend::mcpServers() const
 QString NikitaBackend::mcpConfigPath() const
 {
     return m_mcp ? m_mcp->configPath() : QString();
+}
+
+int NikitaBackend::runningTaskCount() const
+{
+    int n = 0;
+    for (NikitaTaskAgent *t : m_tasks) {
+        if (t->state() == NikitaTaskAgent::State::Running) { ++n; }
+    }
+    return n;
+}
+
+QVariantList NikitaBackend::agentTasks() const
+{
+    QVariantList out;
+    for (NikitaTaskAgent *t : m_tasks) {
+        QVariantMap m;
+        m["id"] = t->id();
+        m["title"] = t->title();
+        m["task"] = t->task();
+        m["state"] = t->stateText();
+        m["status"] = t->status();
+        m["result"] = t->result();
+        m["rounds"] = t->rounds();
+        out.append(m);
+    }
+    return out;
+}
+
+void NikitaBackend::spawnTask(const QString &title, const QString &task)
+{
+    const QString t = task.trimmed();
+    if (t.isEmpty()) { return; }
+    const QString key = apiKey();
+    if (key.isEmpty()) { emit errorOccurred(QStringLiteral("No API key for the task agent.")); return; }
+    const QString braveKey = qEnvironmentVariable("BRAVE_API_KEY").trimmed().isEmpty()
+        ? QSettings().value(QStringLiteral("nikita/braveApiKey")).toString().trimmed()
+        : qEnvironmentVariable("BRAVE_API_KEY").trimmed();
+    QString ttl = title.trimmed();
+    if (ttl.isEmpty()) { ttl = t.left(40); }
+    NikitaTaskAgent *agent = new NikitaTaskAgent(m_nextTaskId++, ttl, t, key, apiModel(),
+                                                 braveKey, assistantName(), m_memory, this);
+    connect(agent, &NikitaTaskAgent::changed, this, [this](int) { emit agentTasksChanged(); });
+    connect(agent, &NikitaTaskAgent::finished, this, [this, agent](int id) {
+        emit agentTasksChanged();
+        emit taskFinished(id, agent->title(), agent->result());
+        nikitaLogAs(assistantName(),
+                   QStringLiteral("task #%1 (%2) %3").arg(id).arg(agent->title(), agent->stateText()));
+    });
+    m_tasks.append(agent);
+    nikitaLogAs(assistantName(), QStringLiteral("spawned task #%1: %2").arg(agent->id()).arg(t.left(80)));
+    emit agentTasksChanged();
+    agent->start();
+}
+
+void NikitaBackend::stopTask(int id)
+{
+    for (NikitaTaskAgent *t : m_tasks) {
+        if (t->id() == id) { t->stop(); break; }
+    }
+}
+
+void NikitaBackend::clearFinishedTasks()
+{
+    QList<NikitaTaskAgent*> keep;
+    for (NikitaTaskAgent *t : m_tasks) {
+        if (t->state() == NikitaTaskAgent::State::Running) { keep.append(t); }
+        else { t->deleteLater(); }
+    }
+    m_tasks = keep;
+    emit agentTasksChanged();
 }
 
 void NikitaBackend::reloadMcp()
@@ -7134,6 +7222,18 @@ void NikitaBackend::runOneTool(const QString &rawName, const QJsonObject &args, 
         done(result);
     };
     done = logged;
+
+    // Spawn a parallel fragment of Nikita. Fire-and-forget: it runs on its own
+    // and its result surfaces when it finishes; this turn does not block on it.
+    if (name == QLatin1String("spawn_task")) {
+        const QString task = args.value("task").toString().trimmed();
+        if (task.isEmpty()) { done(QStringLiteral("{\"error\":\"no task given\"}")); return; }
+        spawnTask(args.value("title").toString(), task);
+        done(QStringLiteral("{\"ok\":true,\"spawned\":true,\"note\":\"A fragment is now working "
+                            "this in parallel. Its result will arrive on its own -- do not wait for "
+                            "it here; continue with anything else, or tell the user it is running.\"}"));
+        return;
+    }
 
     // The web tools -- read-only HTTP, no device, no workspace needed.
     if (name == QLatin1String("web_search")) {

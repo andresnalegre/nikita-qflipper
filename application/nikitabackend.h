@@ -27,6 +27,7 @@ class QProcess;
 // to live-query the connected Flipper Zero over qFlipper's RPC link.
 class FlipperCli;   // defined below; NikitaBackend holds a pointer for run_cli
 class McpClient;   // application/mcpclient.h -- the MCP tool servers
+class NikitaTaskAgent; // application/nikitataskagent.h -- parallel Nikita fragments
 
 class NikitaBackend : public QObject
 {
@@ -166,6 +167,17 @@ private:
     Q_PROPERTY(int mcpToolCount READ mcpToolCount NOTIFY mcpChanged)
     Q_PROPERTY(QVariantList mcpServers READ mcpServers NOTIFY mcpChanged)
     Q_PROPERTY(QString mcpConfigPath READ mcpConfigPath CONSTANT)
+
+    // ---- Parallel Nikita fragments (N task agents) ---------------------
+    Q_PROPERTY(QVariantList agentTasks READ agentTasks NOTIFY agentTasksChanged)
+    Q_PROPERTY(int runningTaskCount READ runningTaskCount NOTIFY agentTasksChanged)
+public:
+    QVariantList agentTasks() const;
+    int runningTaskCount() const;
+    Q_INVOKABLE void spawnTask(const QString &title, const QString &task);
+    Q_INVOKABLE void stopTask(int id);
+    Q_INVOKABLE void clearFinishedTasks();
+private:
 
     // ---- The working plan ----------------------------------------------
     // What Nikita is in the middle of. Written by the model through
@@ -363,6 +375,8 @@ signals:
     void modelChanged();
     void agentChanged();
     void mcpChanged();
+    void agentTasksChanged();
+    void taskFinished(int id, const QString &title, const QString &result);
     void planChanged();
     // The whole conversation was thrown away -- the panel has to drop its own
     // copy of it too, or an erase only clears what is on disk and the bubbles
@@ -537,6 +551,8 @@ private:
     ApplicationBackend *m_appBackend = nullptr;
     FlipperCli         *m_cli = nullptr;   // for the run_cli tool (set by Application)
     McpClient          *m_mcp = nullptr;  // MCP tool servers; owned, created in the ctor
+    QList<NikitaTaskAgent*> m_tasks;      // running/finished parallel fragments
+    int                m_nextTaskId = 1;
 
     // The plan, as the model last wrote it: [{text, status}]. m_planNote is
     // its one-line "where this stands", which is what makes a resumed session

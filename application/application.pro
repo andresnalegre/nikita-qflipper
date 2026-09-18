@@ -29,6 +29,7 @@ SOURCES += \
         applicationupdateregistry.cpp \
         nikitabackend.cpp \
         mcpclient.cpp \
+        nikitataskagent.cpp \
         main.cpp \
         qtsingleapplication/qtlocalpeer.cpp \
         qtsingleapplication/qtlockedfile.cpp \
@@ -122,6 +123,7 @@ HEADERS += \
     applicationupdateregistry.h \
     nikitabackend.h \
     mcpclient.h \
+    nikitataskagent.h \
     qtsingleapplication/qtlocalpeer.h \
     qtsingleapplication/qtlockedfile.h \
     qtsingleapplication/qtsingleapplication.h \

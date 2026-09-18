@@ -921,6 +921,127 @@ Rectangle {
             }
         }
 
+        // ---- parallel agents (Nikita fragments) --------------------------
+        // Each entry is one spawn_task fragment: the SAME Nikita, running its
+        // own turn loop on a sub-task in parallel. The strip only exists while
+        // there is at least one fragment; a running one pulses, a finished one
+        // shows its result line. This is the visible half of "N agentes".
+        Rectangle {
+            id: tasksCard
+            property bool expanded: true
+            visible: root.viewState !== "min" && Nikita.agentTasks.length > 0
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? tasksCol.implicitHeight + 12 : 0
+            radius: 4
+            color: "#0d0818"
+            border.width: 1
+            border.color: Theme.color.lightorange2
+
+            ColumnLayout {
+                id: tasksCol
+                x: 10; y: 6
+                width: parent.width - 20
+                spacing: 3
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Text {
+                        text: "✦ fragments"
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 11
+                        font.bold: true
+                    }
+                    Text {
+                        text: Nikita.runningTaskCount > 0
+                              ? Nikita.runningTaskCount + " running"
+                              : "all done"
+                        color: Nikita.runningTaskCount > 0
+                               ? Theme.color.lightorange2 : "#39ff14"
+                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        visible: Nikita.runningTaskCount === 0
+                                 && Nikita.agentTasks.length > 0
+                        text: "clear"
+                        color: Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Nikita.clearFinishedTasks()
+                        }
+                    }
+                    Text {
+                        text: tasksCard.expanded ? "▾" : "▸"
+                        color: Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: tasksCard.expanded = !tasksCard.expanded
+                        }
+                    }
+                }
+
+                Repeater {
+                    model: tasksCard.expanded ? Nikita.agentTasks : []
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        // Status dot: pulsing while running, green done, red error.
+                        Rectangle {
+                            Layout.alignment: Qt.AlignTop
+                            y: 2
+                            width: 7; height: 7; radius: 4
+                            color: modelData.state === "running"
+                                   ? Theme.color.lightorange2
+                                   : (modelData.state === "done"
+                                      ? "#39ff14" : "#ff4444")
+                            SequentialAnimation on opacity {
+                                running: modelData.state === "running"
+                                loops: Animation.Infinite
+                                NumberAnimation { from: 1.0; to: 0.25; duration: 700 }
+                                NumberAnimation { from: 0.25; to: 1.0; duration: 700 }
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+                            Text {
+                                text: modelData.title
+                                color: Theme.color.lightorange2
+                                font.family: "Share Tech Mono"; font.pixelSize: 10
+                                font.bold: true
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                            Text {
+                                visible: modelData.status && modelData.status.length > 0
+                                text: modelData.status
+                                color: Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 9
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+                        }
+                        Text {
+                            visible: modelData.state === "running"
+                            text: "stop"
+                            color: Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 9
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.stopTask(modelData.id)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- message log (hidden when minimized) ----
         ListView {
             id: listView
@@ -1028,7 +1149,9 @@ Rectangle {
                             }
                         }
                         Text {
-                            text: "running task"
+                            text: Nikita.runningTaskCount > 0
+                                  ? "running task +" + Nikita.runningTaskCount
+                                  : "running task"
                             color: Theme.color.lightorange2
                             font.family: "Share Tech Mono"
                             font.pixelSize: 11; font.bold: true
