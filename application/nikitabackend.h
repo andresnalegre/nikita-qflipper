@@ -651,6 +651,11 @@ private:
     QJsonObject m_extras;             // { quickCommands:[], skills:[], plugins:[] }
     void loadExtras();
     void saveExtras();
+    // Cross-client sync of the "+" store through the Flipper SD card, so a skill
+    // installed on qFlipper shows up on the phone (and the firmware has it too).
+    void syncExtrasToFlipper();
+    void readPortableExtras();
+    QString m_syncedExtras;   // last bytes written to the card, to avoid churn
     QString learnedSkillsForPrompt() const;   // injected into systemPrompt()
     QString pluginsForPrompt() const;         // injected into systemPrompt()
     void seedQuickCommandsIfEmpty();

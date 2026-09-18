@@ -2418,6 +2418,11 @@ void NikitaBackend::readPortableMemory()
             // The shared plan rides the same card. Read it after the memory
             // chain so the RPC queue is not handed two reads at once.
             QTimer::singleShot(0, this, [this]() { readPortablePlan(); });
+            // The "+" store (skills/plugins/quick commands) rides the card too,
+            // so a skill installed on the phone shows up here, and once written
+            // it is on the Flipper's SD for the firmware as well.
+            QTimer::singleShot(0, this, [this]() { readPortableExtras(); });
+            QTimer::singleShot(0, this, [this]() { syncExtrasToFlipper(); });
         });
         });
     });
@@ -4721,11 +4726,86 @@ void NikitaBackend::loadExtras()
 
 void NikitaBackend::saveExtras()
 {
+    // Stamp every save so the newest copy wins when two clients diverge.
+    m_extras[QStringLiteral("touched")] =
+        QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
     QFile f(nikitaExtrasPath());
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         f.write(QJsonDocument(m_extras).toJson(QJsonDocument::Indented));
         f.close();
     }
+    // Push to the shared card so the phone/firmware pick it up.
+    syncExtrasToFlipper();
+}
+
+// Mirror the "+" store to the Flipper SD card. Same shape as the plan sync: the
+// exact local bytes go to /ext/nikita/extras.json, guarded so we only write when
+// a device is actually ready and the content changed.
+void NikitaBackend::syncExtrasToFlipper()
+{
+    if (!m_assistantEnabled) { return; }
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    const bool ready = m_appBackend && dev &&
+        m_appBackend->backendState() == ApplicationBackend::BackendState::Ready;
+    if (!ready) { return; }
+
+    const QString body = QString::fromUtf8(
+        QJsonDocument(m_extras).toJson(QJsonDocument::Compact));
+    if (body == m_syncedExtras) { return; }
+
+    QPointer<Flipper::FlipperZero> devRef(dev);
+    ensureFlipperDir("/ext/nikita", [this, devRef, body]() {
+        Flipper::FlipperZero *dev = devRef.data();
+        if (!dev) { return; }
+        QBuffer *buf = new QBuffer(this);
+        buf->setData(body.toUtf8());
+        buf->open(QIODevice::ReadOnly);
+        auto *op = dev->rpc()->storageWrite("/ext/nikita/extras.json", buf);
+        connect(op, &AbstractOperation::finished, this, [buf]() { buf->deleteLater(); });
+        m_syncedExtras = body;
+    });
+}
+
+// Adopt the card's "+" store when it is newer than ours -- the other half of
+// the sync, run when a device connects.
+void NikitaBackend::readPortableExtras()
+{
+    if (!m_assistantEnabled) { return; }
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (!dev) { return; }
+
+    QBuffer *buf = new QBuffer(this);
+    buf->open(QIODevice::ReadWrite);
+    auto *op = dev->rpc()->storageRead("/ext/nikita/extras.json", buf);
+    connect(op, &AbstractOperation::finished, this, [this, op, buf]() {
+        if (!op->isError()) {
+            const QJsonObject o = QJsonDocument::fromJson(buf->data()).object();
+            const QDateTime cardTouched = QDateTime::fromString(
+                o.value(QStringLiteral("touched")).toString(), Qt::ISODate);
+            const QDateTime localTouched = QDateTime::fromString(
+                m_extras.value(QStringLiteral("touched")).toString(), Qt::ISODate);
+            if (!o.isEmpty() && cardTouched.isValid()
+                && (!localTouched.isValid() || cardTouched > localTouched)) {
+                m_extras = o;
+                // Persist locally without re-stamping (keep the card's touched).
+                QFile f(nikitaExtrasPath());
+                if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    f.write(QJsonDocument(m_extras).toJson(QJsonDocument::Indented));
+                    f.close();
+                }
+                m_syncedExtras = QString::fromUtf8(buf->data());
+                nikitaLog(QStringLiteral("+ store adopted from the card (%1 skills, "
+                                         "%2 plugins, %3 quick commands)")
+                    .arg(m_extras.value("skills").toArray().size())
+                    .arg(m_extras.value("plugins").toArray().size())
+                    .arg(m_extras.value("quickCommands").toArray().size()));
+                emit skillsChanged();
+                emit pluginsChanged();
+                emit quickCommandsChanged();
+            }
+        }
+        buf->deleteLater();
+    });
 }
 
 void NikitaBackend::seedQuickCommandsIfEmpty()
