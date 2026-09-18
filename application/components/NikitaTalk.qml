@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Dialogs
 
 import Theme 1.0
 import QFlipper 1.0
@@ -311,14 +312,61 @@ Rectangle {
 
     function sendCurrent() {
         var t = input.text.trim();
-        if(t.length === 0 || Nikita.thinking) {
+        // An attachment on its own ("look at this") is a valid turn, so send is
+        // allowed with empty text as long as something is staged.
+        if((t.length === 0 && attachModel.count === 0) || Nikita.thinking) {
             return;
         }
-        appendMessage("you", t);
-        Nikita.send(t, deviceContext());
+        var shown = t;
+        if(attachModel.count > 0) {
+            var names = [];
+            for(var i = 0; i < attachModel.count; i++)
+                names.push("📎 " + attachModel.get(i).name);
+            shown = (t.length > 0 ? t + "\n" : "") + names.join("  ");
+        }
+        appendMessage("you", shown);
+        Nikita.send(t, deviceContext());   // backend picks up staged files
         input.text = "";
+        attachModel.clear();
     }
 
+    // What is staged for the next message, for the strip above the input. The
+    // actual bytes are read and held by the backend (stageAttachmentFromPath);
+    // this is only the on-screen list (name + path for an image thumbnail).
+    ListModel { id: attachModel }
+
+    FileDialog {
+        id: attachDialog
+        title: "Attach an image or file for " + root.aiName
+        fileMode: FileDialog.OpenFiles
+        nameFilters: ["Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp)",
+                      "All files (*)"]
+        onAccepted: {
+            for(var i = 0; i < selectedFiles.length; i++) {
+                var url = selectedFiles[i];
+                var note = Nikita.stageAttachmentFromPath(url);
+                var path = ("" + url).replace("file://", "");
+                var name = path.split("/").pop();
+                var lower = name.toLowerCase();
+                var isImg = /\.(png|jpe?g|gif|webp|bmp)$/.test(lower);
+                attachModel.append({ "name": name, "path": path,
+                                     "url": "" + url, "isImage": isImg });
+            }
+        }
+    }
+
+    FolderDialog {
+        id: folderDialog
+        title: "Add a folder for " + root.aiName
+        onAccepted: {
+            var note = Nikita.stageFolderFromPath("" + selectedFolder);
+            var path = ("" + selectedFolder).replace("file://", "");
+            var name = path.split("/").filter(function(s){return s.length;}).pop();
+            attachModel.append({ "name": name + "/ (" + note + ")",
+                                 "path": path, "url": "" + selectedFolder,
+                                 "isImage": false });
+        }
+    }
 
     ListModel { id: chatModel }
 
@@ -1666,11 +1714,132 @@ Rectangle {
             }
         }
 
+        // ---- staged attachments strip (only when something is attached) ----
+        Flow {
+            visible: root.viewState !== "min" && attachModel.count > 0
+            Layout.fillWidth: true
+            spacing: 6
+            Repeater {
+                model: attachModel
+                Rectangle {
+                    width: chipRow.implicitWidth + 34
+                    height: 34
+                    radius: 6
+                    color: "#120818"
+                    border.width: 1
+                    border.color: Theme.color.mediumorange2
+                    Row {
+                        id: chipRow
+                        anchors.left: parent.left
+                        anchors.leftMargin: 6
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 6
+                        Image {
+                            visible: model.isImage
+                            source: model.isImage ? model.url : ""
+                            width: 24; height: 24
+                            fillMode: Image.PreserveAspectCrop
+                            clip: true
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                            visible: !model.isImage
+                            text: "📄"
+                            font.pixelSize: 16
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Text {
+                            text: model.name.length > 18
+                                  ? model.name.substring(0, 17) + "…"
+                                  : model.name
+                            color: Theme.color.lightorange2
+                            font.family: "Share Tech Mono"; font.pixelSize: 11
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+                    Text {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 6
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "✕"
+                        color: Theme.color.mediumorange1
+                        font.pixelSize: 12
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -6
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                attachModel.remove(index);
+                                // Rebuild the backend's staged set from what is
+                                // left on screen, so a removed chip is really gone.
+                                Nikita.clearStagedAttachments();
+                                for(var k = 0; k < attachModel.count; k++)
+                                    Nikita.stageAttachmentFromPath(
+                                        attachModel.get(k).url);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- input row (hidden when minimized) ----
         RowLayout {
             visible: root.viewState !== "min"
             Layout.fillWidth: true
             spacing: 6
+
+            // The "+" menu: attach, add folder, quick commands, add new skill,
+            // plugins -- the same shape as the Claude composer's plus button.
+            Rectangle {
+                Layout.preferredWidth: 30
+                Layout.preferredHeight: 30
+                radius: 6
+                color: plusMouse.containsMouse ? Theme.color.mediumorange2
+                                               : "transparent"
+                border.width: 1
+                border.color: Theme.color.mediumorange2
+                enabled: root.hasModel
+                opacity: root.hasModel ? 1.0 : 0.4
+                Text {
+                    anchors.centerIn: parent
+                    text: "+"
+                    color: Theme.color.lightorange2
+                    font.family: "Share Tech Mono"
+                    font.pixelSize: 20; font.bold: true
+                }
+                MouseArea {
+                    id: plusMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: plusMenu.open()
+                }
+                Menu {
+                    id: plusMenu
+                    y: -implicitHeight - 4
+                    MenuItem {
+                        text: "📎  Add files or photos"
+                        onTriggered: attachDialog.open()
+                    }
+                    MenuItem {
+                        text: "📁  Add folder"
+                        onTriggered: folderDialog.open()
+                    }
+                    MenuItem {
+                        text: "⚡  Quick commands"
+                        onTriggered: quickPanel.open = true
+                    }
+                    MenuItem {
+                        text: "✦  Add New Skill"
+                        onTriggered: skillPanel.open = true
+                    }
+                    MenuItem {
+                        text: "🔌  Plugins"
+                        onTriggered: pluginPanel.open = true
+                    }
+                }
+            }
 
             Rectangle {
                 Layout.fillWidth: true
@@ -1757,7 +1926,8 @@ Rectangle {
                 // Outside a turn: the normal send button. During a turn: only
                 // once there is something to queue.
                 visible: !Nikita.thinking || input.text.length > 0
-                enabled: root.hasModel && input.text.length > 0
+                enabled: root.hasModel
+                         && (input.text.length > 0 || attachModel.count > 0)
                 onClicked: {
                     if (!Nikita.thinking) {
                         root.sendCurrent();
@@ -2083,6 +2253,457 @@ Rectangle {
                                 Nikita.assistantEnabled = false;
                             }
                             consent.pending = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ================= "+" menu panels: quick / skill / plugins ============
+
+    // ---- Quick commands: a catalog of ready-made prompts -------------------
+    Item {
+        id: quickPanel
+        parent: root.parent ? root.parent : root
+        anchors.fill: parent
+        z: 210
+        property bool open: false
+        visible: opacity > 0
+        enabled: visible
+        focus: open
+        opacity: open ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: 120 } }
+        Keys.onEscapePressed: quickPanel.open = false
+
+        MouseArea { anchors.fill: parent; onClicked: quickPanel.open = false }
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 40, 520)
+            height: Math.min(parent.height - 60, 520)
+            radius: 8
+            color: "#0d0818"
+            border.width: 1
+            border.color: Theme.color.lightorange2
+            MouseArea { anchors.fill: parent }   // swallow clicks
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 10
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        text: "⚡  Quick commands"
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: "✕"; color: Theme.color.mediumorange1
+                        font.pixelSize: 16
+                        MouseArea { anchors.fill: parent; anchors.margins: -6
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: quickPanel.open = false }
+                    }
+                }
+                Text {
+                    text: "Pick one to drop it in the box. It sends right away."
+                    color: Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 10
+                }
+                ListView {
+                    id: quickList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 6
+                    model: Nikita.quickCommands()
+                    Connections {
+                        target: Nikita
+                        function onQuickCommandsChanged() {
+                            quickList.model = Nikita.quickCommands();
+                        }
+                    }
+                    delegate: Rectangle {
+                        width: quickList.width
+                        height: qcCol.implicitHeight + 14
+                        radius: 6
+                        color: qcMouse.containsMouse ? "#1b1030" : "#120818"
+                        border.width: 1
+                        border.color: Theme.color.mediumorange2
+                        ColumnLayout {
+                            id: qcCol
+                            x: 10; y: 7
+                            width: parent.width - 50
+                            spacing: 2
+                            Text {
+                                text: modelData.label
+                                color: Theme.color.lightorange2
+                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                Layout.fillWidth: true; elide: Text.ElideRight
+                            }
+                            Text {
+                                text: modelData.prompt
+                                color: Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 10
+                                wrapMode: Text.WordWrap; maximumLineCount: 2
+                                elide: Text.ElideRight; Layout.fillWidth: true
+                            }
+                        }
+                        Text {
+                            visible: !modelData.builtin
+                            anchors.right: parent.right; anchors.rightMargin: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "✕"; color: Theme.color.mediumorange1
+                            font.pixelSize: 12
+                            MouseArea { anchors.fill: parent; anchors.margins: -6
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.removeQuickCommand(modelData.id) }
+                        }
+                        MouseArea {
+                            id: qcMouse
+                            anchors.fill: parent
+                            anchors.rightMargin: 24
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                quickPanel.open = false;
+                                if(Nikita.thinking) {
+                                    Nikita.queueMessage(modelData.prompt);
+                                } else {
+                                    root.appendMessage("you", modelData.prompt);
+                                    Nikita.send(modelData.prompt, root.deviceContext());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Add your own quick command.
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.preferredHeight: 28
+                        radius: 6; color: "black"
+                        border.width: 1; border.color: Theme.color.mediumorange2
+                        TextInput {
+                            id: newQuick
+                            anchors.fill: parent; anchors.margins: 6
+                            verticalAlignment: TextInput.AlignVCenter
+                            color: "white"; clip: true
+                            font.family: "Share Tech Mono"; font.pixelSize: 12
+                            Text {
+                                anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                                visible: newQuick.text.length === 0 && !newQuick.activeFocus
+                                text: "add your own prompt…"
+                                color: Theme.color.mediumorange1; font: newQuick.font
+                            }
+                        }
+                    }
+                    Button {
+                        text: "Add"
+                        enabled: newQuick.text.trim().length > 0
+                        onClicked: {
+                            Nikita.addQuickCommand("", newQuick.text.trim());
+                            newQuick.text = "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Add New Skill: learn from a GitHub repo --------------------------
+    Item {
+        id: skillPanel
+        parent: root.parent ? root.parent : root
+        anchors.fill: parent
+        z: 210
+        property bool open: false
+        property string status: ""
+        property bool busy: false
+        visible: opacity > 0
+        enabled: visible
+        focus: open
+        opacity: open ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: 120 } }
+        Keys.onEscapePressed: skillPanel.open = false
+        Connections {
+            target: Nikita
+            function onSkillLearnStatus(message, busy) {
+                skillPanel.status = message; skillPanel.busy = busy;
+            }
+        }
+        MouseArea { anchors.fill: parent; onClicked: skillPanel.open = false }
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 40, 520)
+            height: Math.min(parent.height - 60, 520)
+            radius: 8; color: "#0d0818"
+            border.width: 1; border.color: Theme.color.lightorange2
+            MouseArea { anchors.fill: parent }
+            ColumnLayout {
+                anchors.fill: parent; anchors.margins: 14; spacing: 10
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        text: "✦  Add New Skill"
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: "✕"; color: Theme.color.mediumorange1; font.pixelSize: 16
+                        MouseArea { anchors.fill: parent; anchors.margins: -6
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: skillPanel.open = false }
+                    }
+                }
+                Text {
+                    text: "Paste a GitHub repo link. Nikita reads it, distills what it does, and keeps it as a skill she can use."
+                    color: Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 10
+                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 6
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.preferredHeight: 28
+                        radius: 6; color: "black"
+                        border.width: 1; border.color: Theme.color.mediumorange2
+                        TextInput {
+                            id: repoUrl
+                            anchors.fill: parent; anchors.margins: 6
+                            verticalAlignment: TextInput.AlignVCenter
+                            color: "white"; clip: true
+                            font.family: "Share Tech Mono"; font.pixelSize: 12
+                            Text {
+                                anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                                visible: repoUrl.text.length === 0 && !repoUrl.activeFocus
+                                text: "https://github.com/owner/repo"
+                                color: Theme.color.mediumorange1; font: repoUrl.font
+                            }
+                        }
+                    }
+                    Button {
+                        text: skillPanel.busy ? "…" : "Learn"
+                        enabled: repoUrl.text.trim().length > 0 && !skillPanel.busy
+                        onClicked: { Nikita.addSkillFromRepo(repoUrl.text.trim()); }
+                    }
+                }
+                Text {
+                    visible: skillPanel.status.length > 0
+                    text: skillPanel.status
+                    color: skillPanel.busy ? Theme.color.mediumorange1 : "#39ff14"
+                    font.family: "Share Tech Mono"; font.pixelSize: 11
+                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                }
+                Text {
+                    text: "Skills you've learned:"
+                    color: Theme.color.lightorange2
+                    font.family: "Share Tech Mono"; font.pixelSize: 11
+                }
+                ListView {
+                    id: skillList
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                    clip: true; spacing: 6
+                    model: Nikita.learnedSkills()
+                    Connections {
+                        target: Nikita
+                        function onSkillsChanged() {
+                            skillList.model = Nikita.learnedSkills();
+                        }
+                    }
+                    delegate: Rectangle {
+                        width: skillList.width
+                        height: skCol.implicitHeight + 14
+                        radius: 6; color: "#120818"
+                        border.width: 1; border.color: Theme.color.mediumorange2
+                        ColumnLayout {
+                            id: skCol
+                            x: 10; y: 7; width: parent.width - 40; spacing: 2
+                            Text {
+                                text: modelData.name
+                                color: Theme.color.lightorange2
+                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                Layout.fillWidth: true; elide: Text.ElideRight
+                            }
+                            Text {
+                                text: modelData.summary
+                                color: Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 10
+                                wrapMode: Text.WordWrap; Layout.fillWidth: true
+                            }
+                        }
+                        Text {
+                            anchors.right: parent.right; anchors.rightMargin: 10
+                            anchors.top: parent.top; anchors.topMargin: 8
+                            text: "✕"; color: Theme.color.mediumorange1; font.pixelSize: 12
+                            MouseArea { anchors.fill: parent; anchors.margins: -6
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.removeSkill(modelData.name) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Plugins: register external APIs Nikita can call ------------------
+    Item {
+        id: pluginPanel
+        parent: root.parent ? root.parent : root
+        anchors.fill: parent
+        z: 210
+        property bool open: false
+        visible: opacity > 0
+        enabled: visible
+        focus: open
+        opacity: open ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: 120 } }
+        Keys.onEscapePressed: pluginPanel.open = false
+        MouseArea { anchors.fill: parent; onClicked: pluginPanel.open = false }
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 40, 540)
+            height: Math.min(parent.height - 60, 560)
+            radius: 8; color: "#0d0818"
+            border.width: 1; border.color: Theme.color.lightorange2
+            MouseArea { anchors.fill: parent }
+            ColumnLayout {
+                anchors.fill: parent; anchors.margins: 14; spacing: 8
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        text: "🔌  Plugins"
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: "✕"; color: Theme.color.mediumorange1; font.pixelSize: 16
+                        MouseArea { anchors.fill: parent; anchors.margins: -6
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: pluginPanel.open = false }
+                    }
+                }
+                Text {
+                    text: "Register an HTTP API so Nikita can call it. She gets a call_plugin tool; the base URL and auth header are added for her."
+                    color: Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 10
+                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                }
+                Grid {
+                    Layout.fillWidth: true
+                    columns: 2; columnSpacing: 6; rowSpacing: 6
+                    property real fw: (width - columnSpacing) / 2
+                    Repeater {
+                        model: [ {id:"pn", ph:"name (e.g. weather)"},
+                                 {id:"pu", ph:"base URL (https://…)"},
+                                 {id:"ph", ph:"auth header (optional)"},
+                                 {id:"pv", ph:"auth value (optional)"} ]
+                        Rectangle {
+                            width: parent.fw; height: 28
+                            radius: 6; color: "black"
+                            border.width: 1; border.color: Theme.color.mediumorange2
+                            property alias text: pf.text
+                            TextInput {
+                                id: pf
+                                objectName: modelData.id
+                                anchors.fill: parent; anchors.margins: 6
+                                verticalAlignment: TextInput.AlignVCenter
+                                color: "white"; clip: true
+                                font.family: "Share Tech Mono"; font.pixelSize: 11
+                                Text {
+                                    anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                                    visible: pf.text.length === 0 && !pf.activeFocus
+                                    text: modelData.ph
+                                    color: Theme.color.mediumorange1; font: pf.font
+                                }
+                            }
+                        }
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 6
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.preferredHeight: 28
+                        radius: 6; color: "black"
+                        border.width: 1; border.color: Theme.color.mediumorange2
+                        TextInput {
+                            id: pdesc
+                            anchors.fill: parent; anchors.margins: 6
+                            verticalAlignment: TextInput.AlignVCenter
+                            color: "white"; clip: true
+                            font.family: "Share Tech Mono"; font.pixelSize: 11
+                            Text {
+                                anchors.fill: parent; verticalAlignment: Text.AlignVCenter
+                                visible: pdesc.text.length === 0 && !pdesc.activeFocus
+                                text: "what it does / when to use it"
+                                color: Theme.color.mediumorange1; font: pdesc.font
+                            }
+                        }
+                    }
+                    Button {
+                        text: "Add"
+                        onClicked: {
+                            function fld(o) {
+                                var r = null;
+                                function walk(it){ for(var i=0;i<it.children.length;i++){
+                                    var c=it.children[i];
+                                    if(c.objectName===o) r=c; else walk(c); } }
+                                walk(pluginPanel); return r;
+                            }
+                            var pn=fld("pn"), pu=fld("pu"), ph=fld("ph"), pv=fld("pv");
+                            if(pn && pu && pn.text.trim().length && pu.text.trim().length){
+                                Nikita.addPlugin(pn.text.trim(), pu.text.trim(),
+                                    ph?ph.text.trim():"", pv?pv.text.trim():"",
+                                    pdesc.text.trim());
+                                pn.text=""; pu.text=""; if(ph)ph.text=""; if(pv)pv.text="";
+                                pdesc.text="";
+                            }
+                        }
+                    }
+                }
+                ListView {
+                    id: pluginList
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                    clip: true; spacing: 6
+                    model: Nikita.plugins()
+                    Connections {
+                        target: Nikita
+                        function onPluginsChanged() { pluginList.model = Nikita.plugins(); }
+                    }
+                    delegate: Rectangle {
+                        width: pluginList.width
+                        height: plCol.implicitHeight + 14
+                        radius: 6; color: "#120818"
+                        border.width: 1; border.color: Theme.color.mediumorange2
+                        ColumnLayout {
+                            id: plCol
+                            x: 10; y: 7; width: parent.width - 40; spacing: 2
+                            Text {
+                                text: modelData.name + "  ·  " + modelData.baseUrl
+                                color: Theme.color.lightorange2
+                                font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                                Layout.fillWidth: true; elide: Text.ElideRight
+                            }
+                            Text {
+                                visible: modelData.description.length > 0
+                                text: modelData.description
+                                color: Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 10
+                                wrapMode: Text.WordWrap; Layout.fillWidth: true
+                            }
+                        }
+                        Text {
+                            anchors.right: parent.right; anchors.rightMargin: 10
+                            anchors.top: parent.top; anchors.topMargin: 8
+                            text: "✕"; color: Theme.color.mediumorange1; font.pixelSize: 12
+                            MouseArea { anchors.fill: parent; anchors.margins: -6
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.removePlugin(modelData.name) }
                         }
                     }
                 }

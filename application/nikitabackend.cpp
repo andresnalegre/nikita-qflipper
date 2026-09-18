@@ -17,6 +17,7 @@
 #include <QNetworkRequest>
 #include <QNetworkReply>
 #include <QRegularExpression>
+#include <QUuid>
 #include <QFile>
 #include <QDir>
 #include <QDirIterator>
@@ -1027,7 +1028,7 @@ static int nikitaMessageFocus(const QString &text)
 // are the only way to touch the device at all, and they earn their place.
 static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
                               const QSet<QString> *allowed = nullptr,
-                              bool overBle = false)
+                              bool overBle = false, bool hasPlugins = false)
 {
     const QJsonObject listFiles{
         {"type", "function"},
@@ -1321,8 +1322,32 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         }}
     };
 
+    const QJsonObject callPlugin{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "call_plugin"},
+            {"description", "Call one of the user's registered API PLUGINS (see the PLUGINS list "
+             "in your context). The plugin's base URL and any auth header are added automatically "
+             "-- you give the plugin name, the path (appended to its base URL), the HTTP method, "
+             "and an optional JSON body. Returns the response text. Only for registered plugins."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"name", QJsonObject{{"type", "string"}, {"description", "The registered plugin name."}}},
+                    {"path", QJsonObject{{"type", "string"}, {"description", "Path appended to the base URL, e.g. /v1/thing?x=1"}}},
+                    {"method", QJsonObject{{"type", "string"}, {"description", "GET, POST, PUT, DELETE. Default GET."}}},
+                    {"body", QJsonObject{{"type", "string"}, {"description", "Optional JSON body for POST/PUT."}}}
+                }},
+                {"required", QJsonArray{"name", "path"}}
+            }}
+        }}
+    };
+
     QJsonArray tools{remember, listMemory, forget, nikitaPlanTool(),
                      webSearch, webFetch, spawnTask};
+    if (hasPlugins) {
+        tools.append(callPlugin);
+    }
 
     // The Flipper's own file tools come off the list when the message is plainly
     // about the computer. Not to forbid anything -- runOneTool would reroute a
@@ -2001,6 +2026,7 @@ NikitaBackend::NikitaBackend(QObject *parent)
 {
     m_net.setTransferTimeout(0);
     loadHistory();
+    loadExtras();
     loadFilters();
     loadMistakes();
     // Off on a fresh install. An assistant that reads files and remembers
@@ -3059,36 +3085,73 @@ static QString nikitaToolDetail(const QString &name, const QJsonObject &args)
     return QStringLiteral("%1(%2)").arg(name, bits.join(QStringLiteral(", ")));
 }
 
-static QString nikitaToolStatus(const QString &tool)
+// A Claude-Code-style live status: an action verb plus the thing it acts on
+// ("read config.txt", "ran `ls`", "searching the web · foo"), so the footer
+// reads like a running command, not a bare tool name. args may be empty.
+static QString nikitaToolStatus(const QString &tool,
+                                const QJsonObject &args = QJsonObject())
 {
-    static const QHash<QString, QString> phrases = {
-        {QStringLiteral("computer_write"),  QStringLiteral("writing the file")},
-        {QStringLiteral("computer_read"),   QStringLiteral("reading the file")},
-        {QStringLiteral("computer_list"),   QStringLiteral("listing the folder")},
-        {QStringLiteral("computer_find"),   QStringLiteral("searching")},
-        {QStringLiteral("computer_grep"),   QStringLiteral("searching the code")},
-        {QStringLiteral("computer_edit"),   QStringLiteral("editing the file")},
-        {QStringLiteral("computer_run"),    QStringLiteral("running the command")},
-        {QStringLiteral("computer_cd"),     QStringLiteral("changing folder")},
-        {QStringLiteral("computer_mkdir"),  QStringLiteral("creating the folder")},
-        {QStringLiteral("computer_delete"), QStringLiteral("deleting")},
-        {QStringLiteral("computer_move"),   QStringLiteral("moving")},
-        {QStringLiteral("computer_copy"),   QStringLiteral("copying")},
-        {QStringLiteral("save_file"),   QStringLiteral("writing to the Flipper")},
-        {QStringLiteral("read_file"),   QStringLiteral("reading from the Flipper")},
-        {QStringLiteral("list_files"),  QStringLiteral("listing the Flipper")},
-        {QStringLiteral("file_info"),   QStringLiteral("checking the file")},
-        {QStringLiteral("make_dir"),    QStringLiteral("creating the folder on the Flipper")},
-        {QStringLiteral("delete_file"), QStringLiteral("deleting on the Flipper")},
-        {QStringLiteral("rename_file"), QStringLiteral("renaming on the Flipper")},
-        {QStringLiteral("press_button"),QStringLiteral("pressing the button")},
-        {QStringLiteral("run_cli"),     QStringLiteral("running it on the Flipper")},
-        {QStringLiteral("remember"),    QStringLiteral("saving that to memory")},
-        {QStringLiteral("list_memory"), QStringLiteral("checking memory")},
-        {QStringLiteral("forget"),      QStringLiteral("forgetting that")},
-        {QStringLiteral("web_search"),  QStringLiteral("searching the web")},
-        {QStringLiteral("web_fetch"),   QStringLiteral("reading the page")},
+    auto val = [&](const char *k) -> QString {
+        QString v = args.value(QLatin1String(k)).toVariant().toString().simplified();
+        if (v.size() > 40) { v = v.left(40) + QStringLiteral("…"); }
+        return v;
     };
+    auto base = [](const QString &p) -> QString {
+        const int slash = p.lastIndexOf(QLatin1Char('/'));
+        return slash >= 0 ? p.mid(slash + 1) : p;
+    };
+    const QString path = base(val("path"));
+
+    if (tool == QLatin1String("web_search"))
+        return QStringLiteral("searching the web · %1").arg(val("query"));
+    if (tool == QLatin1String("web_fetch"))
+        return QStringLiteral("reading %1").arg(val("url"));
+    if (tool == QLatin1String("spawn_task"))
+        return QStringLiteral("spinning up a fragment · %1").arg(val("title"));
+    if (tool == QLatin1String("computer_run"))
+        return QStringLiteral("ran a command · %1").arg(val("command"));
+    if (tool == QLatin1String("run_cli"))
+        return QStringLiteral("running on the Flipper · %1").arg(val("command"));
+    if (tool == QLatin1String("computer_read"))
+        return QStringLiteral("read %1").arg(path);
+    if (tool == QLatin1String("computer_write"))
+        return QStringLiteral("writing %1").arg(path);
+    if (tool == QLatin1String("computer_edit"))
+        return QStringLiteral("editing %1").arg(path);
+    if (tool == QLatin1String("computer_list"))
+        return QStringLiteral("listing %1").arg(val("path"));
+    if (tool == QLatin1String("computer_find") || tool == QLatin1String("computer_grep"))
+        return QStringLiteral("searching files · %1%2").arg(val("pattern"), val("query"));
+    if (tool == QLatin1String("computer_mkdir"))
+        return QStringLiteral("creating %1").arg(path);
+    if (tool == QLatin1String("computer_delete"))
+        return QStringLiteral("deleting %1").arg(path);
+    if (tool == QLatin1String("computer_move")) return QStringLiteral("moving");
+    if (tool == QLatin1String("computer_copy")) return QStringLiteral("copying");
+    if (tool == QLatin1String("computer_cd")) return QStringLiteral("changing folder");
+    if (tool == QLatin1String("save_file"))
+        return QStringLiteral("writing %1 to the Flipper").arg(path);
+    if (tool == QLatin1String("read_file"))
+        return QStringLiteral("reading %1 from the Flipper").arg(path);
+    if (tool == QLatin1String("list_files"))
+        return QStringLiteral("listing the Flipper · %1").arg(val("path"));
+    if (tool == QLatin1String("file_info"))
+        return QStringLiteral("checking %1").arg(path);
+    if (tool == QLatin1String("make_dir"))
+        return QStringLiteral("creating %1 on the Flipper").arg(path);
+    if (tool == QLatin1String("delete_file"))
+        return QStringLiteral("deleting %1 on the Flipper").arg(path);
+    if (tool == QLatin1String("rename_file"))
+        return QStringLiteral("renaming on the Flipper");
+    if (tool == QLatin1String("press_button"))
+        return QStringLiteral("pressing %1").arg(val("button"));
+    if (tool == QLatin1String("run_app"))
+        return QStringLiteral("opening %1").arg(val("name"));
+    if (tool == QLatin1String("remember")) return QStringLiteral("saving that to memory");
+    if (tool == QLatin1String("list_memory")) return QStringLiteral("checking memory");
+    if (tool == QLatin1String("forget")) return QStringLiteral("forgetting that");
+    if (tool == QLatin1String("update_plan")) return QStringLiteral("updating the plan");
+
     // An MCP tool's name is mcp__<server>__<tool>. The server is the part
     // worth showing: "asking github" says more than the identifier does.
     if (McpClient::isMcpTool(tool)) {
@@ -3099,7 +3162,7 @@ static QString nikitaToolStatus(const QString &tool)
         return bare.isEmpty() ? QStringLiteral("asking %1").arg(server)
                               : QStringLiteral("%1: %2").arg(server, bare);
     }
-    return phrases.value(tool, QStringLiteral("working"));
+    return QStringLiteral("working");
 }
 
 QString NikitaBackend::turnStatus() const { return m_turnStatus; }
@@ -4482,12 +4545,517 @@ QString NikitaBackend::systemPrompt() const
             .arg(sys.size()).arg(sys.size() / 4)
             .arg(m_turnIsDevice ? QStringLiteral("yes") : QStringLiteral("no"))
             .arg(m_turnNeedsTools ? QStringLiteral("yes") : QStringLiteral("no")));
+    // Skills learned from GitHub repos and any registered API plugins -- the
+    // "+" menu's contribution to what Nikita knows and can reach.
+    sys += learnedSkillsForPrompt();
+    sys += pluginsForPrompt();
+
     // Last, after everything else, so the bytes before it never move: the
     // provider caches the longest identical prefix it has seen, and the plan is
     // the one part of this prompt that legitimately changes every round.
     sys += planForPrompt();
 
     return sys;
+}
+
+void NikitaBackend::stageAttachment(const QVariantMap &att)
+{
+    QJsonObject o;
+    o["kind"] = att.value(QStringLiteral("kind"), QStringLiteral("file")).toString();
+    o["filename"] = att.value(QStringLiteral("filename")).toString();
+    o["mime"] = att.value(QStringLiteral("mime")).toString();
+    o["dataURL"] = att.value(QStringLiteral("dataURL")).toString();
+    o["text"] = att.value(QStringLiteral("text")).toString();
+    o["bytes"] = att.value(QStringLiteral("bytes")).toInt();
+    m_stagedAttachments.append(o);
+}
+
+void NikitaBackend::clearStagedAttachments()
+{
+    m_stagedAttachments = QJsonArray();
+}
+
+// Read a file the QML file dialog returned, classify it (image vs text vs other)
+// and stage it. Images become base64 data URLs (Kimi vision); text files are
+// inlined; anything else is noted by name and size. 20 MB cap so a stray huge
+// file cannot blow the request up.
+QString NikitaBackend::stageAttachmentFromPath(const QString &path)
+{
+    QString p = path;
+    if (p.startsWith(QLatin1String("file://"))) {
+        p = QUrl(p).toLocalFile();
+    }
+    QFileInfo fi(p);
+    if (!fi.exists() || !fi.isFile()) {
+        return QStringLiteral("No such file: %1").arg(p);
+    }
+    if (fi.size() > 20 * 1024 * 1024) {
+        return QStringLiteral("Too large (%1 MB); 20 MB max.")
+            .arg(fi.size() / (1024.0 * 1024.0), 0, 'f', 1);
+    }
+    QFile f(p);
+    if (!f.open(QIODevice::ReadOnly)) {
+        return QStringLiteral("Could not open %1").arg(fi.fileName());
+    }
+    const QByteArray data = f.readAll();
+    f.close();
+
+    const QString ext = fi.suffix().toLower();
+    static const QStringList imgExts{"png", "jpg", "jpeg", "gif", "webp", "bmp"};
+    QVariantMap att;
+    att["filename"] = fi.fileName();
+    att["bytes"] = static_cast<int>(data.size());
+    if (imgExts.contains(ext)) {
+        QString mime = ext == "png" ? "image/png"
+                     : ext == "gif" ? "image/gif"
+                     : ext == "webp" ? "image/webp"
+                     : ext == "bmp" ? "image/bmp"
+                     : "image/jpeg";
+        att["kind"] = QStringLiteral("image");
+        att["mime"] = mime;
+        att["dataURL"] = QStringLiteral("data:%1;base64,%2")
+            .arg(mime, QString::fromLatin1(data.toBase64()));
+    } else {
+        // Try to read as UTF-8 text; if it is not valid text, keep it as a
+        // named binary reference so at least the model knows it was attached.
+        QString asText = QString::fromUtf8(data);
+        const bool looksText = !asText.contains(QChar(0));
+        if (looksText) {
+            att["kind"] = QStringLiteral("text");
+            att["mime"] = QStringLiteral("text/plain");
+            att["text"] = asText.left(100000);
+        } else {
+            att["kind"] = QStringLiteral("file");
+            att["mime"] = QStringLiteral("application/octet-stream");
+        }
+    }
+    stageAttachment(att);
+    emit stagedAttachmentsChanged();
+    return QStringLiteral("attached %1").arg(fi.fileName());
+}
+
+// Build the user message content for the wire: a plain string when nothing is
+// attached (unchanged from before), or the multimodal array Kimi K2.6+ accept
+// -- a text part (words plus inlined text files) followed by an image_url part
+// per image. Clears the staged list so it only rides one turn.
+QJsonValue NikitaBackend::buildUserContent(const QString &userText)
+{
+    if (m_stagedAttachments.isEmpty()) {
+        return QJsonValue(userText);
+    }
+    QString promptText = userText;
+    QJsonArray images;
+    for (const QJsonValue &v : m_stagedAttachments) {
+        const QJsonObject o = v.toObject();
+        const QString kind = o.value("kind").toString();
+        if (kind == QLatin1String("image")
+            && !o.value("dataURL").toString().isEmpty()) {
+            images.append(QJsonObject{
+                {"type", "image_url"},
+                {"image_url", QJsonObject{{"url", o.value("dataURL").toString()}}}});
+        } else if (kind == QLatin1String("text")
+                   && !o.value("text").toString().isEmpty()) {
+            promptText += QStringLiteral("\n\n--- Attached file: %1 ---\n%2")
+                .arg(o.value("filename").toString(), o.value("text").toString());
+        } else {
+            promptText += QStringLiteral("\n\n[Attached file: %1, %2 bytes -- "
+                                         "binary, cannot read as text]")
+                .arg(o.value("filename").toString())
+                .arg(o.value("bytes").toInt());
+        }
+    }
+    m_stagedAttachments = QJsonArray();
+    emit stagedAttachmentsChanged();
+
+    QJsonArray parts;
+    if (!promptText.isEmpty()) {
+        parts.append(QJsonObject{{"type", "text"}, {"text", promptText}});
+    }
+    for (const QJsonValue &img : images) { parts.append(img); }
+    return QJsonValue(parts);
+}
+
+// ---- "+" menu store: quick commands, learned skills, plugins ---------------
+
+static QString nikitaExtrasPath()
+{
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (dir.isEmpty()) { dir = QDir::tempPath(); }
+    QDir().mkpath(dir);
+    return dir + QStringLiteral("/extras.json");
+}
+
+void NikitaBackend::loadExtras()
+{
+    QFile f(nikitaExtrasPath());
+    if (f.open(QIODevice::ReadOnly)) {
+        m_extras = QJsonDocument::fromJson(f.readAll()).object();
+        f.close();
+    }
+    if (!m_extras.contains(QStringLiteral("quickCommands")))
+        m_extras[QStringLiteral("quickCommands")] = QJsonArray();
+    if (!m_extras.contains(QStringLiteral("skills")))
+        m_extras[QStringLiteral("skills")] = QJsonArray();
+    if (!m_extras.contains(QStringLiteral("plugins")))
+        m_extras[QStringLiteral("plugins")] = QJsonArray();
+    seedQuickCommandsIfEmpty();
+}
+
+void NikitaBackend::saveExtras()
+{
+    QFile f(nikitaExtrasPath());
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        f.write(QJsonDocument(m_extras).toJson(QJsonDocument::Indented));
+        f.close();
+    }
+}
+
+void NikitaBackend::seedQuickCommandsIfEmpty()
+{
+    if (m_extras.value(QStringLiteral("quickCommands")).toArray().size() > 0)
+        return;
+    struct QC { const char *label; const char *prompt; };
+    static const QC seeds[] = {
+        {"Flipper snapshot", "Give me a full snapshot of the connected Flipper: firmware, free SD space, installed apps, and anything that looks off."},
+        {"Free up SD space", "Find the biggest files and any junk on the Flipper SD card and suggest what is safe to delete to free space."},
+        {"Make a BadUSB script", "Ask me the target OS, then write a clean BadUSB DuckyScript for it and save it to /ext/badusb."},
+        {"Scan sub-GHz", "Explain step by step how to capture and replay a sub-GHz signal with this Flipper, and set it up for me."},
+        {"Research a person", "I will give you a name; do a thorough, sourced web lookup and hand me an organised summary."},
+        {"Nice PDF report", "Turn what we just discussed into a clean, good-looking PDF report and save it to my Desktop."},
+        {"Explain this repo", "I will paste a GitHub URL; read it and explain what it does, how it is built, and how I would use it."},
+        {"Health check", "Check that all your tools, the bridge and your skills are working right now, and fix anything you can."}
+    };
+    QJsonArray arr;
+    for (const auto &s : seeds) {
+        arr.append(QJsonObject{
+            {QStringLiteral("id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+            {QStringLiteral("label"), QString::fromUtf8(s.label)},
+            {QStringLiteral("prompt"), QString::fromUtf8(s.prompt)},
+            {QStringLiteral("builtin"), true}});
+    }
+    m_extras[QStringLiteral("quickCommands")] = arr;
+    saveExtras();
+}
+
+QVariantList NikitaBackend::quickCommands() const
+{
+    QVariantList out;
+    for (const QJsonValue &v : m_extras.value(QStringLiteral("quickCommands")).toArray())
+        out.append(v.toObject().toVariantMap());
+    return out;
+}
+
+void NikitaBackend::addQuickCommand(const QString &label, const QString &prompt)
+{
+    if (prompt.trimmed().isEmpty()) { return; }
+    QJsonArray arr = m_extras.value(QStringLiteral("quickCommands")).toArray();
+    arr.append(QJsonObject{
+        {QStringLiteral("id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+        {QStringLiteral("label"), label.trimmed().isEmpty() ? prompt.left(30) : label.trimmed()},
+        {QStringLiteral("prompt"), prompt.trimmed()},
+        {QStringLiteral("builtin"), false}});
+    m_extras[QStringLiteral("quickCommands")] = arr;
+    saveExtras();
+    emit quickCommandsChanged();
+}
+
+void NikitaBackend::removeQuickCommand(const QString &id)
+{
+    QJsonArray arr = m_extras.value(QStringLiteral("quickCommands")).toArray();
+    for (int i = 0; i < arr.size(); ++i) {
+        if (arr.at(i).toObject().value(QStringLiteral("id")).toString() == id) {
+            arr.removeAt(i);
+            break;
+        }
+    }
+    m_extras[QStringLiteral("quickCommands")] = arr;
+    saveExtras();
+    emit quickCommandsChanged();
+}
+
+QVariantList NikitaBackend::learnedSkills() const
+{
+    QVariantList out;
+    for (const QJsonValue &v : m_extras.value(QStringLiteral("skills")).toArray())
+        out.append(v.toObject().toVariantMap());
+    return out;
+}
+
+void NikitaBackend::removeSkill(const QString &name)
+{
+    QJsonArray arr = m_extras.value(QStringLiteral("skills")).toArray();
+    for (int i = 0; i < arr.size(); ++i) {
+        if (arr.at(i).toObject().value(QStringLiteral("name")).toString() == name) {
+            arr.removeAt(i);
+            break;
+        }
+    }
+    m_extras[QStringLiteral("skills")] = arr;
+    saveExtras();
+    emit skillsChanged();
+}
+
+// Learn a skill from a GitHub repo: fetch its README, ask Kimi to distill a
+// compact skill descriptor (name, what it does, when to use it, how to use it,
+// key commands), and store it. From then on it rides in the system prompt, so
+// Nikita "knows" it. Best-effort and honest: a fetch or key failure is reported,
+// not swallowed.
+void NikitaBackend::addSkillFromRepo(const QString &repoUrl)
+{
+    const QString url = repoUrl.trimmed();
+    if (url.isEmpty()) { emit skillLearnStatus(QStringLiteral("Give me a GitHub URL."), false); return; }
+    const QString key = apiKey();
+    if (key.isEmpty()) { emit skillLearnStatus(QStringLiteral("No API key set."), false); return; }
+
+    // Normalise owner/repo out of common GitHub URL shapes.
+    QString owner, repo;
+    QRegularExpression re(QStringLiteral("github\\.com[:/]+([^/]+)/([^/#?]+)"));
+    QRegularExpressionMatch m = re.match(url);
+    if (m.hasMatch()) {
+        owner = m.captured(1);
+        repo = m.captured(2);
+        if (repo.endsWith(QStringLiteral(".git"))) repo.chop(4);
+    }
+    if (owner.isEmpty() || repo.isEmpty()) {
+        emit skillLearnStatus(QStringLiteral("That does not look like a GitHub repo URL."), false);
+        return;
+    }
+
+    emit skillLearnStatus(QStringLiteral("Reading %1/%2…").arg(owner, repo), true);
+
+    // Try the raw README on the two default branches in turn.
+    auto tryBranch = std::make_shared<std::function<void(int)>>();
+    QStringList branches{QStringLiteral("main"), QStringLiteral("master")};
+    *tryBranch = [this, owner, repo, key, branches, tryBranch](int idx) {
+        if (idx >= branches.size()) {
+            emit skillLearnStatus(QStringLiteral("Could not read a README for that repo."), false);
+            return;
+        }
+        const QString raw = QStringLiteral("https://raw.githubusercontent.com/%1/%2/%3/README.md")
+            .arg(owner, repo, branches.at(idx));
+        QNetworkRequest req{QUrl(raw)};
+        req.setRawHeader("User-Agent", "nikita");
+        req.setTransferTimeout(20000);
+        QNetworkReply *reply = m_net.get(req);
+        connect(reply, &QNetworkReply::finished, this,
+                [this, reply, owner, repo, key, idx, tryBranch]() {
+            reply->deleteLater();
+            const QByteArray body = reply->readAll();
+            if (reply->error() != QNetworkReply::NoError || body.isEmpty()) {
+                (*tryBranch)(idx + 1);
+                return;
+            }
+            distillSkillFromReadme(owner, repo, QString::fromUtf8(body).left(12000), key);
+        });
+    };
+    (*tryBranch)(0);
+}
+
+// Second half of addSkillFromRepo: hand the README to Kimi and save the result.
+void NikitaBackend::distillSkillFromReadme(const QString &owner, const QString &repo,
+                                           const QString &readme, const QString &key)
+{
+    emit skillLearnStatus(QStringLiteral("Learning the skill from %1/%2…").arg(owner, repo), true);
+    const QString sys = QStringLiteral(
+        "You turn a GitHub project's README into a COMPACT skill card for an AI assistant "
+        "named Nikita, so she can use the project later. Reply with ONLY compact JSON, no "
+        "prose: {\"name\":\"short human name\",\"summary\":\"one sentence on what it does\","
+        "\"when\":\"when Nikita should reach for it\",\"how\":\"how to use it in practice, "
+        "concrete steps or commands, 2-5 short lines\",\"install\":\"install/setup command if "
+        "any, else empty\"}. Be accurate to the README; do not invent features.");
+    const QString user = QStringLiteral("REPO: github.com/%1/%2\n\nREADME:\n%3")
+        .arg(owner, repo, readme);
+    QJsonObject body{
+        {QStringLiteral("model"), apiModel()},
+        {QStringLiteral("messages"), QJsonArray{
+            QJsonObject{{QStringLiteral("role"), QStringLiteral("system")}, {QStringLiteral("content"), sys}},
+            QJsonObject{{QStringLiteral("role"), QStringLiteral("user")}, {QStringLiteral("content"), user}}
+        }},
+        {QStringLiteral("stream"), false},
+        {QStringLiteral("max_tokens"), 500}
+    };
+    QNetworkRequest req{QUrl(QString::fromUtf8(NIKITA_API_URL))};
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setRawHeader("Authorization", QByteArray("Bearer ") + key.toUtf8());
+    req.setTransferTimeout(60000);
+    QNetworkReply *reply = m_net.post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, owner, repo]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            emit skillLearnStatus(QStringLiteral("Kimi could not distill the skill."), false);
+            return;
+        }
+        const QJsonArray choices = QJsonDocument::fromJson(reply->readAll())
+            .object().value(QStringLiteral("choices")).toArray();
+        QString content = choices.isEmpty() ? QString()
+            : choices.first().toObject().value(QStringLiteral("message")).toObject()
+                  .value(QStringLiteral("content")).toString();
+        const int a = content.indexOf(QLatin1Char('{'));
+        const int b = content.lastIndexOf(QLatin1Char('}'));
+        if (a < 0 || b <= a) {
+            emit skillLearnStatus(QStringLiteral("Could not understand the skill."), false);
+            return;
+        }
+        QJsonObject card = QJsonDocument::fromJson(content.mid(a, b - a + 1).toUtf8()).object();
+        card[QStringLiteral("repo")] = QStringLiteral("github.com/%1/%2").arg(owner, repo);
+        if (card.value(QStringLiteral("name")).toString().trimmed().isEmpty())
+            card[QStringLiteral("name")] = repo;
+
+        QJsonArray arr = m_extras.value(QStringLiteral("skills")).toArray();
+        // Replace any existing skill with the same name.
+        const QString nm = card.value(QStringLiteral("name")).toString();
+        for (int i = 0; i < arr.size(); ++i)
+            if (arr.at(i).toObject().value(QStringLiteral("name")).toString() == nm) { arr.removeAt(i); break; }
+        arr.append(card);
+        m_extras[QStringLiteral("skills")] = arr;
+        saveExtras();
+        emit skillsChanged();
+        emit skillLearnStatus(QStringLiteral("Learned \"%1\". It is now part of me.").arg(nm), false);
+    });
+}
+
+QString NikitaBackend::learnedSkillsForPrompt() const
+{
+    const QJsonArray arr = m_extras.value(QStringLiteral("skills")).toArray();
+    if (arr.isEmpty()) { return QString(); }
+    QString s = QStringLiteral("\n\nLEARNED SKILLS -- projects you have studied and can use. "
+        "Reach for the right one when a request matches it; use your shell/web tools to run it.");
+    for (const QJsonValue &v : arr) {
+        const QJsonObject o = v.toObject();
+        s += QStringLiteral("\n- %1 (%2): %3 WHEN: %4 HOW: %5")
+            .arg(o.value(QStringLiteral("name")).toString(),
+                 o.value(QStringLiteral("repo")).toString(),
+                 o.value(QStringLiteral("summary")).toString(),
+                 o.value(QStringLiteral("when")).toString(),
+                 o.value(QStringLiteral("how")).toString());
+        const QString inst = o.value(QStringLiteral("install")).toString();
+        if (!inst.trimmed().isEmpty())
+            s += QStringLiteral(" INSTALL: %1").arg(inst);
+    }
+    return s;
+}
+
+QVariantList NikitaBackend::plugins() const
+{
+    QVariantList out;
+    for (const QJsonValue &v : m_extras.value(QStringLiteral("plugins")).toArray())
+        out.append(v.toObject().toVariantMap());
+    return out;
+}
+
+void NikitaBackend::addPlugin(const QString &name, const QString &baseUrl,
+                              const QString &authHeader, const QString &authValue,
+                              const QString &description)
+{
+    if (name.trimmed().isEmpty() || baseUrl.trimmed().isEmpty()) { return; }
+    QJsonArray arr = m_extras.value(QStringLiteral("plugins")).toArray();
+    for (int i = 0; i < arr.size(); ++i)
+        if (arr.at(i).toObject().value(QStringLiteral("name")).toString() == name.trimmed()) { arr.removeAt(i); break; }
+    arr.append(QJsonObject{
+        {QStringLiteral("name"), name.trimmed()},
+        {QStringLiteral("baseUrl"), baseUrl.trimmed()},
+        {QStringLiteral("authHeader"), authHeader.trimmed()},
+        {QStringLiteral("authValue"), authValue.trimmed()},
+        {QStringLiteral("description"), description.trimmed()}});
+    m_extras[QStringLiteral("plugins")] = arr;
+    saveExtras();
+    emit pluginsChanged();
+}
+
+void NikitaBackend::removePlugin(const QString &name)
+{
+    QJsonArray arr = m_extras.value(QStringLiteral("plugins")).toArray();
+    for (int i = 0; i < arr.size(); ++i)
+        if (arr.at(i).toObject().value(QStringLiteral("name")).toString() == name) { arr.removeAt(i); break; }
+    m_extras[QStringLiteral("plugins")] = arr;
+    saveExtras();
+    emit pluginsChanged();
+}
+
+QString NikitaBackend::pluginsForPrompt() const
+{
+    const QJsonArray arr = m_extras.value(QStringLiteral("plugins")).toArray();
+    if (arr.isEmpty()) { return QString(); }
+    QString s = QStringLiteral("\n\nPLUGINS -- external HTTP APIs registered for you. Call one "
+        "with the call_plugin tool (plugin name + path + method + optional json body); the base "
+        "URL and any auth header are added for you. Use them when a request matches.");
+    for (const QJsonValue &v : arr) {
+        const QJsonObject o = v.toObject();
+        s += QStringLiteral("\n- %1: %2 (base %3)")
+            .arg(o.value(QStringLiteral("name")).toString(),
+                 o.value(QStringLiteral("description")).toString(),
+                 o.value(QStringLiteral("baseUrl")).toString());
+    }
+    return s;
+}
+
+// Stage the readable text files in a folder (for "Add folder"). Bounded so a
+// huge tree cannot blow up the prompt: up to 25 files, 60 KB each, images too.
+QString NikitaBackend::stageFolderFromPath(const QString &path)
+{
+    QString p = path;
+    if (p.startsWith(QLatin1String("file://"))) { p = QUrl(p).toLocalFile(); }
+    QDir dir(p);
+    if (!dir.exists()) { return QStringLiteral("No such folder."); }
+    int staged = 0;
+    const QFileInfoList entries = dir.entryInfoList(
+        QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QFileInfo &fi : entries) {
+        if (staged >= 25) { break; }
+        if (fi.size() > 60 * 1024) { continue; }
+        const QString note = stageAttachmentFromPath(fi.absoluteFilePath());
+        if (note.startsWith(QStringLiteral("attached"))) { ++staged; }
+    }
+    return QStringLiteral("attached %1 file(s) from %2").arg(staged).arg(dir.dirName());
+}
+
+void NikitaBackend::runCallPlugin(const QJsonObject &args,
+                                  std::function<void(const QString &)> done)
+{
+    const QString name = args.value(QStringLiteral("name")).toString();
+    QJsonObject plugin;
+    for (const QJsonValue &v : m_extras.value(QStringLiteral("plugins")).toArray()) {
+        if (v.toObject().value(QStringLiteral("name")).toString() == name) { plugin = v.toObject(); break; }
+    }
+    if (plugin.isEmpty()) {
+        done(QStringLiteral("{\"error\":\"no plugin named '%1'\"}").arg(name));
+        return;
+    }
+    QString base = plugin.value(QStringLiteral("baseUrl")).toString();
+    while (base.endsWith(QLatin1Char('/'))) base.chop(1);
+    QString path = args.value(QStringLiteral("path")).toString();
+    if (!path.isEmpty() && !path.startsWith(QLatin1Char('/'))) path.prepend(QLatin1Char('/'));
+    const QString method = args.value(QStringLiteral("method")).toString(QStringLiteral("GET")).toUpper();
+    const QString body = args.value(QStringLiteral("body")).toString();
+
+    QNetworkRequest req{QUrl(base + path)};
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setRawHeader("User-Agent", "nikita");
+    const QString ah = plugin.value(QStringLiteral("authHeader")).toString();
+    const QString av = plugin.value(QStringLiteral("authValue")).toString();
+    if (!ah.isEmpty()) { req.setRawHeader(ah.toUtf8(), av.toUtf8()); }
+    req.setTransferTimeout(30000);
+
+    QNetworkReply *reply = nullptr;
+    if (method == QLatin1String("POST")) reply = m_net.post(req, body.toUtf8());
+    else if (method == QLatin1String("PUT")) reply = m_net.put(req, body.toUtf8());
+    else if (method == QLatin1String("DELETE")) reply = m_net.deleteResource(req);
+    else reply = m_net.get(req);
+
+    connect(reply, &QNetworkReply::finished, this, [reply, done]() {
+        reply->deleteLater();
+        const int status = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QString text = QString::fromUtf8(reply->readAll()).left(8000);
+        if (reply->error() != QNetworkReply::NoError && text.isEmpty()) {
+            done(QStringLiteral("{\"error\":\"%1\",\"status\":%2}")
+                 .arg(reply->errorString()).arg(status));
+            return;
+        }
+        QJsonObject out{{QStringLiteral("status"), status},
+                        {QStringLiteral("body"), text}};
+        done(QString::fromUtf8(QJsonDocument(out).toJson(QJsonDocument::Compact)));
+    });
 }
 
 void NikitaBackend::send(const QString &userText, const QString &deviceContext)
@@ -4621,7 +5189,8 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     m_verifyRounds = 0;      // completion-checker passes used this turn
     m_planContinuations = 0; // plan-driven re-entries used this turn
     m_lengthDeaths = 0;      // output-cap deaths recovered from this turn
-    m_history.append(QJsonObject{{"role", "user"}, {"content", userText}});
+    m_history.append(QJsonObject{{"role", "user"},
+                                 {"content", buildUserContent(userText)}});
     setThinking(true);
 
     // DETERMINISTIC SHORTCUT: "turn on/off the TV" and its variants fire the
@@ -5047,7 +5616,8 @@ void NikitaBackend::dispatchTurn()
         // Action turns get the full toolset; plain conversation still gets the
         // memory tools so the assistant can learn durable facts as you talk.
         const QSet<QString> allowed = allowedTools();
-        QJsonArray offered = m_turnNeedsTools ? nikitaTools(agentReady(), m_turnFocus, &allowed, deviceOverBle())
+        const bool hasPlugins = !m_extras.value(QStringLiteral("plugins")).toArray().isEmpty();
+        QJsonArray offered = m_turnNeedsTools ? nikitaTools(agentReady(), m_turnFocus, &allowed, deviceOverBle(), hasPlugins)
                                               : nikitaMemoryTools();
 
         // MCP tools, appended after the access filter because their names come
@@ -6593,7 +7163,7 @@ void NikitaBackend::runToolCalls(const QJsonArray &toolCalls, int index)
 
     // The phrase the user sees while THIS tool runs. Set before the call, not
     // after, so the window changes the moment the work changes.
-    setTurnStatus(nikitaToolStatus(name));
+    setTurnStatus(nikitaToolStatus(name, args));
 
     // A line in the chat the moment it STARTS. Until this existed the trail
     // only grew when a tool FINISHED, so a slow call (a shell command, a write
@@ -7232,6 +7802,11 @@ void NikitaBackend::runOneTool(const QString &rawName, const QJsonObject &args, 
         done(QStringLiteral("{\"ok\":true,\"spawned\":true,\"note\":\"A fragment is now working "
                             "this in parallel. Its result will arrive on its own -- do not wait for "
                             "it here; continue with anything else, or tell the user it is running.\"}"));
+        return;
+    }
+
+    if (name == QLatin1String("call_plugin")) {
+        runCallPlugin(args, done);
         return;
     }
 

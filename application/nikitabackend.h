@@ -248,6 +248,39 @@ public:
     Q_INVOKABLE void answerSaveConflict(const QString &action, const QString &newName);
 
     Q_INVOKABLE void send(const QString &userText, const QString &deviceContext);
+    // Stage files/images to ride along with the NEXT send(). Each entry is a
+    // map {kind, filename, mime, dataURL, text, bytes}; images (dataURL set) go
+    // to Kimi as vision parts, text files are inlined into the prompt. Called
+    // by the QML attach UI; cleared automatically once the turn is built.
+    Q_INVOKABLE void stageAttachment(const QVariantMap &att);
+    Q_INVOKABLE void clearStagedAttachments();
+    Q_INVOKABLE int stagedAttachmentCount() const { return m_stagedAttachments.size(); }
+    // Read an image/file from disk (a path the file dialog returned) and stage
+    // it. Returns a short note; too-large files are refused here, not silently.
+    Q_INVOKABLE QString stageAttachmentFromPath(const QString &path);
+    // Stage every readable text file in a folder (bounded), for "Add folder".
+    Q_INVOKABLE QString stageFolderFromPath(const QString &path);
+
+    // ---- the "+" menu: quick commands, learned skills, plugins -------------
+    // QUICK COMMANDS: a catalog of ready-made prompts the user can pick instead
+    // of typing. Seeded with defaults, extendable, persisted.
+    Q_INVOKABLE QVariantList quickCommands() const;
+    Q_INVOKABLE void addQuickCommand(const QString &label, const QString &prompt);
+    Q_INVOKABLE void removeQuickCommand(const QString &id);
+    // LEARNED SKILLS: point Nikita at a GitHub repo; she reads it, distills what
+    // it does and how to use it, and keeps it as a skill injected into her
+    // prompt from then on. Async -- skillLearnStatus/skillsChanged report back.
+    Q_INVOKABLE QVariantList learnedSkills() const;
+    Q_INVOKABLE void addSkillFromRepo(const QString &repoUrl);
+    Q_INVOKABLE void removeSkill(const QString &name);
+    // PLUGINS: external HTTP APIs Nikita can call. Each is a named endpoint with
+    // an optional auth header; exposed to the model as the call_plugin tool.
+    Q_INVOKABLE QVariantList plugins() const;
+    Q_INVOKABLE void addPlugin(const QString &name, const QString &baseUrl,
+                               const QString &authHeader, const QString &authValue,
+                               const QString &description);
+    Q_INVOKABLE void removePlugin(const QString &name);
+
     // Typed while a turn is still running. Held, not dropped, and delivered as
     // one message the moment the turn ends -- so a thought does not have to
     // wait on a 4B model finishing its sentence.
@@ -376,6 +409,11 @@ signals:
     void agentChanged();
     void mcpChanged();
     void agentTasksChanged();
+    void stagedAttachmentsChanged();
+    void quickCommandsChanged();
+    void skillsChanged();
+    void skillLearnStatus(const QString &message, bool busy);
+    void pluginsChanged();
     void taskFinished(int id, const QString &title, const QString &result);
     void planChanged();
     // The whole conversation was thrown away -- the panel has to drop its own
@@ -582,6 +620,26 @@ private:
     bool     m_buddyBaselined = false; // wrote the id:0 baseline req.json once
     void pollBuddyMailbox();
     void writeBuddyReply(uint32_t id, const QString &text);
+    // Files/images staged for the next send(): each a QJsonObject with kind,
+    // filename, mime, and either dataURL (images) or text (text files).
+    QJsonArray m_stagedAttachments;
+    // Build the user message content for m_history: a plain string when nothing
+    // is attached, or the OpenAI/Kimi multimodal array when there is.
+    QJsonValue buildUserContent(const QString &userText);
+
+    // The "+" menu store, persisted in extras.json next to history/memory.
+    QJsonObject m_extras;             // { quickCommands:[], skills:[], plugins:[] }
+    void loadExtras();
+    void saveExtras();
+    QString learnedSkillsForPrompt() const;   // injected into systemPrompt()
+    QString pluginsForPrompt() const;         // injected into systemPrompt()
+    void seedQuickCommandsIfEmpty();
+    // Second half of addSkillFromRepo, once the README has been fetched.
+    void distillSkillFromReadme(const QString &owner, const QString &repo,
+                                const QString &readme, const QString &key);
+    // The call_plugin tool: call a registered API plugin, base URL + auth added.
+    void runCallPlugin(const QJsonObject &args,
+                       std::function<void(const QString &)> done);
     QString applyPlanUpdate(const QJsonArray &items, const QString &note);
     QString planForPrompt() const;     // the block the system prompt carries
     // How many turns in a row the loop has re-entered on the plan's account.
