@@ -399,7 +399,15 @@ void ProtobufSession::processQueue()
     }
 
     m_currentOperation = m_queue.dequeue();
-    qCInfo(LOG_SESSION).noquote() << prettyOperationDescription() << "START";
+    // The Nikita Buddy relay polls req.json roughly once a second; logging every
+    // one of those reads buries the log in noise when nobody is using the Buddy.
+    // Skip the routine START/SUCCESS lines for that specific poll (a real ERROR
+    // still logs below), so the log only shows the Buddy when it is actually used.
+    const bool quietOp = prettyOperationDescription()
+                             .contains(QStringLiteral("/ext/nikita/buddy/req.json"));
+    if(!quietOp) {
+        qCInfo(LOG_SESSION).noquote() << prettyOperationDescription() << "START";
+    }
 
     connect(m_currentOperation, &AbstractOperation::finished, this, &ProtobufSession::onCurrentOperationFinished);
     m_currentOperation->start();
@@ -477,7 +485,9 @@ void ProtobufSession::onCurrentOperationFinished()
         clearOperationQueue();
 
     } else {
-        qCInfo(LOG_SESSION).noquote() << prettyOperationDescription() << "SUCCESS";
+        if(!prettyOperationDescription().contains(QStringLiteral("/ext/nikita/buddy/req.json"))) {
+            qCInfo(LOG_SESSION).noquote() << prettyOperationDescription() << "SUCCESS";
+        }
     }
 
     m_currentOperation->deleteLater();

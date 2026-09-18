@@ -166,6 +166,9 @@ static const double NIKITA_USD_OUT       = 15.00;
 // off cannot spin forever. Hitting the bound is not a failure: the plan is
 // kept, and the next message or the next launch resumes from it.
 static const int   NIKITA_MAX_PLAN_CONTINUATIONS = 12;
+// How many times per turn a second-agent completion check may send the turn
+// back to keep working. Bounded so a stubborn "not done" cannot loop forever.
+static const int   NIKITA_MAX_VERIFY = 3;
 
 static const int   NIKITA_MAX_REPEAT_ROUNDS = 3;
 // Corrections for a turn that claims something it didn't do -- not a step
@@ -319,7 +322,7 @@ MEMORY -- remember on your own, without being asked:
 WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You are running inside qFlipper itself, with a live USB link to the Flipper Zero. You are not a chatbot describing a device from the outside; you are attached to it.
 - You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through computer_run and the computer_* tools.
-- You can SEARCH THE WEB and READ WEB PAGES, through this computer's internet connection: web_search(query) returns the top results, and web_fetch(url) returns a page's text. Looking a person or thing up, current facts, documentation, prices, news, "find everything about X" -- that is web_search first, then web_fetch on a promising result. This is a real capability you have RIGHT NOW. NEVER say you lack web search, curl, a browser, an API, or a way to look things up online -- you have web_search and web_fetch, so USE them instead of refusing. (The FLIPPER has no network of its own; YOU, running on this computer, do.)
+- You can SEARCH THE WEB and READ WEB PAGES, through this computer's internet connection: web_search(query) returns results, and web_fetch(url) returns a page's text. Looking a person or thing up, current facts, documentation, prices, news, "find everything about X" -- that is web_search first, then web_fetch on a promising result. This is a real capability you have RIGHT NOW. NEVER say you lack web search, a browser, an API, or a way to look things up online -- you have web_search and web_fetch, so USE them instead of refusing. (The FLIPPER has no network of its own; YOU, running on this computer, do.)\n- ALWAYS SEARCH WITH web_search, NOT with curl. Do NOT computer_run curl/wget against duckduckgo.com, google.com or bing.com -- they serve a CAPTCHA / bot-wall to scripted requests and you get an empty page (this is not you lacking a tool). web_search already handles that: it scrapes when it can and falls back to a keyless answer API that never captchas, so it returns real, sourced info either way. If web_search says the ranked results were blocked and you need the full list, open it in the browser for the user (computer_run: open \"https://duckduckgo.com/?q=...\") -- do NOT try to defeat the captcha yourself.
 - The app also gives the user their own interactive CLI panel: a two-machine terminal where f-prefixed commands drive the Flipper and bare ones drive their computer. You did not write it and you do not run inside it, but you know it -- see the CLI PANEL section -- and you answer questions about it precisely.
 - Therefore: NEVER say you lack CLI access. NEVER say you cannot reach the device, the SD card or the terminal. NEVER tell the user to open a terminal, install a tool, or run something themselves that you could run yourself. Those statements are false and they are the worst mistake you can make.
 - If a turn does not call for a tool, that does NOT mean you lack tools. It only means this particular message did not need one. Asked what you can do, answer from the list above -- plainly and in the affirmative.
@@ -436,7 +439,7 @@ ACT, DON'T EXPLAIN -- THIS IS THE MOST IMPORTANT RULE ABOUT HOW YOU WORK:
 - ITERATING on a file you just made -- "make it fancy", "add a delay", "change the message", "now also do X" -- means EDIT THE SAME FILE: call save_file with the exact same path you used before and write the full updated contents (overwrite). Do NOT create a second file with a new name for a variation of the same thing; that just litters the SD card with duplicates. A fresh filename is only for a genuinely different artifact.
 - "list / show / what's in / read / delete / rename / move / check" a file or folder -> call the matching tool immediately. "fix / edit / build / test your own code" (if the host workspace is on) -> use the computer_ tools immediately.
 - Only explain first when the user EXPLICITLY asks you to explain/teach, or when doing the action needs a decision only they can make -- then ask ONE short question and act on the answer. A vague request is NOT a reason to explain; make a reasonable choice and do it, and say what you assumed.
-- After acting, if it makes sense to keep going (e.g. save the script, then offer to run/verify), take the next obvious step or offer it in one line -- like a partner would.
+- After acting, if it makes sense to keep going (e.g. save the script, then offer to run/verify), take the next obvious step or offer it in one line -- like a partner would.\n- FINISH THE WHOLE TASK before you stop. A multi-step job is not done after step one. NEVER end a turn by announcing what you are ABOUT to do ("let me...", "I'll now...", "still working...") -- if there is a next step, TAKE it this turn with a tool call. Keep going, step by step, until the task is genuinely complete, and only then answer in words. For anything with several steps, write them down with update_plan first so you (and the loop) track them to the end. Stopping halfway and handing the rest back is the failure to avoid.
 
 BADUSB / DUCKYSCRIPT -- know this cold so you write REAL, ROBUST scripts, not toys:
 - KEYBOARD LAYOUT IS THE #1 CAUSE OF "GARBLED" BADUSB OUTPUT. BadUSB does not send letters -- it sends physical KEY POSITIONS (HID scancodes), and the target machine maps those positions to characters using ITS keyboard layout. A payload typed with the wrong layout comes out scrambled: on a Brazilian (ABNT2) Mac a US-layout payload turns "https://" into "httpsö--" and drops letters, because ":" and "/" sit on different keys. So when the user reports mangled output -- ":// became ö--", missing characters, wrong symbols -- do NOT think the script is wrong: it is a LAYOUT MISMATCH. Tell them to set the Flipper Bad USB keyboard layout to match the TARGET machine (e.g. Portuguese/Brazil pt-BR / ABNT2), chosen in the Bad USB app's layout picker; on Momentum/Unleashed the layout files live in /ext/badusb/assets/layouts/*.kl. The layout is a device-side setting, NOT something in the .txt script. When you WRITE a script, note at the top (as a REM) which layout the target needs, and prefer keystrokes that map the same across layouts (GUI SPACE for macOS Spotlight then the app name, plain ASCII, ENTER/TAB) over punctuation-heavy lines where you can.
@@ -2720,6 +2723,28 @@ void NikitaBackend::setApiKey(const QString &key)
     checkApiKey();
 }
 
+bool NikitaBackend::braveKeyPresent() const
+{
+    if (!qEnvironmentVariable("BRAVE_API_KEY").trimmed().isEmpty()) { return true; }
+    return !QSettings().value(QStringLiteral("nikita/braveApiKey")).toString().trimmed().isEmpty();
+}
+
+void NikitaBackend::setBraveApiKey(const QString &key)
+{
+    const QString t = key.trimmed();
+    if (t.isEmpty()) { clearBraveApiKey(); return; }
+    QSettings().setValue(QStringLiteral("nikita/braveApiKey"), t);
+    nikitaLog(QStringLiteral("Brave Search key saved (%1 chars). web_search will use Brave.")
+                  .arg(t.size()));
+    emit braveKeyChanged();
+}
+
+void NikitaBackend::clearBraveApiKey()
+{
+    QSettings().remove(QStringLiteral("nikita/braveApiKey"));
+    emit braveKeyChanged();
+}
+
 QString NikitaBackend::revealApiKey() const
 {
     return apiKey();
@@ -4505,6 +4530,7 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     m_lastProvenTool.clear();
     m_forcedRetry = 0;       // corrections used this turn
     m_falseIncapacity = false;
+    m_verifyRounds = 0;      // completion-checker passes used this turn
     m_planContinuations = 0; // plan-driven re-entries used this turn
     m_lengthDeaths = 0;      // output-cap deaths recovered from this turn
     m_history.append(QJsonObject{{"role", "user"}, {"content", userText}});
@@ -5315,6 +5341,82 @@ bool NikitaBackend::turnWorkVerified() const
     return true;
 }
 
+// The second agent. Before a working turn is allowed to end, a cheap, separate
+// LLM call judges whether the user's request is ACTUALLY satisfied -- because a
+// model asking itself "am I done?" mid-stream is not reliable, but a fresh
+// checker looking only at (request, what ran, final reply) is. It answers strict
+// JSON {done, next}. Not done -> the turn continues with that next step. This is
+// the "two work better than one" that makes Nikita finish the job instead of
+// stopping halfway. Fails OPEN (treats as done) on any error, so the checker can
+// never trap a turn.
+void NikitaBackend::verifyTurnComplete(const QString &finalText,
+                                       std::function<void(bool, const QString &)> cb)
+{
+    const QString key = apiKey();
+    if (key.isEmpty()) { cb(true, QString()); return; }
+
+    QStringList ran = m_turnToolsRan.values();
+    std::sort(ran.begin(), ran.end());
+
+    const QString sys = QStringLiteral(
+        "You are a STRICT completion checker for an assistant that has tools (web search, a "
+        "shell, file and device tools). You are given the user's ORIGINAL request, the tools "
+        "that actually ran, and the assistant's FINAL reply. Decide whether the request is "
+        "FULLY satisfied. Be strict: if the assistant only PROMISED to do something, did part "
+        "of it, hit a wall it could route around, or handed work back that it could have done "
+        "itself, it is NOT done. If the assistant genuinely finished, or is correctly waiting "
+        "on something only the user can provide, it IS done. Reply with ONLY compact JSON, no "
+        "prose: {\"done\": true|false, \"next\": \"the single concrete next action the "
+        "assistant should take now, empty string if done\"}.");
+
+    const QString user = QStringLiteral("ORIGINAL REQUEST:\n%1\n\nTOOLS THAT RAN: %2\n\n"
+                                        "ASSISTANT FINAL REPLY:\n%3")
+        .arg(m_lastUserText,
+             ran.isEmpty() ? QStringLiteral("(none)") : ran.join(QStringLiteral(", ")),
+             finalText.left(2000));
+
+    QJsonObject body{
+        {QStringLiteral("model"), apiModel()},
+        {QStringLiteral("messages"), QJsonArray{
+            QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
+                        {QStringLiteral("content"), sys}},
+            QJsonObject{{QStringLiteral("role"), QStringLiteral("user")},
+                        {QStringLiteral("content"), user}}
+        }},
+        {QStringLiteral("stream"), false},
+        {QStringLiteral("max_tokens"), 200}
+    };
+
+    QNetworkRequest req{QUrl(QString::fromUtf8(NIKITA_API_URL))};
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setRawHeader("Authorization", QByteArray("Bearer ") + key.toUtf8());
+    req.setTransferTimeout(30000);
+
+    QNetworkReply *reply = m_net.post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+    auto done = std::make_shared<bool>(false);
+    connect(reply, &QNetworkReply::finished, this, [reply, cb, done]() {
+        if (*done) { return; }
+        *done = true;
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) { cb(true, QString()); return; }
+        const QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+        const QString content = root.value(QStringLiteral("choices")).toArray().isEmpty()
+            ? QString()
+            : root.value(QStringLiteral("choices")).toArray().first().toObject()
+                  .value(QStringLiteral("message")).toObject()
+                  .value(QStringLiteral("content")).toString();
+        // Pull the JSON object out of the reply (models sometimes wrap it).
+        const int a = content.indexOf(QLatin1Char('{'));
+        const int b = content.lastIndexOf(QLatin1Char('}'));
+        if (a < 0 || b <= a) { cb(true, QString()); return; }
+        const QJsonObject verdict =
+            QJsonDocument::fromJson(content.mid(a, b - a + 1).toUtf8()).object();
+        const bool isDone = verdict.value(QStringLiteral("done")).toBool(true);
+        const QString next = verdict.value(QStringLiteral("next")).toString().trimmed();
+        cb(isDone, next);
+    });
+}
+
 void NikitaBackend::emitReply(const QString &text)
 {
     // A closing line, always. Without it the last thing on screen is the live
@@ -5696,7 +5798,38 @@ void NikitaBackend::finalizeStream()
     // lolo.txt as well. The bound is on corrections that achieve nothing, which
     // is the same rule the tool loop uses: keep going while progress is being
     // made, stop when it is not.
-    if ((falseClaim || saidNothing || claimedWithoutActing)
+    // Dying halfway: it ran tools this turn, then signed off announcing a NEXT
+    // step ("let me try...", "I'll open...", "still working...", "vou...")
+    // instead of taking it. A real agent finishes the job; it does not narrate
+    // the next move and stop. Treat that as a miss and push it to continue --
+    // only when it actually worked this turn (mid-task, not idle chat) and no
+    // tool errored (an error has its own honest handling below). Action-intent
+    // phrases only, so a plain "done, let me know if..." does not trip it.
+    bool promisedMore = false;
+    if (m_turnRanAnyTool && !m_turnHadToolError && !toolCalls.isEmpty() == false) {
+        const QString low = text.toLower();
+        static const QStringList kMore = {
+            QStringLiteral("let me try"), QStringLiteral("let me search"),
+            QStringLiteral("let me open"), QStringLiteral("let me check"),
+            QStringLiteral("let me pull"), QStringLiteral("let me get"),
+            QStringLiteral("let me look"), QStringLiteral("let me grab"),
+            QStringLiteral("let me fetch"), QStringLiteral("let me run"),
+            QStringLiteral("i'll try"), QStringLiteral("i'll search"),
+            QStringLiteral("i'll open"), QStringLiteral("i'll check"),
+            QStringLiteral("i'll pull"), QStringLiteral("i'll get"),
+            QStringLiteral("i'll look"), QStringLiteral("i'll fetch"),
+            QStringLiteral("i'll run"), QStringLiteral("next i'll"),
+            QStringLiteral("now i'll"), QStringLiteral("still working"),
+            QStringLiteral("continuing"), QStringLiteral("one moment"),
+            QStringLiteral("vou tentar"), QStringLiteral("vou buscar"),
+            QStringLiteral("vou abrir"), QStringLiteral("vou pegar"),
+            QStringLiteral("vou procurar"), QStringLiteral("deixa eu"),
+            QStringLiteral("agora vou"), QStringLiteral("ainda estou")
+        };
+        for (const QString &m : kMore) { if (low.contains(m)) { promisedMore = true; break; } }
+    }
+
+    if ((falseClaim || saidNothing || claimedWithoutActing || promisedMore)
         && m_forcedRetry < NIKITA_MAX_CORRECTIONS) {
         m_forcedRetry++;
         // The turn may have arrived with only the memory tools attached, which
@@ -5757,6 +5890,13 @@ void NikitaBackend::finalizeStream()
                 "app IS open -- that report is the confirmation; there is no screen to read. Only use "
                 "press_button for a deterministic, blind action once an app is open, and never claim an "
                 "app is open until run_ble reported it open.");
+        } else if (promisedMore) {
+            correction = QStringLiteral(
+                "You announced a next step and then STOPPED without taking it. Do not narrate "
+                "what you are about to do and end the turn -- actually do it. Call the tool for "
+                "that next step NOW, this message. Keep going, step by step, until the task is "
+                "genuinely finished; only then answer in words. If it truly IS finished, say so "
+                "plainly and stop. Just the call, no preamble.");
         } else if (m_falseIncapacity) {
             // The wake-up. It refused a capability it actually has. Reaffirm
             // only what is TRULY offered -- never invent a tool it does not
@@ -5875,6 +6015,42 @@ void NikitaBackend::finalizeStream()
     // Remembered across the turn boundary so the follow-up is armed. Cleared
     // the moment something actually runs.
     m_lastTurnMissed = m_turnWasFileAction && !m_turnRanAnyTool;
+
+    // Second-agent completion check before we let the turn end. Only for turns
+    // that did real work (a plain chat reply needs no checking), bounded, and
+    // never when the user stopped it. Fails open.
+    if (m_turnRanAnyTool && !m_turnAborted && !m_userStoppedThinking
+        && m_verifyRounds < NIKITA_MAX_VERIFY) {
+        m_verifyRounds++;
+        const QString finalText = text;
+        setTurnStatus(QStringLiteral("checking the work"));
+        verifyTurnComplete(finalText, [this, finalText](bool complete, const QString &next) {
+            if (m_turnAborted) { return; }
+            if (complete || next.isEmpty()) {
+                m_history.append(QJsonObject{{"role", "assistant"}, {"content", finalText}});
+                saveHistory();
+                m_currentReply = nullptr;
+                setThinking(false);
+                emitReply(finalText);
+                return;
+            }
+            // Not done -- keep the assistant's words, tell it the next step, go on.
+            nikitaLogAs(assistantName(),
+                       QStringLiteral("checker: not done -- %1").arg(next.left(120)));
+            m_history.append(QJsonObject{{"role", "assistant"}, {"content", finalText}});
+            m_history.append(QJsonObject{{"role", "user"},
+                {"content", QStringLiteral("[completion check] Not finished yet: %1\n"
+                    "Do that now with a tool -- do not just describe it, and do not stop until "
+                    "the whole request is done. If you truly cannot proceed without the user, "
+                    "say exactly what you need.").arg(next)}});
+            m_streamContent.clear();
+            m_turnText.clear();
+            m_streamTools = QJsonArray();
+            setThinking(true);
+            redispatch();
+        });
+        return;   // defer the real emit until the checker answers
+    }
 
     m_history.append(QJsonObject{{"role", "assistant"}, {"content", text}});
     saveHistory();
@@ -8049,6 +8225,88 @@ static QString nikitaUnwrapDdgUrl(const QString &href)
     return QUrl::fromPercentEncoding(enc.toUtf8());
 }
 
+// The keyless, captcha-proof fallback for search. The HTML endpoints (DDG, Bing)
+// serve a bot wall to anything scripted, so when the scrape comes back empty we
+// ask DuckDuckGo's Instant Answer JSON API instead -- it never captchas and
+// returns a real abstract plus related topics with URLs. Not a full ranked web
+// search, but genuine, sourced information the model can actually use.
+void NikitaBackend::webSearchJsonFallback(const QString &query,
+                                          std::function<void(const QString &)> done)
+{
+    QUrl url(QStringLiteral("https://api.duckduckgo.com/"));
+    QUrlQuery q;
+    q.addQueryItem(QStringLiteral("q"), query);
+    q.addQueryItem(QStringLiteral("format"), QStringLiteral("json"));
+    q.addQueryItem(QStringLiteral("no_html"), QStringLiteral("1"));
+    q.addQueryItem(QStringLiteral("no_redirect"), QStringLiteral("1"));
+    url.setQuery(q);
+
+    QNetworkRequest req(url);
+    req.setRawHeader("User-Agent", "nikita-qflipper");
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                     QNetworkRequest::NoLessSafeRedirectPolicy);
+    req.setTransferTimeout(20000);
+
+    QNetworkReply *reply = m_net.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, query, done]() {
+        Q_UNUSED(this)
+        reply->deleteLater();
+        QJsonArray results;
+        if (reply->error() == QNetworkReply::NoError) {
+            const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
+            const QString abstract = o.value(QStringLiteral("AbstractText")).toString();
+            const QString absUrl = o.value(QStringLiteral("AbstractURL")).toString();
+            const QString heading = o.value(QStringLiteral("Heading")).toString();
+            if (!abstract.isEmpty()) {
+                results.append(QJsonObject{
+                    {QStringLiteral("title"), heading.isEmpty() ? query : heading},
+                    {QStringLiteral("url"), absUrl},
+                    {QStringLiteral("snippet"), abstract.left(500)}
+                });
+            }
+            // RelatedTopics: flatten one level (some entries are groups).
+            std::function<void(const QJsonArray &)> take = [&](const QJsonArray &arr) {
+                for (const QJsonValue &v : arr) {
+                    if (results.size() >= 8) { break; }
+                    const QJsonObject t = v.toObject();
+                    if (t.contains(QStringLiteral("Topics"))) {
+                        take(t.value(QStringLiteral("Topics")).toArray());
+                        continue;
+                    }
+                    const QString text = t.value(QStringLiteral("Text")).toString();
+                    const QString furl = t.value(QStringLiteral("FirstURL")).toString();
+                    if (text.isEmpty()) { continue; }
+                    results.append(QJsonObject{
+                        {QStringLiteral("title"), text.left(80)},
+                        {QStringLiteral("url"), furl},
+                        {QStringLiteral("snippet"), text.left(300)}
+                    });
+                }
+            };
+            take(o.value(QStringLiteral("RelatedTopics")).toArray());
+        }
+
+        QJsonObject out{{QStringLiteral("query"), query},
+                        {QStringLiteral("results"), results},
+                        {QStringLiteral("source"), QStringLiteral("duckduckgo instant answer (fallback)")}};
+        if (results.isEmpty()) {
+            out[QStringLiteral("note")] = QStringLiteral(
+                "The web search endpoints are serving bot/captcha pages to automated "
+                "requests right now, and the keyless answer API had nothing for this "
+                "query. This is a bot-wall, not a lack of the tool. For a deep search, "
+                "open the query in the browser (computer_run: open \"https://duckduckgo.com/?q=...\") "
+                "so the user can look, or fetch a specific known URL with web_fetch.");
+        } else {
+            out[QStringLiteral("note")] = QStringLiteral(
+                "Ranked web scraping was blocked by a bot-wall, so these come from the "
+                "keyless answer API -- solid facts with sources, but not a full result "
+                "list. Use web_fetch on a url here to go deeper, or open the browser for "
+                "the user if they need the full ranked results.");
+        }
+        done(QString::fromUtf8(QJsonDocument(out).toJson(QJsonDocument::Compact)));
+    });
+}
+
 void NikitaBackend::runWebSearch(const QString &query,
                                  std::function<void(const QString &)> done)
 {
@@ -8056,6 +8314,56 @@ void NikitaBackend::runWebSearch(const QString &query,
         done(QStringLiteral("{\"error\":\"no query given\"}"));
         return;
     }
+    // Brave Search API first, when a key is set -- this is the robust path: a
+    // real ranked web search, no captcha, covers people and everything else.
+    // A free key (2000 queries/month) is entered in Nikita settings, same as
+    // the Kimi key. Env BRAVE_API_KEY overrides. No key -> keyless fallbacks.
+    const QString braveKey = qEnvironmentVariable("BRAVE_API_KEY").trimmed().isEmpty()
+        ? QSettings().value(QStringLiteral("nikita/braveApiKey")).toString().trimmed()
+        : qEnvironmentVariable("BRAVE_API_KEY").trimmed();
+    if (!braveKey.isEmpty()) {
+        QUrl burl(QStringLiteral("https://api.search.brave.com/res/v1/web/search"));
+        QUrlQuery bq; bq.addQueryItem(QStringLiteral("q"), query);
+        bq.addQueryItem(QStringLiteral("count"), QStringLiteral("8"));
+        burl.setQuery(bq);
+        QNetworkRequest breq(burl);
+        breq.setRawHeader("Accept", "application/json");
+        breq.setRawHeader("X-Subscription-Token", braveKey.toUtf8());
+        breq.setTransferTimeout(20000);
+        QNetworkReply *br = m_net.get(breq);
+        connect(br, &QNetworkReply::finished, this, [this, br, query, done]() {
+            br->deleteLater();
+            if (br->error() == QNetworkReply::NoError) {
+                const QJsonObject root = QJsonDocument::fromJson(br->readAll()).object();
+                const QJsonArray res = root.value(QStringLiteral("web"))
+                                           .toObject().value(QStringLiteral("results")).toArray();
+                QJsonArray results;
+                for (const QJsonValue &v : res) {
+                    const QJsonObject r = v.toObject();
+                    results.append(QJsonObject{
+                        {QStringLiteral("title"), r.value(QStringLiteral("title")).toString().left(200)},
+                        {QStringLiteral("url"), r.value(QStringLiteral("url")).toString()},
+                        {QStringLiteral("snippet"), r.value(QStringLiteral("description")).toString().left(300)}
+                    });
+                    if (results.size() >= 8) { break; }
+                }
+                if (!results.isEmpty()) {
+                    QJsonObject out{{QStringLiteral("query"), query},
+                                    {QStringLiteral("results"), results},
+                                    {QStringLiteral("source"), QStringLiteral("brave")}};
+                    done(QString::fromUtf8(QJsonDocument(out).toJson(QJsonDocument::Compact)));
+                    return;
+                }
+            } else {
+                nikitaLog(QStringLiteral("Brave search failed (%1) -- falling back")
+                              .arg(br->errorString()));
+            }
+            // Brave errored or empty -> keyless chain.
+            webSearchJsonFallback(query, done);
+        });
+        return;
+    }
+
     QUrl url(QStringLiteral("https://html.duckduckgo.com/html/"));
     QUrlQuery q; q.addQueryItem(QStringLiteral("q"), query);
     url.setQuery(q);
@@ -8069,11 +8377,11 @@ void NikitaBackend::runWebSearch(const QString &query,
     req.setTransferTimeout(20000);
 
     QNetworkReply *reply = m_net.get(req);
-    connect(reply, &QNetworkReply::finished, this, [reply, query, done]() {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, query, done]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
-            done(QStringLiteral("{\"error\":\"web search failed: %1\"}")
-                     .arg(reply->errorString()));
+            // Network error on the scrape -> try the keyless JSON API anyway.
+            webSearchJsonFallback(query, done);
             return;
         }
         const QString html = QString::fromUtf8(reply->readAll());
@@ -8105,13 +8413,13 @@ void NikitaBackend::runWebSearch(const QString &query,
             ++n;
         }
 
+        if (results.isEmpty()) {
+            // Scrape blocked or empty -> keyless JSON API that never captchas.
+            webSearchJsonFallback(query, done);
+            return;
+        }
         QJsonObject out{{QStringLiteral("query"), query},
                         {QStringLiteral("results"), results}};
-        if (results.isEmpty()) {
-            out[QStringLiteral("note")] = QStringLiteral(
-                "No results parsed. The query may be too narrow, or the search "
-                "page changed shape. Try web_fetch on a URL you already know.");
-        }
         done(QString::fromUtf8(QJsonDocument(out).toJson(QJsonDocument::Compact)));
     });
 }

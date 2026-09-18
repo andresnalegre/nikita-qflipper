@@ -51,6 +51,9 @@ class NikitaBackend : public QObject
     // if it can send a turn; it never needs the characters, and a key readable
     // from QML is a key that ends up in a screenshot.
     Q_PROPERTY(bool apiKeyPresent READ apiKeyPresent NOTIFY apiKeyChanged)
+    // Optional Brave Search API key -- when set, web_search uses Brave (real
+    // ranked results, no captcha) instead of the keyless fallbacks.
+    Q_PROPERTY(bool braveKeyPresent READ braveKeyPresent NOTIFY braveKeyChanged)
     bool apiKeyPresent() const;
     // Where the key came from, for the settings panel to explain itself:
     // "environment" (MOONSHOT_API_KEY), "settings", or "" when there is none.
@@ -96,6 +99,9 @@ class NikitaBackend : public QObject
     // the access they were written with.
 public:
     Q_INVOKABLE void setApiKey(const QString &key);
+    Q_INVOKABLE void setBraveApiKey(const QString &key);
+    Q_INVOKABLE void clearBraveApiKey();
+    bool braveKeyPresent() const;
     Q_INVOKABLE void clearApiKey();
     // Ask Moonshot whether the stored key works, and take the model list back
     // with the answer. Safe to call whenever; a check already in flight wins.
@@ -338,6 +344,7 @@ signals:
     void thinkingChanged();
     void assistantEnabledChanged();
     void apiKeyChanged();
+    void braveKeyChanged();
     void canRateChanged();
     void queuedChanged();
     // Emitted the instant a queued message is dequeued to run, so the chat can
@@ -465,6 +472,7 @@ private:
     // same on every account); web_fetch pulls one page and returns its text.
     void runWebSearch(const QString &query, std::function<void(const QString &)> done);
     void runWebFetch(const QString &url, std::function<void(const QString &)> done);
+    void webSearchJsonFallback(const QString &query, std::function<void(const QString &)> done);
     // Actually spawns the command (async QProcess + watchdog, never blocks the
     // GUI thread). Called either straight away, when the exact command is on
     // the always-allow list, or from answerHostRunConfirm() once a person
@@ -580,6 +588,9 @@ private:
     // prose instead of calling anything, it is asked again with a single tool.
     int        m_forcedRetry = 0;            // corrections spent on this turn
     bool       m_falseIncapacity = false;    // model refused a tool it actually has
+    int        m_verifyRounds = 0;           // completion-checker passes this turn
+    void       verifyTurnComplete(const QString &finalText,
+                                  std::function<void(bool done, const QString &next)> cb);
     // Set when a turn was supposed to act and didn't. The next message is then
     // armed with tools no matter how it is phrased, because that next message
     // is almost always "no, you didn't actually do it".

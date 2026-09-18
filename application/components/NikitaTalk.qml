@@ -2465,6 +2465,114 @@ Rectangle {
                         }
                     }
 
+                    // ---- BRAVE SEARCH KEY (optional, robust web search) --------
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Theme.color.mediumorange2
+                        opacity: 0.4
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Text {
+                            text: "WEB SEARCH"
+                            color: Theme.color.lightorange2
+                            font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
+                        }
+                        Text {
+                            text: Nikita.braveKeyPresent ? "Brave key set - deep search on"
+                                                         : "keyless (limited) - add a Brave key"
+                            color: Nikita.braveKeyPresent ? "#39ff14" : Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 11
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 30
+                            radius: 4
+                            color: "#120818"
+                            border.width: 1; border.color: Theme.color.mediumorange2
+                            TextInput {
+                                id: braveField
+                                anchors.fill: parent
+                                anchors.leftMargin: 8; anchors.rightMargin: 8
+                                verticalAlignment: TextInput.AlignVCenter
+                                clip: true
+                                echoMode: TextInput.Password
+                                color: Theme.color.lightorange2
+                                font.family: "Share Tech Mono"; font.pixelSize: 12
+                                Text {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 0
+                                    verticalAlignment: Text.AlignVCenter
+                                    visible: braveField.text.length === 0
+                                    text: Nikita.braveKeyPresent ? "•••••••• (saved) - paste to replace"
+                                                                 : "paste Brave Search API key"
+                                    color: Theme.color.mediumorange1
+                                    font.family: "Share Tech Mono"; font.pixelSize: 12
+                                }
+                                onAccepted: { Nikita.setBraveApiKey(text); text = ""; }
+                            }
+                        }
+                        Rectangle {
+                            Layout.preferredWidth: braveSaveLabel.implicitWidth + 20
+                            Layout.preferredHeight: 30
+                            radius: 4
+                            color: braveSaveMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                            border.width: 1; border.color: Theme.color.mediumorange2
+                            Text {
+                                id: braveSaveLabel
+                                anchors.centerIn: parent
+                                text: "SAVE"
+                                color: braveSaveMouse.containsMouse ? "#0b0410" : Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                            }
+                            MouseArea {
+                                id: braveSaveMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: { Nikita.setBraveApiKey(braveField.text); braveField.text = ""; }
+                            }
+                        }
+                        Rectangle {
+                            visible: Nikita.braveKeyPresent
+                            Layout.preferredWidth: braveClrLabel.implicitWidth + 16
+                            Layout.preferredHeight: 30
+                            radius: 4
+                            color: "transparent"
+                            border.width: 1; border.color: Theme.color.mediumorange2
+                            Text {
+                                id: braveClrLabel
+                                anchors.centerIn: parent
+                                text: "CLEAR"
+                                color: braveClrMouse.containsMouse ? "#ff6a6a" : Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                            }
+                            MouseArea {
+                                id: braveClrMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.clearBraveApiKey()
+                            }
+                        }
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Free key (2000/mo) at brave.com/search/api. Without it, search "
+                              + "falls back to keyless sources that cover topics but not people."
+                        color: Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                        wrapMode: Text.WordWrap
+                    }
+
                     // ---- MCP SERVERS -------------------------------------------
                     // Tool servers NIKITA borrows, over the same protocol Claude
                     // Code speaks. There is deliberately no editor here: the
