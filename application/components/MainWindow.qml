@@ -619,13 +619,19 @@ Item {
                         id: logFlick
                         anchors.fill: parent; anchors.margins: 8; clip: true
                         contentHeight: logText.height; contentWidth: width
+                        boundsBehavior: Flickable.StopAtBounds
+                        // Stick to the bottom only while the user is already
+                        // there; let them scroll up to read without being yanked.
+                        property bool atBottom: true
+                        onMovementEnded: atBottom = atYEnd
+                        onFlickEnded: atBottom = atYEnd
                         Text {
                             id: logText
                             width: logFlick.width
                             text: Ble.status
                             color: Theme.color.lightorange2; font.family: "Share Tech Mono"; font.pixelSize: 11
                             wrapMode: Text.WrapAnywhere
-                            onTextChanged: logFlick.contentY = Math.max(0, logText.height - logFlick.height)
+                            onTextChanged: if(logFlick.atBottom) logFlick.contentY = Math.max(0, logText.height - logFlick.height)
                         }
                     }
                 }

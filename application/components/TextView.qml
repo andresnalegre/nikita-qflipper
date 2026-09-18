@@ -12,6 +12,9 @@ Item {
     property alias background: scrollView.background
 
     property Menu menu
+    // Only auto-scroll to the bottom when the user is ALREADY there. Otherwise
+    // reading back through the log is impossible -- every new line yanks it down.
+    property bool atBottom: true
 
     ScrollView {
         id: scrollView
@@ -24,6 +27,10 @@ Item {
             boundsBehavior: Flickable.StopAtBounds
             contentWidth: scrollView.contentWidth;
             contentHeight: content.implicitHeight;
+            // The user's scroll intent: updated only when THEY move the view,
+            // never by new text arriving, so growth doesn't flip it.
+            onMovementEnded: control.atBottom = atYEnd
+            onFlickEnded: control.atBottom = atYEnd
 
             TextEdit {
                 id: content
@@ -46,7 +53,7 @@ Item {
                 selectByMouse: true
                 selectByKeyboard: true
 
-                onTextChanged: scrollToBottom();
+                onTextChanged: if(control.atBottom) scrollToBottom();
             }
         }
     }

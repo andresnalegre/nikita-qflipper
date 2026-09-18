@@ -797,6 +797,130 @@ Rectangle {
             }
         }
 
+        // ---- the working plan -------------------------------------------
+        // NIKITA's own list of steps, written with update_plan and stored on
+        // disk. It is here rather than buried in the settings page because it
+        // is the answer to "what is it doing" -- and because it survives the
+        // app closing, so on the next launch this strip is what says the job
+        // is still open instead of the conversation looking finished.
+        //
+        // Collapsed to the current step by default: while it is working, the
+        // next thing is the only line anyone reads. Click to see the whole list.
+        Rectangle {
+            id: planCard
+            property bool expanded: false
+            visible: root.viewState !== "min" && Nikita.planItems.length > 0
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? planCol.implicitHeight + 12 : 0
+            radius: 4
+            color: "#120818"
+            border.width: 1
+            border.color: Theme.color.mediumorange2
+
+            ColumnLayout {
+                id: planCol
+                x: 10; y: 6
+                width: parent.width - 20
+                spacing: 3
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
+
+                    Text {
+                        text: "PLAN"
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 11; font.bold: true
+                    }
+                    Text {
+                        text: Nikita.planOpenCount > 0
+                              ? (Nikita.planItems.length - Nikita.planOpenCount)
+                                + "/" + Nikita.planItems.length + " done"
+                              : "all done"
+                        color: Nikita.planOpenCount > 0 ? Theme.color.mediumorange1 : "#39ff14"
+                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                    }
+                    // Collapsed, this carries the whole message: the one thing
+                    // it is on right now.
+                    Text {
+                        visible: !planCard.expanded && Nikita.planCurrent.length > 0
+                        text: "·  " + Nikita.planCurrent
+                        color: "#eaffea"
+                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+                    Item { visible: planCard.expanded || Nikita.planCurrent.length === 0
+                           Layout.fillWidth: true }
+
+                    Text {
+                        text: planCard.expanded ? "−" : "+"
+                        color: Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                    }
+
+                    Rectangle {
+                        Layout.preferredWidth: clearPlanLabel.implicitWidth + 14
+                        Layout.preferredHeight: 18
+                        radius: 3
+                        color: clearPlanMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                        border.width: 1
+                        border.color: Theme.color.mediumorange2
+                        Text {
+                            id: clearPlanLabel
+                            anchors.centerIn: parent
+                            text: "CLEAR"
+                            color: clearPlanMouse.containsMouse ? "#0b0410" : Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 9; font.bold: true
+                        }
+                        MouseArea {
+                            id: clearPlanMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Nikita.clearPlan()
+                        }
+                    }
+                }
+
+                Repeater {
+                    model: planCard.expanded ? Nikita.planItems : []
+
+                    delegate: Text {
+                        readonly property bool isDone: modelData.status === "done"
+                        readonly property bool isNow: modelData.status === "in_progress"
+                        text: (isDone ? "[x]  " : isNow ? "[>]  " : "[ ]  ") + modelData.text
+                        color: isNow ? "#eaffea"
+                             : isDone ? Theme.color.mediumorange2
+                                      : Theme.color.mediumorange1
+                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                        font.bold: isNow
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
+
+                Text {
+                    visible: planCard.expanded && Nikita.planNote.length > 0
+                    text: Nikita.planNote
+                    color: Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 10
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+            }
+
+            // The whole card toggles, except the parts that already do
+            // something of their own -- so the target is as big as the strip.
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton
+                cursorShape: Qt.PointingHandCursor
+                z: -1
+                onClicked: planCard.expanded = !planCard.expanded
+            }
+        }
+
         // ---- message log (hidden when minimized) ----
         ListView {
             id: listView
@@ -866,9 +990,51 @@ Rectangle {
             // moving even when the phrase does not, so a slow turn still reads
             // as working rather than as hung.
             footer: Item {
+                id: turnFooter
                 width: ListView.view ? ListView.view.width : 0
-                height: Nikita.thinking ? 24 : 0
+                height: Nikita.thinking ? 28 : 0
                 visible: Nikita.thinking
+                // A task is "running" when a tool is actually executing -- the
+                // status is a tool phrase, not the plain "thinking" that the
+                // text on the left already shows. Only then does the pill appear.
+                property bool taskRunning: Nikita.thinking
+                                           && Nikita.turnStatus.length > 0
+                                           && Nikita.turnStatus !== "thinking"
+                // The "running task" pill, on the RIGHT.
+                Rectangle {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 4
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: turnFooter.taskRunning
+                    width: runTaskRow.implicitWidth + 18
+                    height: 20
+                    radius: 6
+                    color: "#241a2e"
+                    border.width: 1
+                    border.color: Theme.color.lightorange2
+                    Row {
+                        id: runTaskRow
+                        anchors.centerIn: parent
+                        spacing: 5
+                        Rectangle {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 7; height: 7; radius: 4
+                            color: Theme.color.lightorange2
+                            SequentialAnimation on opacity {
+                                running: turnFooter.taskRunning
+                                loops: Animation.Infinite
+                                NumberAnimation { from: 1.0; to: 0.25; duration: 700 }
+                                NumberAnimation { from: 0.25; to: 1.0; duration: 700 }
+                            }
+                        }
+                        Text {
+                            text: "running task"
+                            color: Theme.color.lightorange2
+                            font.family: "Share Tech Mono"
+                            font.pixelSize: 11; font.bold: true
+                        }
+                    }
+                }
                 Row {
                     x: 0
                     anchors.verticalCenter: parent.verticalCenter
@@ -2296,6 +2462,174 @@ Rectangle {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // ---- MCP SERVERS -------------------------------------------
+                    // Tool servers NIKITA borrows, over the same protocol Claude
+                    // Code speaks. There is deliberately no editor here: the
+                    // servers are read from ~/.nikita/mcp.json, from Claude
+                    // Code's own ~/.claude.json, and from the workspace's
+                    // .mcp.json -- so a server already set up for Claude Code is
+                    // simply here, and there is one place to edit rather than two
+                    // that can disagree. This panel is the mirror: what was
+                    // found, whether it answered, and how many tools it brought.
+                    Rectangle {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 1
+                        color: Theme.color.mediumorange2
+                        opacity: 0.4
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
+                        Text {
+                            text: "MCP"
+                            color: Theme.color.lightorange2
+                            font.family: "Share Tech Mono"; font.pixelSize: 14; font.bold: true
+                        }
+                        Text {
+                            text: Nikita.mcpStatus
+                            color: Nikita.mcpToolCount > 0 ? "#39ff14" : Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 11
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+
+                        // On/off, same pill as every other switch in this panel.
+                        Rectangle {
+                            Layout.preferredWidth: 44
+                            Layout.preferredHeight: 20
+                            radius: 3
+                            color: Nikita.mcpEnabled ? "#0f3d1f" : "transparent"
+                            border.width: Nikita.mcpEnabled ? 0 : 1
+                            border.color: Theme.color.mediumorange2
+                            Text {
+                                anchors.centerIn: parent
+                                text: Nikita.mcpEnabled ? "ON" : "OFF"
+                                color: Nikita.mcpEnabled ? "#39ff14" : Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.mcpEnabled = !Nikita.mcpEnabled
+                            }
+                        }
+
+                        Rectangle {
+                            Layout.preferredWidth: reloadMcpLabel.implicitWidth + 16
+                            Layout.preferredHeight: 20
+                            radius: 3
+                            color: reloadMcpMouse.containsMouse ? Theme.color.lightorange2 : "transparent"
+                            border.width: 1
+                            border.color: Theme.color.mediumorange2
+                            Text {
+                                id: reloadMcpLabel
+                                anchors.centerIn: parent
+                                text: "RELOAD"
+                                color: reloadMcpMouse.containsMouse ? "#0b0410" : Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 10; font.bold: true
+                            }
+                            MouseArea {
+                                id: reloadMcpMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.reloadMcp()
+                            }
+                        }
+                    }
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 4
+                        visible: Nikita.mcpEnabled
+
+                        Repeater {
+                            model: Nikita.mcpServers
+
+                            delegate: Rectangle {
+                                readonly property bool ready: modelData.state === "ready"
+                                readonly property bool broken: modelData.state === "failed"
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: mcpCol.implicitHeight + 12
+                                radius: 4
+                                color: ready ? "#120818" : "#0d0610"
+                                border.width: 1
+                                border.color: ready ? Theme.color.mediumorange2 : "#3a2a3a"
+
+                                ColumnLayout {
+                                    id: mcpCol
+                                    x: 10; y: 6
+                                    width: parent.width - 20
+                                    spacing: 2
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 6
+
+                                        // A dot rather than a word: the state is
+                                        // glanceable, and the words are needed for
+                                        // the name and the count.
+                                        Rectangle {
+                                            Layout.preferredWidth: 8
+                                            Layout.preferredHeight: 8
+                                            radius: 4
+                                            color: ready ? "#39ff14"
+                                                 : broken ? Theme.color.lightorange2
+                                                 : Theme.color.mediumorange2
+                                        }
+                                        Text {
+                                            text: modelData.name
+                                            color: ready ? "#eaffea" : Theme.color.mediumorange1
+                                            font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                        }
+                                        Text {
+                                            text: modelData.kind
+                                            color: Theme.color.mediumorange1
+                                            font.family: "Share Tech Mono"; font.pixelSize: 9
+                                            Layout.fillWidth: true
+                                        }
+                                        Text {
+                                            text: ready ? modelData.tools + " tools" : modelData.state
+                                            color: ready ? "#39ff14" : Theme.color.mediumorange1
+                                            font.family: "Share Tech Mono"; font.pixelSize: 10
+                                        }
+                                    }
+
+                                    // The error in the server's own words when
+                                    // there is one, and where the entry came from
+                                    // when there isn't -- "from ~/.claude.json" is
+                                    // the answer to "why is this here at all".
+                                    Text {
+                                        text: modelData.error !== "" ? modelData.error
+                                            : (modelData.label !== ""
+                                               ? modelData.label + "  ·  from " + modelData.source
+                                               : "from " + modelData.source)
+                                        color: modelData.error !== "" ? Theme.color.lightorange2
+                                                                      : Theme.color.mediumorange1
+                                        font.family: "Share Tech Mono"; font.pixelSize: 10
+                                        wrapMode: Text.WordWrap
+                                        Layout.fillWidth: true
+                                    }
+                                }
+                            }
+                        }
+
+                        // Nothing configured is a normal state, and it deserves a
+                        // sentence that says what to do rather than an empty gap.
+                        Text {
+                            visible: Nikita.mcpServers.length === 0
+                            text: "No MCP servers. Add them to " + Nikita.mcpConfigPath
+                                  + " (or to ~/.claude.json, which is read too) and hit RELOAD."
+                            color: Theme.color.mediumorange1
+                            font.family: "Share Tech Mono"; font.pixelSize: 10
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
                         }
                     }
 

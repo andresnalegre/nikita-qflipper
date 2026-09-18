@@ -26,6 +26,7 @@ class QProcess;
 // Nikita - an AI chat assistant inside qFlipper, with tool access to the
 // to live-query the connected Flipper Zero over qFlipper's RPC link.
 class FlipperCli;   // defined below; NikitaBackend holds a pointer for run_cli
+class McpClient;   // application/mcpclient.h -- the MCP tool servers
 
 class NikitaBackend : public QObject
 {
@@ -149,6 +150,42 @@ private:
     Q_PROPERTY(QString modelName READ modelName NOTIFY modelChanged)
     Q_PROPERTY(bool agentEnabled READ agentEnabled WRITE setAgentEnabled NOTIFY agentChanged)
     Q_PROPERTY(QString agentDir READ agentDir WRITE setAgentDir NOTIFY agentChanged)
+
+    // ---- MCP -----------------------------------------------------------
+    // Tool servers Nikita borrows, over the same protocol Claude Code speaks.
+    // Surfaced through the backend rather than by registering McpClient as its
+    // own QML type, so the panel has one object to talk to.
+    Q_PROPERTY(bool mcpEnabled READ mcpEnabled WRITE setMcpEnabled NOTIFY mcpChanged)
+    Q_PROPERTY(QString mcpStatus READ mcpStatus NOTIFY mcpChanged)
+    Q_PROPERTY(int mcpToolCount READ mcpToolCount NOTIFY mcpChanged)
+    Q_PROPERTY(QVariantList mcpServers READ mcpServers NOTIFY mcpChanged)
+    Q_PROPERTY(QString mcpConfigPath READ mcpConfigPath CONSTANT)
+
+    // ---- The working plan ----------------------------------------------
+    // What Nikita is in the middle of. Written by the model through
+    // update_plan, read by the loop to decide whether a turn is actually over,
+    // and persisted -- so closing the app pauses the work instead of ending
+    // it. The panel shows it, which is also why the user can tell the
+    // difference between "thinking" and "on step 2 of 4".
+    Q_PROPERTY(QVariantList planItems READ planItems NOTIFY planChanged)
+    Q_PROPERTY(QString planNote READ planNote NOTIFY planChanged)
+    Q_PROPERTY(int planOpenCount READ planOpenCount NOTIFY planChanged)
+    Q_PROPERTY(QString planCurrent READ planCurrent NOTIFY planChanged)
+public:
+    QVariantList planItems() const;
+    QString planNote() const;
+    int planOpenCount() const;
+    QString planCurrent() const;     // the in_progress item, or the first pending one
+    Q_INVOKABLE void clearPlan();
+private:
+    bool mcpEnabled() const;
+    void setMcpEnabled(bool on);
+    QString mcpStatus() const;
+    int mcpToolCount() const;
+    QVariantList mcpServers() const;
+    QString mcpConfigPath() const;
+    Q_INVOKABLE void reloadMcp();
+private:
 
 public:
     // Erases everything NIKITA has kept about this user: the conversation, the
@@ -318,6 +355,8 @@ signals:
                       bool finished, bool failed);
     void modelChanged();
     void agentChanged();
+    void mcpChanged();
+    void planChanged();
     // The whole conversation was thrown away -- the panel has to drop its own
     // copy of it too, or an erase only clears what is on disk and the bubbles
     // stay on screen (and come back the next time the assistant is switched on).
@@ -386,6 +425,11 @@ private:
     // rest of this file reads. Returns true when the turn is finished.
     bool consumeModelFrame(const QJsonObject &obj);
     void runToolCalls(const QJsonArray &toolCalls, int index); // execute tools sequentially
+    // A run of independent read-only calls, fired together instead of one
+    // after another. [from, to) of the same batch; continues at `to`.
+    void runToolsInParallel(const QJsonArray &toolCalls, int from, int to);
+    void noteToolOutcome(const QString &name, const QJsonObject &args,
+                         const QString &result);   // per-call turn bookkeeping
     // Every exit point that ends a turn with a user-visible reply calls this
     // instead of `emit replyReceived` directly, so the closing "done in" line
     // rides along with the text it produced rather than vanishing once the
@@ -415,6 +459,12 @@ private:
     QString m_agentCwd;
     void runHostTool(const QString &name, const QJsonObject &args,
                      std::function<void(const QString &)> done);
+    // The web. Both are read-only HTTP GETs on this machine's network, async
+    // through m_net, answering `done` with the same JSON shape as every other
+    // tool. web_search hits DuckDuckGo's HTML endpoint (no API key, works the
+    // same on every account); web_fetch pulls one page and returns its text.
+    void runWebSearch(const QString &query, std::function<void(const QString &)> done);
+    void runWebFetch(const QString &url, std::function<void(const QString &)> done);
     // Actually spawns the command (async QProcess + watchdog, never blocks the
     // GUI thread). Called either straight away, when the exact command is on
     // the always-allow list, or from answerHostRunConfirm() once a person
@@ -478,6 +528,42 @@ private:
     QNetworkAccessManager m_net;
     ApplicationBackend *m_appBackend = nullptr;
     FlipperCli         *m_cli = nullptr;   // for the run_cli tool (set by Application)
+    McpClient          *m_mcp = nullptr;  // MCP tool servers; owned, created in the ctor
+
+    // The plan, as the model last wrote it: [{text, status}]. m_planNote is
+    // its one-line "where this stands", which is what makes a resumed session
+    // readable rather than just a list of leftovers.
+    QJsonArray m_plan;
+    QString    m_planNote;
+    QDateTime  m_planTouched;
+    void    refreshMcpDeviceIdentity();   // tell MCP which Flipper is attached
+    void    loadPlan();
+    void    savePlan() const;
+    // The plan is mirrored to /ext/nikita/plan.json so it travels between the
+    // three clients through the same SD card the memory does. Local file is the
+    // cache; the card is the shared copy. Best-effort, gated on a live device.
+    void    syncPlanToFlipper();
+    void    readPortablePlan();
+    QString m_syncedPlan;   // last content written to the card, to dedupe
+
+    // ---- Nikita Buddy relay -------------------------------------------
+    // The Flipper's own app leaves a question in /ext/nikita/buddy/req.json;
+    // this polls for it, runs it through the normal turn (so it shows in the
+    // chat, honestly), and writes the answer to res.json for the Flipper to
+    // display. The Flipper has no internet -- this machine's Kimi link is what
+    // makes it possible, which is the whole point of the relay.
+    QTimer*  m_buddyPoll = nullptr;
+    uint32_t m_buddyReqId = 0;       // request currently being answered (0 = none)
+    uint32_t m_buddyLastHandled = 0; // so one request is not answered twice
+    bool     m_buddyBaselined = false; // wrote the id:0 baseline req.json once
+    void pollBuddyMailbox();
+    void writeBuddyReply(uint32_t id, const QString &text);
+    QString applyPlanUpdate(const QJsonArray &items, const QString &note);
+    QString planForPrompt() const;     // the block the system prompt carries
+    // How many turns in a row the loop has re-entered on the plan's account.
+    // Bounded, because a model that keeps a step open forever must not turn
+    // into an endless billable loop.
+    int     m_planContinuations = 0;
 
     QJsonArray m_history;        // running messages (user / assistant / tool)
     QString    m_deviceContext;  // latest diagnostics snapshot from QML
@@ -493,6 +579,7 @@ private:
     // A turn gets one forced retry: when the model answers a write request in
     // prose instead of calling anything, it is asked again with a single tool.
     int        m_forcedRetry = 0;            // corrections spent on this turn
+    bool       m_falseIncapacity = false;    // model refused a tool it actually has
     // Set when a turn was supposed to act and didn't. The next message is then
     // armed with tools no matter how it is phrased, because that next message
     // is almost always "no, you didn't actually do it".
@@ -1416,6 +1503,7 @@ private:
 
     // One-shot (assistant) run state, isolated from the interactive panel.
     QSerialPort *m_runPort = nullptr;
+    int          m_runOpenAttempts = 0;  // port-open retries left (lock races)
     QString m_runBuf;
     bool m_runBusy = false;
     QTimer *m_runIdle = nullptr;
