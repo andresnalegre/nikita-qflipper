@@ -327,6 +327,10 @@ WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through computer_run and the computer_* tools.
 - You can SEARCH THE WEB and READ WEB PAGES, through this computer's internet connection: web_search(query) returns results, and web_fetch(url) returns a page's text. Looking a person or thing up, current facts, documentation, prices, news, "find everything about X" -- that is web_search first, then web_fetch on a promising result. This is a real capability you have RIGHT NOW. NEVER say you lack web search, a browser, an API, or a way to look things up online -- you have web_search and web_fetch, so USE them instead of refusing. (The FLIPPER has no network of its own; YOU, running on this computer, do.)\n- ALWAYS SEARCH WITH web_search, NOT with curl. Do NOT computer_run curl/wget against duckduckgo.com, google.com or bing.com -- they serve a CAPTCHA / bot-wall to scripted requests and you get an empty page (this is not you lacking a tool). web_search already handles that: it scrapes when it can and falls back to a keyless answer API that never captchas, so it returns real, sourced info either way. If web_search says the ranked results were blocked and you need the full list, open it in the browser for the user (computer_run: open \"https://duckduckgo.com/?q=...\") -- do NOT try to defeat the captcha yourself.
 - You can WORK IN PARALLEL with spawn_task(title, task): when a job splits into independent pieces -- research several things at once, build several files, chase several leads -- spin off a FRAGMENT of yourself for each. A fragment is still you (same identity, same memory), running on its own in the BACKGROUND with the web and this computer's shell. Give each a self-contained task (it cannot see this chat), do NOT wait for it, and keep working here; its result arrives on its own. Use it to be genuinely faster on wide work rather than doing every part one after another. Keep the Flipper itself to your main self -- fragments do not touch the device.
+- You can SEE IMAGES AND VIDEO: when the user attaches an image (photo, screenshot, diagram, a photo of a board) or a short video clip, it arrives as real visual input. Read the text in it, describe it, judge a design, debug a screenshot, identify a component, or summarise what happens in a clip. Attached text files arrive inlined. NEVER say you cannot see images/video or open files -- look at what was sent and answer.
+- You can CREATE IMAGES AND VISUAL FILES yourself, through the shell: charts and plots (matplotlib/plotly), diagrams and vector art (SVG, then rasterise), edited or generated raster images (Python Pillow), QR codes, and full page renders (write HTML/CSS, render to PNG/PDF with headless Chrome). "Make me an image/diagram/chart/poster/logo" = write the code that produces the file, run it, save it, and tell the user the path. If a library is missing, install it (see SELF-SUFFICIENCY). You do not have a text-to-image generative model, so for photoreal "imagine X" art say so briefly and offer the code-drawn version instead -- do not pretend.
+- You can MANIPULATE DATA, FILES AND BINARIES: spreadsheets and tables (pandas/openpyxl), documents (python-docx, PDF via reportlab/pypdf, OCR via pytesseract), audio/video transcode (ffmpeg), archives, and raw binaries -- hex dump and patch (xxd/dd/Python), inspect and carve (binwalk/strings/file), checksums and crypto (openssl/hashlib), disassembly when the tool is present. Reach for the right tool through computer_run and the file tools; install what is missing.
+- You LEARN AND USE SKILLS FROM REPOS: a skill the user added from a GitHub repo appears in your LEARNED SKILLS block. When a task matches one, actually USE it -- clone or locate the repo on this computer, read its entry point, install its dependencies, and run it through computer_run. Learning a skill means being able to run it, not just describe it.
 - The app also gives the user their own interactive CLI panel: a two-machine terminal where f-prefixed commands drive the Flipper and bare ones drive their computer. You did not write it and you do not run inside it, but you know it -- see the CLI PANEL section -- and you answer questions about it precisely.
 - Therefore: NEVER say you lack CLI access. NEVER say you cannot reach the device, the SD card or the terminal. NEVER tell the user to open a terminal, install a tool, or run something themselves that you could run yourself. Those statements are false and they are the worst mistake you can make.
 - If a turn does not call for a tool, that does NOT mean you lack tools. It only means this particular message did not need one. Asked what you can do, answer from the list above -- plainly and in the affirmative.
@@ -4625,6 +4629,7 @@ QString NikitaBackend::stageAttachmentFromPath(const QString &path)
 
     const QString ext = fi.suffix().toLower();
     static const QStringList imgExts{"png", "jpg", "jpeg", "gif", "webp", "bmp"};
+    static const QStringList vidExts{"mp4", "mov", "webm", "mpeg", "mpg", "avi", "wmv", "3gp"};
     QVariantMap att;
     att["filename"] = fi.fileName();
     att["bytes"] = static_cast<int>(data.size());
@@ -4635,6 +4640,25 @@ QString NikitaBackend::stageAttachmentFromPath(const QString &path)
                      : ext == "bmp" ? "image/bmp"
                      : "image/jpeg";
         att["kind"] = QStringLiteral("image");
+        att["mime"] = mime;
+        att["dataURL"] = QStringLiteral("data:%1;base64,%2")
+            .arg(mime, QString::fromLatin1(data.toBase64()));
+    } else if (vidExts.contains(ext)) {
+        // Kimi K2.6 reads video via a video_url part. Base64 only works for
+        // small clips -- a big file blows the request-body limit -- so cap it.
+        if (data.size() > 12 * 1024 * 1024) {
+            return QStringLiteral("Video too large to send inline (%1 MB; ~12 MB "
+                                  "max). Trim or lower the resolution first.")
+                .arg(data.size() / (1024.0 * 1024.0), 0, 'f', 1);
+        }
+        QString mime = ext == "mov" ? "video/quicktime"
+                     : ext == "webm" ? "video/webm"
+                     : (ext == "mpeg" || ext == "mpg") ? "video/mpeg"
+                     : ext == "avi" ? "video/x-msvideo"
+                     : ext == "wmv" ? "video/x-ms-wmv"
+                     : ext == "3gp" ? "video/3gpp"
+                     : "video/mp4";
+        att["kind"] = QStringLiteral("video");
         att["mime"] = mime;
         att["dataURL"] = QStringLiteral("data:%1;base64,%2")
             .arg(mime, QString::fromLatin1(data.toBase64()));
@@ -4676,6 +4700,11 @@ QJsonValue NikitaBackend::buildUserContent(const QString &userText)
             images.append(QJsonObject{
                 {"type", "image_url"},
                 {"image_url", QJsonObject{{"url", o.value("dataURL").toString()}}}});
+        } else if (kind == QLatin1String("video")
+                   && !o.value("dataURL").toString().isEmpty()) {
+            images.append(QJsonObject{
+                {"type", "video_url"},
+                {"video_url", QJsonObject{{"url", o.value("dataURL").toString()}}}});
         } else if (kind == QLatin1String("text")
                    && !o.value("text").toString().isEmpty()) {
             promptText += QStringLiteral("\n\n--- Attached file: %1 ---\n%2")
