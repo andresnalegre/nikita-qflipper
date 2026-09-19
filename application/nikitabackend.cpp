@@ -96,7 +96,7 @@ static const char *NIKITA_API_MODEL = "kimi-k2.6";
 // The ceiling on one reply. Output is what costs money here, so this is a real
 // budget and not a formality: at $15 per million, a turn that ran the whole way
 // to this ceiling would be about six cents on its own.
-static const int   NIKITA_API_MAX_TOKENS = 4096;
+static const int   NIKITA_API_MAX_TOKENS = 16384;
 // How many times one turn will quietly wait out a 429 before giving up. A 429 is
 // a per-minute throttle, so a couple of backed-off retries clears the common
 // case (two turns fired close together); past that the account tier is the real
@@ -179,11 +179,16 @@ static const int   NIKITA_MAX_VERIFY = 12;
 // call means she is spinning in place, and MORE of those is wasted tokens, not
 // more power -- so this stays low on purpose. It stops a stuck loop; it does not
 // limit real work (that is what the high ceilings above/below are for).
-static const int   NIKITA_MAX_REPEAT_ROUNDS = 6;
+// The last remaining safety, kept FINITE on purpose: consecutive rounds with no
+// new tool call means she is genuinely spinning (asking nothing, doing nothing),
+// and more of those is wasted tokens, not autonomy. Raised high so real
+// persistence is never cut short, but not infinite -- a pathological loop still
+// has to end somewhere. Everything that limited real WORK has been removed.
+static const int   NIKITA_MAX_REPEAT_ROUNDS = 40;
 // Corrections for a turn that claims something it didn't do.
 static const int   NIKITA_MAX_CORRECTIONS = 30;
 static const int   NIKITA_TOOL_ROUND_CEILING = 999;
-static const int   NIKITA_READ_CAP = 8000;
+static const int   NIKITA_READ_CAP = 40000;
 static const int   NIKITA_MAX_PRESSES = 99;
 
 // ---- Access filters -------------------------------------------------------
@@ -270,10 +275,10 @@ static const QHash<QString, QString> &nikitaToolGroups()
 // requestHostActionConfirm() for write/mkdir/move/copy/delete,
 // hostRunConfirmRequested for computer_run.
 static const int   NIKITA_HOST_RUN_TIMEOUT_MS = 900000;   // 15 min per command
-static const int   NIKITA_HOST_OUTPUT_CAP     = 60000;    // chars of stdout+stderr returned
-static const int   NIKITA_HOST_READ_CAP       = 120000;   // chars returned by computer_read
-static const int   NIKITA_HOST_LIST_CAP       = 4000;     // entries returned by computer_list
-static const int   NIKITA_HOST_FIND_CAP       = 2000;     // paths returned by computer_find
+static const int   NIKITA_HOST_OUTPUT_CAP     = 250000;   // chars of stdout+stderr returned
+static const int   NIKITA_HOST_READ_CAP       = 500000;   // chars returned by computer_read
+static const int   NIKITA_HOST_LIST_CAP       = 20000;    // entries returned by computer_list
+static const int   NIKITA_HOST_FIND_CAP       = 10000;    // paths returned by computer_find
 
 // Defined after the CLI command table further down, because it is built FROM
 // that table -- the same reason nikitaWellKnownDir is declared before its
@@ -6229,7 +6234,7 @@ void NikitaBackend::dispatchTurn()
     // Talk is not memory: something mentioned in passing ten messages ago sits
     // in context looking exactly like a saved fact, and for this one question it
     // is only in the way. memory.txt is the answer; nothing else is.
-    const int kWindow = recallQuestion ? 2 : 14;
+    const int kWindow = recallQuestion ? 2 : 40;
     int start = m_history.size() > kWindow ? m_history.size() - kWindow : 0;
     while (start > 0 && m_history.at(start).toObject().value("role").toString()
                         != QLatin1String("user")) {
