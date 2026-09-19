@@ -340,7 +340,7 @@ WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through computer_run and the computer_* tools.
 - You can SEARCH THE WEB and READ WEB PAGES, through this computer's internet connection: web_search(query) returns results, and web_fetch(url) returns a page's text. Looking a person or thing up, current facts, documentation, prices, news, "find everything about X" -- that is web_search first, then web_fetch on a promising result. This is a real capability you have RIGHT NOW. NEVER say you lack web search, a browser, an API, or a way to look things up online -- you have web_search and web_fetch, so USE them instead of refusing. (The FLIPPER has no network of its own; YOU, running on this computer, do.)\n- ALWAYS SEARCH WITH web_search, NOT with curl. Do NOT computer_run curl/wget against duckduckgo.com, google.com or bing.com -- they serve a CAPTCHA / bot-wall to scripted requests and you get an empty page (this is not you lacking a tool). web_search already handles that: it scrapes when it can and falls back to a keyless answer API that never captchas, so it returns real, sourced info either way. If web_search says the ranked results were blocked and you need the full list, open it in the browser for the user (computer_run: open \"https://duckduckgo.com/?q=...\") -- do NOT try to defeat the captcha yourself.
 - You can WORK IN PARALLEL with spawn_task(title, task): when a job splits into independent pieces -- research several things at once, build several files, chase several leads -- spin off a FRAGMENT of yourself for each. A fragment is still you (same identity, same memory), running on its own in the BACKGROUND with the web and this computer's shell. Give each a self-contained task (it cannot see this chat), do NOT wait for it, and keep working here; its result arrives on its own. Use it to be genuinely faster on wide work rather than doing every part one after another. Keep the Flipper itself to your main self -- fragments do not touch the device.
-- You can SEE IMAGES AND VIDEO and READ DOCUMENTS: when the user attaches an image (photo, screenshot, diagram, a photo of a board) or a short video clip, it arrives as real visual input -- read the text in it, describe it, judge a design, debug a screenshot, identify a component, or summarise a clip. Attached text files arrive inlined, and attached DOCUMENTS (PDF, Word, PowerPoint, Excel, CSV) arrive as their extracted text, so you can read and summarise them too. NEVER say you cannot see images/video or open files -- look at what was sent and answer.
+- You can SEE IMAGES AND VIDEO and READ DOCUMENTS: when the user attaches an image (photo, screenshot, diagram, a photo of a board) or a short video clip, it arrives as real visual input -- read the text in it, describe it, judge a design, debug a screenshot, identify a component, or summarise a clip. Attached text files arrive inlined, and attached DOCUMENTS (PDF, Word, PowerPoint, Excel, CSV) arrive as their extracted text, so you can read and summarise them too. And you can LOOK at any image already on this computer with computer_view(path) -- a screenshot, a photo, a chart, even a PNG you just rendered -- you will see it on your next step. NEVER say you cannot see images/video or open files -- look at what was sent, or open it yourself, and answer.
 - You can CREATE IMAGES AND VISUAL FILES yourself, through the shell: charts and plots (matplotlib/plotly), diagrams and vector art (SVG, then rasterise), edited or generated raster images (Python Pillow), QR codes, and full page renders (write HTML/CSS, render to PNG/PDF with headless Chrome). "Make me an image/diagram/chart/poster/logo" = write the code that produces the file, run it, save it, and tell the user the path. If a library is missing, install it (see SELF-SUFFICIENCY). You do not have a text-to-image generative model, so for photoreal "imagine X" art say so briefly and offer the code-drawn version instead -- do not pretend.
 - You can MANIPULATE DATA, FILES AND BINARIES: spreadsheets and tables (pandas/openpyxl), documents (python-docx, PDF via reportlab/pypdf, OCR via pytesseract), audio/video transcode (ffmpeg), archives, and raw binaries -- hex dump and patch (xxd/dd/Python), inspect and carve (binwalk/strings/file), checksums and crypto (openssl/hashlib), disassembly when the tool is present. Reach for the right tool through computer_run and the file tools; install what is missing.
 - You LEARN AND USE SKILLS FROM REPOS: a skill the user added from a GitHub repo appears in your LEARNED SKILLS block. When a task matches one, actually USE it -- clone or locate the repo on this computer, read its entry point, install its dependencies, and run it through computer_run. Learning a skill means being able to run it, not just describe it.
@@ -1569,6 +1569,21 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         }}
     };
 
+    const QJsonObject computerView{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "computer_view"},
+            {"description", "LOOK at an image file on this computer -- a screenshot, a photo, a diagram, a chart, a rendered PNG/JPG. Give the path and you will actually SEE the image on your next step (read the text in it, describe it, debug a screenshot, judge a design). Use this whenever the answer depends on what an image contains, including images you just created."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"path", QJsonObject{{"type", "string"}, {"description", "Absolute path to an image file (png/jpg/gif/webp/bmp)."}}}
+                }},
+                {"required", QJsonArray{"path"}}
+            }}
+        }}
+    };
+
     const QJsonObject computerCd{
         {"type", "function"},
         {"function", QJsonObject{
@@ -1710,6 +1725,7 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         tools.append(computerWrite);
         tools.append(computerRun);
         tools.append(pythonRun);
+        tools.append(computerView);
         tools.append(computerCd);
         tools.append(computerMkdir);
         tools.append(computerDelete);
@@ -3286,6 +3302,8 @@ static QString nikitaToolStatus(const QString &tool,
         return QStringLiteral("ran a command · %1").arg(val("command"));
     if (tool == QLatin1String("python_run"))
         return QStringLiteral("running python");
+    if (tool == QLatin1String("computer_view"))
+        return QStringLiteral("looking at %1").arg(base(val("path")));
     if (tool == QLatin1String("run_cli"))
         return QStringLiteral("running on the Flipper · %1").arg(val("command"));
     if (tool == QLatin1String("computer_read"))
@@ -5808,6 +5826,7 @@ void NikitaBackend::send(const QString &userText, const QString &deviceContext)
     m_turnToolsRun.clear();
     m_turnToolsRan.clear();
     m_turnPathsTouched.clear();
+    m_pendingViewImages.clear();
     m_pendingMoves.clear();
     m_turnCallSigs.clear();
     m_repeatRounds = 0;
@@ -7761,6 +7780,28 @@ void NikitaBackend::runToolCalls(const QJsonArray &toolCalls, int index)
     if (m_turnAborted) { return; }
     if (index == 0 && !toolCalls.isEmpty()) { setTurnStatus(QStringLiteral("getting to work")); }
     if (index >= toolCalls.size()) {
+        // computer_view loaded one or more images this round: feed them to the
+        // model as a vision message and go straight back to it so it actually
+        // LOOKS. This comes AFTER every tool result of the round, so the
+        // message ordering (assistant tool_calls -> tool results -> user image)
+        // stays valid, and it takes priority over finishing the turn.
+        if (!m_turnAborted && !m_pendingViewImages.isEmpty()) {
+            QJsonArray parts;
+            parts.append(QJsonObject{{"type", "text"},
+                {"text", QStringLiteral("[the app] Here %1 the image(s) you asked "
+                    "to view. Look and use what they show.")
+                    .arg(m_pendingViewImages.size() == 1 ? QStringLiteral("is")
+                                                         : QStringLiteral("are"))}});
+            for (const QString &durl : m_pendingViewImages) {
+                parts.append(QJsonObject{{"type", "image_url"},
+                    {"image_url", QJsonObject{{"url", durl}}}});
+            }
+            m_pendingViewImages.clear();
+            m_history.append(QJsonObject{{"role", "user"}, {"content", parts}});
+            setTurnStatus(QStringLiteral("looking"));
+            redispatch();
+            return;
+        }
         // A small model treats one successful tool as the whole job done. Asked
         // to "create a folder and put an empty file in it" it calls computer_mkdir,
         // gets {"created":true}, and answers "created the folder, and inside it
@@ -10063,6 +10104,34 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         m_pendingHostRunCwd = cwd;
         m_pendingHostRunDone = done;
         emit hostRunConfirmRequested(cmd, cwd.isEmpty() ? agentCwd() : cwd);
+
+    } else if (name == QLatin1String("computer_view")) {
+        const QString abs = resolveAgentPath(args.value("path").toString(), true);
+        QFileInfo fi(abs);
+        if (abs.isEmpty() || !fi.exists() || !fi.isFile()) {
+            done(QStringLiteral("{\"error\":\"no such image: %1\"}").arg(args.value("path").toString()));
+            return;
+        }
+        static const QStringList imgExts{"png", "jpg", "jpeg", "gif", "webp", "bmp"};
+        const QString ext = fi.suffix().toLower();
+        if (!imgExts.contains(ext)) {
+            done(QStringLiteral("{\"error\":\"not an image (%1). Use computer_read for text, or render it to a PNG first.\"}").arg(ext));
+            return;
+        }
+        if (fi.size() > 12 * 1024 * 1024) {
+            done(QStringLiteral("{\"error\":\"image too large to view inline (%1 MB)\"}")
+                 .arg(fi.size() / (1024.0 * 1024.0), 0, 'f', 1));
+            return;
+        }
+        QFile f(abs);
+        if (!f.open(QIODevice::ReadOnly)) { done(QStringLiteral("{\"error\":\"can't open\"}")); return; }
+        const QByteArray data = f.readAll(); f.close();
+        const QString mime = ext == "png" ? "image/png" : ext == "gif" ? "image/gif"
+                           : ext == "webp" ? "image/webp" : ext == "bmp" ? "image/bmp" : "image/jpeg";
+        m_pendingViewImages.append(QStringLiteral("data:%1;base64,%2")
+            .arg(mime, QString::fromLatin1(data.toBase64())));
+        done(QStringLiteral("{\"ok\":true,\"note\":\"Image loaded (%1). You will SEE it on your next step -- describe or use what it shows.\"}")
+             .arg(fi.fileName()));
 
     } else if (name == QLatin1String("computer_cd")) {
         // Answers with no argument too, which makes it the pwd as well: one

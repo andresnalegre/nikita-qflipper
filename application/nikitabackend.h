@@ -650,6 +650,9 @@ private:
     bool     m_buddySeeded = false;    // seeded lastHandled from res.json at launch
     void pollBuddyMailbox();
     void writeBuddyReply(uint32_t id, const QString &text);
+    // Images the model asked to look at with computer_view this round, as
+    // data: URLs. Fed to it as a user vision message when the tool round ends.
+    QStringList m_pendingViewImages;
     // Voice input (macOS Speech). Owned; the waveform reads m_micLevels.
     MacSpeech *m_speech = nullptr;
     QVariantList m_micLevels;
