@@ -74,6 +74,8 @@ private:
     void toolWebSearch(const QString &query, std::function<void(const QString &)> done);
     void toolWebFetch(const QString &url, std::function<void(const QString &)> done);
     void toolComputerRun(const QString &cmd, std::function<void(const QString &)> done);
+    void toolPythonRun(const QString &code, std::function<void(const QString &)> done);
+    void toolHttpRequest(const QJsonObject &args, std::function<void(const QString &)> done);
     void toolComputerWrite(const QString &path, const QString &content,
                            std::function<void(const QString &)> done);
     void toolComputerRead(const QString &path, std::function<void(const QString &)> done);

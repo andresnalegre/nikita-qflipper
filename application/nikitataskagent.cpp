@@ -106,6 +106,14 @@ QJsonArray NikitaTaskAgent::tools() const
            QJsonObject{{"url", str("the full URL")}}, QJsonArray{"url"}),
         fn("computer_run", "Run a shell command on this computer and return its output.",
            QJsonObject{{"command", str("the shell command")}}, QJsonArray{"command"}),
+        fn("python_run", "Run Python 3 in Nikita's env (matplotlib/pandas/Pillow/"
+           "cairosvg/pypdf/qrcode...). Best for charts, images, data, PDF, binaries.",
+           QJsonObject{{"code", str("the Python 3 source")}}, QJsonArray{"code"}),
+        fn("http_request", "HTTP request to any URL (method/headers/body); returns status+body. "
+           "A real API client, not just page reading.",
+           QJsonObject{{"url", str("full http/https URL")},
+                       {"method", str("GET/POST/PUT/PATCH/DELETE, default GET")},
+                       {"body", str("optional request body")}}, QJsonArray{"url"}),
         fn("computer_write", "Write a text file on this computer (creates parent folders).",
            QJsonObject{{"path", str("absolute path")}, {"content", str("full contents")}},
            QJsonArray{"path", "content"}),
@@ -193,6 +201,10 @@ void NikitaTaskAgent::runOneTool(const QString &name, const QJsonObject &args,
         toolWebFetch(args.value(QStringLiteral("url")).toString(), done);
     } else if (name == QLatin1String("computer_run")) {
         toolComputerRun(args.value(QStringLiteral("command")).toString(), done);
+    } else if (name == QLatin1String("python_run")) {
+        toolPythonRun(args.value(QStringLiteral("code")).toString(), done);
+    } else if (name == QLatin1String("http_request")) {
+        toolHttpRequest(args, done);
     } else if (name == QLatin1String("computer_write")) {
         toolComputerWrite(args.value(QStringLiteral("path")).toString(),
                           args.value(QStringLiteral("content")).toString(), done);
@@ -235,6 +247,46 @@ void NikitaTaskAgent::toolComputerRun(const QString &cmd,
         }
     });
     p->start(QStringLiteral("/bin/zsh"), {QStringLiteral("-lc"), cmd});
+}
+
+void NikitaTaskAgent::toolPythonRun(const QString &code,
+                                    std::function<void(const QString &)> done)
+{
+    const QString b64 = QString::fromLatin1(code.toUtf8().toBase64());
+    const QString cmd = QStringLiteral(
+        "PY=\"$HOME/.nikita/venv/bin/python3\"; [ -x \"$PY\" ] || "
+        "PY=\"$HOME/.nikita/venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; "
+        "echo %1 | base64 -d | \"$PY\" -").arg(b64);
+    toolComputerRun(cmd, done);
+}
+
+void NikitaTaskAgent::toolHttpRequest(const QJsonObject &args,
+                                      std::function<void(const QString &)> done)
+{
+    const QUrl url(args.value(QStringLiteral("url")).toString().trimmed());
+    if (!url.isValid() || !(url.scheme() == QLatin1String("http")
+                            || url.scheme() == QLatin1String("https"))) {
+        done(QStringLiteral("{\"error\":\"url must be http/https\"}"));
+        return;
+    }
+    const QString method = args.value(QStringLiteral("method")).toString(QStringLiteral("GET")).toUpper();
+    const QByteArray body = args.value(QStringLiteral("body")).toString().toUtf8();
+    QNetworkRequest req{url};
+    req.setRawHeader("User-Agent", "nikita");
+    if (!body.isEmpty()) req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setTransferTimeout(30000);
+    QNetworkReply *reply = method == QLatin1String("POST") ? m_net.post(req, body)
+        : method == QLatin1String("PUT") ? m_net.put(req, body)
+        : method == QLatin1String("DELETE") ? m_net.deleteResource(req)
+        : method == QLatin1String("PATCH") ? m_net.sendCustomRequest(req, QByteArrayLiteral("PATCH"), body)
+        : m_net.get(req);
+    connect(reply, &QNetworkReply::finished, this, [reply, done]() {
+        reply->deleteLater();
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QString text = QString::fromUtf8(reply->readAll()).left(12000);
+        QJsonObject o{{"status", status}, {"body", text}};
+        done(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+    });
 }
 
 void NikitaTaskAgent::toolComputerWrite(const QString &path, const QString &content,
