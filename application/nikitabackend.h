@@ -662,6 +662,10 @@ private:
     // Second half of addSkillFromRepo, once the README has been fetched.
     void distillSkillFromReadme(const QString &owner, const QString &repo,
                                 const QString &readme, const QString &key);
+    // Clone/refresh a learned skill's repo to ~/.nikita/skills/<name> so Nikita
+    // can actually run it, and record the local path back into its card.
+    void cloneSkillRepo(const QString &name, const QString &owner,
+                        const QString &repo);
     // The call_plugin tool: call a registered API plugin, base URL + auth added.
     void runCallPlugin(const QJsonObject &args,
                        std::function<void(const QString &)> done);

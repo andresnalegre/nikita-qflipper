@@ -5037,16 +5037,84 @@ void NikitaBackend::distillSkillFromReadme(const QString &owner, const QString &
         m_extras[QStringLiteral("skills")] = arr;
         saveExtras();
         emit skillsChanged();
-        emit skillLearnStatus(QStringLiteral("Learned \"%1\". It is now part of me.").arg(nm), false);
+        emit skillLearnStatus(
+            QStringLiteral("Learned \"%1\". Cloning it so I can run it…").arg(nm), true);
+        // Pull the repo down so the skill is genuinely runnable, not just known.
+        cloneSkillRepo(nm, owner, repo);
     });
+}
+
+// Clone (or refresh) a learned skill's repo onto this computer so Nikita can
+// run it. Shallow clone into ~/.nikita/skills/<name>; on success the card gets a
+// localPath (which then syncs to the SD with the rest of the "+" store). A
+// failure is not fatal -- the skill stays learned, and the prompt still tells
+// Nikita to clone it on demand.
+void NikitaBackend::cloneSkillRepo(const QString &name, const QString &owner,
+                                   const QString &repo)
+{
+    QString safe = name;
+    safe.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]")),
+                 QStringLiteral("_"));
+    if (safe.isEmpty()) { safe = repo; }
+    const QString base = QDir::homePath() + QStringLiteral("/.nikita/skills");
+    QDir().mkpath(base);
+    const QString dest = base + QLatin1Char('/') + safe;
+    const QString url = QStringLiteral("https://github.com/%1/%2.git").arg(owner, repo);
+
+    QProcess *git = new QProcess(this);
+    QStringList args;
+    if (QDir(dest).exists()) {
+        args << QStringLiteral("-C") << dest << QStringLiteral("pull")
+             << QStringLiteral("--ff-only");
+    } else {
+        args << QStringLiteral("clone") << QStringLiteral("--depth")
+             << QStringLiteral("1") << url << dest;
+    }
+    connect(git, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, git, name, dest](int code, QProcess::ExitStatus) {
+        git->deleteLater();
+        const bool ok = (code == 0) && QDir(dest).exists();
+        if (ok) {
+            // Record the local path on the matching skill card.
+            QJsonArray arr = m_extras.value(QStringLiteral("skills")).toArray();
+            for (int i = 0; i < arr.size(); ++i) {
+                QJsonObject o = arr.at(i).toObject();
+                if (o.value(QStringLiteral("name")).toString() == name) {
+                    o[QStringLiteral("localPath")] = dest;
+                    arr[i] = o;
+                    break;
+                }
+            }
+            m_extras[QStringLiteral("skills")] = arr;
+            saveExtras();
+            emit skillsChanged();
+            emit skillLearnStatus(
+                QStringLiteral("\"%1\" is ready to run (cloned to %2).")
+                    .arg(name, dest), false);
+        } else {
+            emit skillLearnStatus(
+                QStringLiteral("Learned \"%1\" (couldn't auto-clone; I'll clone "
+                               "it when I need to run it).").arg(name), false);
+        }
+    });
+    git->start(QStringLiteral("git"), args);
+    if (!git->waitForStarted(3000)) {
+        git->deleteLater();
+        emit skillLearnStatus(
+            QStringLiteral("Learned \"%1\" (git not available to auto-clone).")
+                .arg(name), false);
+    }
 }
 
 QString NikitaBackend::learnedSkillsForPrompt() const
 {
     const QJsonArray arr = m_extras.value(QStringLiteral("skills")).toArray();
     if (arr.isEmpty()) { return QString(); }
-    QString s = QStringLiteral("\n\nLEARNED SKILLS -- projects you have studied and can use. "
-        "Reach for the right one when a request matches it; use your shell/web tools to run it.");
+    QString s = QStringLiteral("\n\nLEARNED SKILLS -- projects you have studied and can RUN. "
+        "When a request matches one, use it: if it has a LOCAL path it is already cloned on "
+        "this computer, so cd there, install its deps if needed, and run it with computer_run. "
+        "If it has no local path, clone it first (git clone into ~/.nikita/skills), then run. "
+        "The skill registry is kept on the SD card too, so it travels with the device.");
     for (const QJsonValue &v : arr) {
         const QJsonObject o = v.toObject();
         s += QStringLiteral("\n- %1 (%2): %3 WHEN: %4 HOW: %5")
@@ -5058,6 +5126,9 @@ QString NikitaBackend::learnedSkillsForPrompt() const
         const QString inst = o.value(QStringLiteral("install")).toString();
         if (!inst.trimmed().isEmpty())
             s += QStringLiteral(" INSTALL: %1").arg(inst);
+        const QString lp = o.value(QStringLiteral("localPath")).toString();
+        if (!lp.trimmed().isEmpty())
+            s += QStringLiteral(" LOCAL: %1").arg(lp);
     }
     return s;
 }
