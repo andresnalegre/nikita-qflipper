@@ -346,6 +346,7 @@ WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
   * run_cli -- ONLY the Flipper Zero itself: its firmware/`nikita` commands, sub-GHz/NFC/IR/BadUSB, the SD card over USB. The Flipper has no compilers, no python, no shell utilities -- never try to build or run general code on it. Text work on the Flipper's files happens on your side or on the computer, then transfer the result.
   * web_search/web_fetch -- facts, docs, APIs, error messages you are unsure of. Look it up before guessing.
   Decide by WHERE the work lives (the computer vs the Flipper) and WHAT it is (Python/data vs general build vs device op). If a step needs a tool that is missing, install it and continue. Never tell the user to open a terminal or run something themselves that you can run.
+- LEAVE NO TRACE -- restore the machine to how you found it. When you change state only to get a task done -- open an app, toggle a setting, enable a dev/debug flag, start a server, create temp files or scratch folders, change the working directory or environment -- UNDO it when you finish: close what you opened, turn the flag back off, stop the server, delete the temp files. The user should not discover later that Chrome now always opens with DevTools, a service is still running, or scratch files are lying around because of something you did. Two exceptions, and only these: (1) the change IS the deliverable the user asked for (a file they wanted, a tool they asked you to install and keep -- installs stay, that is how you get more capable), and (2) leaving it as-is is what they explicitly asked for. When in doubt, clean up. Never leave a job half-done or a side effect behind.
 - The app also gives the user their own interactive CLI panel: a two-machine terminal where f-prefixed commands drive the Flipper and bare ones drive their computer. You did not write it and you do not run inside it, but you know it -- see the CLI PANEL section -- and you answer questions about it precisely.
 - Therefore: NEVER say you lack CLI access. NEVER say you cannot reach the device, the SD card or the terminal. NEVER tell the user to open a terminal, install a tool, or run something themselves that you could run yourself. Those statements are false and they are the worst mistake you can make.
 - If a turn does not call for a tool, that does NOT mean you lack tools. It only means this particular message did not need one. Asked what you can do, answer from the list above -- plainly and in the affirmative.
@@ -1358,6 +1359,45 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         }}
     };
 
+    const QJsonObject scheduleTaskTool{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "schedule_task"},
+            {"description", "Schedule work to run LATER and on your own -- this is how you keep living between messages. Give it a self-contained task and an interval in minutes: every_minutes>0 repeats it forever (e.g. 60 = hourly, 1440 = daily); every_minutes=0 runs it ONCE, in a few seconds. At each firing a fragment of you runs the task in the background and, when it finishes, you reach out to the user with the result. Use it for recurring checks, watches, digests, reminders, or deferred work. The task text must stand alone -- the fragment cannot see this chat."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"title", QJsonObject{{"type", "string"}, {"description", "Short label, e.g. 'hourly repo check'."}}},
+                    {"task", QJsonObject{{"type", "string"}, {"description", "Full, self-contained instruction to run each time."}}},
+                    {"every_minutes", QJsonObject{{"type", "integer"}, {"description", "Repeat interval in minutes; 0 = run once soon."}}}
+                }},
+                {"required", QJsonArray{"task"}}
+            }}
+        }}
+    };
+    const QJsonObject listScheduledTool{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "list_scheduled"},
+            {"description", "List your scheduled tasks (id, title, interval, next run)."},
+            {"parameters", QJsonObject{{"type", "object"}, {"properties", QJsonObject{}}}}
+        }}
+    };
+    const QJsonObject cancelScheduledTool{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "cancel_scheduled"},
+            {"description", "Cancel a scheduled task by its id (from list_scheduled)."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"id", QJsonObject{{"type", "string"}, {"description", "The scheduled task id to cancel."}}}
+                }},
+                {"required", QJsonArray{"id"}}
+            }}
+        }}
+    };
+
     const QJsonObject callPlugin{
         {"type", "function"},
         {"function", QJsonObject{
@@ -1380,7 +1420,8 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
     };
 
     QJsonArray tools{remember, listMemory, forget, nikitaPlanTool(),
-                     webSearch, webFetch, spawnTask, notifyUser};
+                     webSearch, webFetch, spawnTask, notifyUser,
+                     scheduleTaskTool, listScheduledTool, cancelScheduledTool};
     if (hasPlugins) {
         tools.append(callPlugin);
     }
@@ -2099,6 +2140,23 @@ NikitaBackend::NikitaBackend(QObject *parent)
     loadExtras();
     loadFilters();
     loadMistakes();
+
+    // The scheduler: a slow heartbeat that fires due scheduled tasks. 30s is
+    // fine granularity for minute-scale schedules and costs nothing when idle.
+    m_schedTimer = new QTimer(this);
+    m_schedTimer->setInterval(30000);
+    connect(m_schedTimer, &QTimer::timeout, this, [this]() { checkSchedules(); });
+    m_schedTimer->start();
+    // When a scheduled fragment finishes, Nikita reaches out with the result --
+    // this is what gives the schedules their "she got back to me on her own" feel.
+    connect(this, &NikitaBackend::taskFinished, this,
+            [this](int, const QString &title, const QString &result) {
+        if (title.startsWith(QStringLiteral("⏰"))) {
+            QString r = result.trimmed();
+            if (r.size() > 240) { r = r.left(240) + QStringLiteral("…"); }
+            reachOutToUser(title, r.isEmpty() ? QStringLiteral("Done.") : r);
+        }
+    });
     // Off on a fresh install. An assistant that reads files and remembers
     // things should be something a person switches on, not something they
     // discover already running -- and plenty of people want this app without
@@ -3484,6 +3542,27 @@ void NikitaBackend::pollBuddyMailbox()
         m_appBackend->backendState() == ApplicationBackend::BackendState::Ready;
     if(!ready) return;
 
+    // Once per launch, seed m_buddyLastHandled from the last reply we wrote
+    // (res.json on the card). Without this, a request already answered in a
+    // previous session -- still sitting in req.json -- would look "new" (since
+    // m_buddyLastHandled starts at 0) and get re-run on startup. That was the
+    // "it keeps redoing the same task every launch" bug.
+    if(!m_buddySeeded) {
+        m_buddySeeded = true;
+        QBuffer *rbuf = new QBuffer(this);
+        rbuf->open(QIODevice::ReadWrite);
+        auto *rop = dev->rpc()->storageRead("/ext/nikita/buddy/res.json", rbuf);
+        connect(rop, &AbstractOperation::finished, this, [this, rop, rbuf]() {
+            if(!rop->isError()) {
+                const uint32_t rid = (uint32_t)QJsonDocument::fromJson(rbuf->data())
+                    .object().value(QStringLiteral("id")).toDouble();
+                if(rid != 0 && rid > m_buddyLastHandled) { m_buddyLastHandled = rid; }
+            }
+            rbuf->deleteLater();
+        });
+        return;   // let the seed settle before evaluating a request this cycle
+    }
+
     QBuffer *buf = new QBuffer(this);
     buf->open(QIODevice::ReadWrite);
     auto *op = dev->rpc()->storageRead("/ext/nikita/buddy/req.json", buf);
@@ -3561,6 +3640,16 @@ void NikitaBackend::writeBuddyReply(uint32_t id, const QString &text)
         buf->open(QIODevice::ReadOnly);
         auto *op = dev->rpc()->storageWrite("/ext/nikita/buddy/res.json", buf);
         connect(op, &AbstractOperation::finished, this, [buf]() { buf->deleteLater(); });
+        // CONSUME the request: reset req.json to {"id":0}. Without this, the
+        // request file stays on the SD and, since m_buddyLastHandled resets to 0
+        // on the next launch, the same old request (e.g. "create folder X") got
+        // re-answered every time qFlipper started. Zeroing it means a handled
+        // request is done for good; the Buddy writes a fresh id for the next ask.
+        QBuffer *rb = new QBuffer(this);
+        rb->setData(QByteArrayLiteral("{\"id\":0}"));
+        rb->open(QIODevice::ReadOnly);
+        auto *rop = dev->rpc()->storageWrite("/ext/nikita/buddy/req.json", rb);
+        connect(rop, &AbstractOperation::finished, this, [rb]() { rb->deleteLater(); });
     });
     nikitaLog(QStringLiteral("Buddy: answered Flipper request #%1").arg(id));
     m_buddyReqId = 0;
@@ -4800,6 +4889,8 @@ void NikitaBackend::loadExtras()
         m_extras[QStringLiteral("skills")] = QJsonArray();
     if (!m_extras.contains(QStringLiteral("plugins")))
         m_extras[QStringLiteral("plugins")] = QJsonArray();
+    if (!m_extras.contains(QStringLiteral("scheduled")))
+        m_extras[QStringLiteral("scheduled")] = QJsonArray();
     seedQuickCommandsIfEmpty();
 }
 
@@ -5235,6 +5326,91 @@ QString NikitaBackend::pluginsForPrompt() const
                  o.value(QStringLiteral("baseUrl")).toString());
     }
     return s;
+}
+
+// ---- Scheduled tasks: Nikita's continuous life ---------------------------
+
+QVariantList NikitaBackend::scheduledTasks() const
+{
+    QVariantList out;
+    for (const QJsonValue &v : m_extras.value(QStringLiteral("scheduled")).toArray())
+        out.append(v.toObject().toVariantMap());
+    return out;
+}
+
+void NikitaBackend::scheduleTask(const QString &title, const QString &task,
+                                 int everyMinutes)
+{
+    if (task.trimmed().isEmpty()) { return; }
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    // everyMinutes <= 0 means run once, soon; otherwise recurring.
+    const int every = everyMinutes;
+    const qint64 first = every > 0 ? now + qint64(every) * 60 : now + 5;
+    QJsonArray arr = m_extras.value(QStringLiteral("scheduled")).toArray();
+    arr.append(QJsonObject{
+        {QStringLiteral("id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+        {QStringLiteral("title"), title.trimmed().isEmpty() ? task.left(40) : title.trimmed()},
+        {QStringLiteral("task"), task.trimmed()},
+        {QStringLiteral("everyMin"), every},
+        {QStringLiteral("nextRun"), first},
+        {QStringLiteral("enabled"), true}});
+    m_extras[QStringLiteral("scheduled")] = arr;
+    saveExtras();
+    emit scheduledChanged();
+}
+
+void NikitaBackend::cancelScheduledTask(const QString &id)
+{
+    QJsonArray arr = m_extras.value(QStringLiteral("scheduled")).toArray();
+    for (int i = 0; i < arr.size(); ++i) {
+        if (arr.at(i).toObject().value(QStringLiteral("id")).toString() == id) {
+            arr.removeAt(i);
+            break;
+        }
+    }
+    m_extras[QStringLiteral("scheduled")] = arr;
+    saveExtras();
+    emit scheduledChanged();
+}
+
+// Fire any due scheduled tasks as fragments. A recurring task is rescheduled;
+// a one-off is removed after it fires. The fragment's completion is what
+// reaches out to the user (see the taskFinished hook in the ctor).
+void NikitaBackend::checkSchedules()
+{
+    if (!m_assistantEnabled || apiKey().isEmpty()) { return; }
+    QJsonArray arr = m_extras.value(QStringLiteral("scheduled")).toArray();
+    if (arr.isEmpty()) { return; }
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    bool changed = false;
+    QJsonArray kept;
+    for (const QJsonValue &v : arr) {
+        QJsonObject o = v.toObject();
+        const bool enabled = o.value(QStringLiteral("enabled")).toBool(true);
+        const qint64 nextRun = qint64(o.value(QStringLiteral("nextRun")).toDouble());
+        const int every = o.value(QStringLiteral("everyMin")).toInt();
+        if (enabled && nextRun > 0 && now >= nextRun) {
+            // Fire it. The "⏰" marker tells the taskFinished hook to reach out.
+            spawnTask(QStringLiteral("⏰ ") + o.value(QStringLiteral("title")).toString(),
+                      o.value(QStringLiteral("task")).toString());
+            if (every > 0) {
+                o[QStringLiteral("nextRun")] = double(now + qint64(every) * 60);
+                changed = true;
+                kept.append(o);
+            } else {
+                // One-off: drop it after firing.
+                changed = true;
+                // (not appended to kept)
+            }
+        } else {
+            kept.append(o);
+        }
+    }
+    if (changed) {
+        m_extras[QStringLiteral("scheduled")] = kept;
+        saveExtras();
+        emit scheduledChanged();
+    }
 }
 
 // Stage the readable text files in a folder (for "Add folder"). Bounded so a
@@ -8091,6 +8267,38 @@ void NikitaBackend::runOneTool(const QString &rawName, const QJsonObject &args, 
         reachOutToUser(title, msg);
         done(QStringLiteral("{\"ok\":true,\"note\":\"The user was pinged with a "
                             "system notification. Continue; also say it in your reply.\"}"));
+        return;
+    }
+
+    if (name == QLatin1String("schedule_task")) {
+        const QString task = args.value("task").toString().trimmed();
+        if (task.isEmpty()) { done(QStringLiteral("{\"error\":\"no task\"}")); return; }
+        const int every = args.value("every_minutes").toInt(0);
+        scheduleTask(args.value("title").toString(), task, every);
+        done(QStringLiteral("{\"ok\":true,\"note\":\"Scheduled. It will run %1 and "
+                            "I'll reach out with the result.\"}")
+             .arg(every > 0 ? QStringLiteral("every %1 min").arg(every)
+                            : QStringLiteral("once, shortly")));
+        return;
+    }
+    if (name == QLatin1String("list_scheduled")) {
+        QJsonArray out;
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        for (const QJsonValue &v : m_extras.value(QStringLiteral("scheduled")).toArray()) {
+            const QJsonObject o = v.toObject();
+            const qint64 next = qint64(o.value(QStringLiteral("nextRun")).toDouble());
+            out.append(QJsonObject{
+                {"id", o.value("id")},
+                {"title", o.value("title")},
+                {"everyMin", o.value("everyMin")},
+                {"inSeconds", double(next - now)}});
+        }
+        done(QString::fromUtf8(QJsonDocument(QJsonObject{{"scheduled", out}}).toJson(QJsonDocument::Compact)));
+        return;
+    }
+    if (name == QLatin1String("cancel_scheduled")) {
+        cancelScheduledTask(args.value("id").toString());
+        done(QStringLiteral("{\"ok\":true}"));
         return;
     }
 

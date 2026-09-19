@@ -283,6 +283,14 @@ public:
     Q_INVOKABLE QVariantList learnedSkills() const;
     Q_INVOKABLE void addSkillFromRepo(const QString &repoUrl);
     Q_INVOKABLE void removeSkill(const QString &name);
+    // SCHEDULED TASKS: recurring or one-off work Nikita runs on her own, giving
+    // her continuous life. Each fires a fragment at its time; on finish she
+    // reaches out with notify_user. Persisted in extras.json (so it syncs to SD).
+    Q_INVOKABLE QVariantList scheduledTasks() const;
+    Q_INVOKABLE void scheduleTask(const QString &title, const QString &task,
+                                  int everyMinutes);
+    Q_INVOKABLE void cancelScheduledTask(const QString &id);
+
     // PLUGINS: external HTTP APIs Nikita can call. Each is a named endpoint with
     // an optional auth header; exposed to the model as the call_plugin tool.
     Q_INVOKABLE QVariantList plugins() const;
@@ -428,6 +436,7 @@ signals:
     // Nikita reached out on her own -- the QML shows an in-app banner.
     void reachedOut(const QString &title, const QString &message);
     void quickCommandsChanged();
+    void scheduledChanged();
     void skillsChanged();
     void skillLearnStatus(const QString &message, bool busy);
     void pluginsChanged();
@@ -635,6 +644,7 @@ private:
     uint32_t m_buddyReqId = 0;       // request currently being answered (0 = none)
     uint32_t m_buddyLastHandled = 0; // so one request is not answered twice
     bool     m_buddyBaselined = false; // wrote the id:0 baseline req.json once
+    bool     m_buddySeeded = false;    // seeded lastHandled from res.json at launch
     void pollBuddyMailbox();
     void writeBuddyReply(uint32_t id, const QString &text);
     // Voice input (macOS Speech). Owned; the waveform reads m_micLevels.
@@ -661,6 +671,9 @@ private:
     QString learnedSkillsForPrompt() const;   // injected into systemPrompt()
     QString pluginsForPrompt() const;         // injected into systemPrompt()
     void seedQuickCommandsIfEmpty();
+    // Scheduler: a timer checks due tasks and fires them as fragments.
+    QTimer *m_schedTimer = nullptr;
+    void checkSchedules();
     // Second half of addSkillFromRepo, once the README has been fetched.
     void distillSkillFromReadme(const QString &owner, const QString &repo,
                                 const QString &readme, const QString &key);
