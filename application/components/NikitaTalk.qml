@@ -1925,6 +1925,10 @@ Rectangle {
                         onTriggered: quickPanel.open = true
                     }
                     NikitaMenuItem {
+                        iconSrc: root.icBolt; label: "Scheduled tasks"
+                        onTriggered: schedPanel.open = true
+                    }
+                    NikitaMenuItem {
                         iconSrc: root.icSkill; label: "Add New Skill"
                         onTriggered: skillPanel.open = true
                     }
@@ -2549,6 +2553,108 @@ Rectangle {
                             newQuick.text = "";
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // ---- Scheduled tasks: Nikita's recurring/one-off autonomous work -------
+    Item {
+        id: schedPanel
+        parent: root.parent ? root.parent : root
+        anchors.fill: parent
+        z: 210
+        property bool open: false
+        visible: opacity > 0
+        enabled: visible
+        focus: open
+        opacity: open ? 1 : 0
+        Behavior on opacity { NumberAnimation { duration: 120 } }
+        Keys.onEscapePressed: schedPanel.open = false
+        MouseArea { anchors.fill: parent; onClicked: schedPanel.open = false }
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 40, 520)
+            height: Math.min(parent.height - 60, 480)
+            radius: 8; color: "#0d0818"
+            border.width: 1; border.color: Theme.color.lightorange2
+            MouseArea { anchors.fill: parent }
+            ColumnLayout {
+                anchors.fill: parent; anchors.margins: 14; spacing: 10
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    Image {
+                        source: root.icBolt
+                        sourceSize.width: 18; sourceSize.height: 18
+                        Layout.preferredWidth: 18; Layout.preferredHeight: 18
+                    }
+                    Text {
+                        text: "Scheduled tasks"
+                        color: Theme.color.lightorange2
+                        font.family: "Share Tech Mono"; font.pixelSize: 15; font.bold: true
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: "✕"; color: Theme.color.mediumorange1; font.pixelSize: 16
+                        MouseArea { anchors.fill: parent; anchors.margins: -6
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: schedPanel.open = false }
+                    }
+                }
+                Text {
+                    text: "Work Nikita runs on her own -- she reaches out when it finishes. Ask her in chat to \"do X every hour\" to add one."
+                    color: Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 10
+                    wrapMode: Text.WordWrap; Layout.fillWidth: true
+                }
+                ListView {
+                    id: schedList
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                    clip: true; spacing: 6
+                    model: Nikita.scheduledTasks()
+                    Connections {
+                        target: Nikita
+                        function onScheduledChanged() { schedList.model = Nikita.scheduledTasks(); }
+                    }
+                    delegate: Rectangle {
+                        width: schedList.width
+                        height: scCol.implicitHeight + 14
+                        radius: 6; color: "#120818"
+                        border.width: 1; border.color: Theme.color.mediumorange2
+                        ColumnLayout {
+                            id: scCol
+                            x: 10; y: 7; width: parent.width - 40; spacing: 2
+                            Text {
+                                text: modelData.title
+                                color: Theme.color.lightorange2
+                                font.family: "Share Tech Mono"; font.pixelSize: 12; font.bold: true
+                                Layout.fillWidth: true; elide: Text.ElideRight
+                            }
+                            Text {
+                                text: (modelData.everyMin > 0
+                                       ? "every " + modelData.everyMin + " min"
+                                       : "once") + "  ·  " + modelData.task
+                                color: Theme.color.mediumorange1
+                                font.family: "Share Tech Mono"; font.pixelSize: 10
+                                wrapMode: Text.WordWrap; maximumLineCount: 2
+                                elide: Text.ElideRight; Layout.fillWidth: true
+                            }
+                        }
+                        Text {
+                            anchors.right: parent.right; anchors.rightMargin: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "✕"; color: Theme.color.mediumorange1; font.pixelSize: 12
+                            MouseArea { anchors.fill: parent; anchors.margins: -6
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: Nikita.cancelScheduledTask(modelData.id) }
+                        }
+                    }
+                }
+                Text {
+                    visible: schedList.count === 0
+                    text: "No scheduled tasks yet."
+                    color: Theme.color.mediumorange1
+                    font.family: "Share Tech Mono"; font.pixelSize: 11
                 }
             }
         }
