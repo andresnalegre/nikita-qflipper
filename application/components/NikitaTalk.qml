@@ -1773,6 +1773,12 @@ Rectangle {
             function onDictationError(message) {
                 root.appendMessage("nikita", message);
             }
+            // Nikita reached out on her own: also drop it into the chat so it is
+            // there when the user comes back to the window (the OS notification
+            // already got their attention elsewhere).
+            function onReachedOut(title, message) {
+                root.appendMessage("nikita", message);
+            }
         }
 
         // ---- staged attachments strip (only when something is attached) ----

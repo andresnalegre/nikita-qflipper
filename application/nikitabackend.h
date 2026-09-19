@@ -425,6 +425,8 @@ signals:
     void dictationPartial(const QString &text);
     void dictationFinal(const QString &text);
     void dictationError(const QString &message);
+    // Nikita reached out on her own -- the QML shows an in-app banner.
+    void reachedOut(const QString &title, const QString &message);
     void quickCommandsChanged();
     void skillsChanged();
     void skillLearnStatus(const QString &message, bool busy);
@@ -669,6 +671,9 @@ private:
     // The call_plugin tool: call a registered API plugin, base URL + auth added.
     void runCallPlugin(const QJsonObject &args,
                        std::function<void(const QString &)> done);
+    // notify_user: Nikita reaching out to the user with a system notification
+    // (and an in-app banner via the reachedOut signal).
+    void reachOutToUser(const QString &title, const QString &message);
     QString applyPlanUpdate(const QJsonArray &items, const QString &note);
     QString planForPrompt() const;     // the block the system prompt carries
     // How many turns in a row the loop has re-entered on the plan's account.
