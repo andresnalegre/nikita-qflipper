@@ -354,6 +354,8 @@ Rectangle {
         title: "Attach an image or file for " + root.aiName
         fileMode: FileDialog.OpenFiles
         nameFilters: ["Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp)",
+                      "Documents (*.pdf *.docx *.pptx *.xlsx *.csv *.txt *.md)",
+                      "Videos (*.mp4 *.mov *.webm)",
                       "All files (*)"]
         onAccepted: {
             for(var i = 0; i < selectedFiles.length; i++) {

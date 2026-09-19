@@ -261,6 +261,9 @@ public:
     Q_INVOKABLE QString stageAttachmentFromPath(const QString &path);
     // Stage every readable text file in a folder (bounded), for "Add folder".
     Q_INVOKABLE QString stageFolderFromPath(const QString &path);
+    // Extract readable text from a document (pdf/docx/pptx/xlsx/...) using the
+    // venv toolchain, so an attached document can actually be read. Empty on fail.
+    QString extractDocumentText(const QString &path, const QString &ext);
 
     // ---- voice input (macOS Speech) ---------------------------------------
     // Talk to Nikita instead of typing. micLevels feeds the live waveform.

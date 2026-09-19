@@ -335,7 +335,7 @@ WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You have the Flipper's FULL command line through run_cli, plus file tools for the microSD, plus the ability to press the device's physical buttons, plus a real shell on the user's own computer through computer_run and the computer_* tools.
 - You can SEARCH THE WEB and READ WEB PAGES, through this computer's internet connection: web_search(query) returns results, and web_fetch(url) returns a page's text. Looking a person or thing up, current facts, documentation, prices, news, "find everything about X" -- that is web_search first, then web_fetch on a promising result. This is a real capability you have RIGHT NOW. NEVER say you lack web search, a browser, an API, or a way to look things up online -- you have web_search and web_fetch, so USE them instead of refusing. (The FLIPPER has no network of its own; YOU, running on this computer, do.)\n- ALWAYS SEARCH WITH web_search, NOT with curl. Do NOT computer_run curl/wget against duckduckgo.com, google.com or bing.com -- they serve a CAPTCHA / bot-wall to scripted requests and you get an empty page (this is not you lacking a tool). web_search already handles that: it scrapes when it can and falls back to a keyless answer API that never captchas, so it returns real, sourced info either way. If web_search says the ranked results were blocked and you need the full list, open it in the browser for the user (computer_run: open \"https://duckduckgo.com/?q=...\") -- do NOT try to defeat the captcha yourself.
 - You can WORK IN PARALLEL with spawn_task(title, task): when a job splits into independent pieces -- research several things at once, build several files, chase several leads -- spin off a FRAGMENT of yourself for each. A fragment is still you (same identity, same memory), running on its own in the BACKGROUND with the web and this computer's shell. Give each a self-contained task (it cannot see this chat), do NOT wait for it, and keep working here; its result arrives on its own. Use it to be genuinely faster on wide work rather than doing every part one after another. Keep the Flipper itself to your main self -- fragments do not touch the device.
-- You can SEE IMAGES AND VIDEO: when the user attaches an image (photo, screenshot, diagram, a photo of a board) or a short video clip, it arrives as real visual input. Read the text in it, describe it, judge a design, debug a screenshot, identify a component, or summarise what happens in a clip. Attached text files arrive inlined. NEVER say you cannot see images/video or open files -- look at what was sent and answer.
+- You can SEE IMAGES AND VIDEO and READ DOCUMENTS: when the user attaches an image (photo, screenshot, diagram, a photo of a board) or a short video clip, it arrives as real visual input -- read the text in it, describe it, judge a design, debug a screenshot, identify a component, or summarise a clip. Attached text files arrive inlined, and attached DOCUMENTS (PDF, Word, PowerPoint, Excel, CSV) arrive as their extracted text, so you can read and summarise them too. NEVER say you cannot see images/video or open files -- look at what was sent and answer.
 - You can CREATE IMAGES AND VISUAL FILES yourself, through the shell: charts and plots (matplotlib/plotly), diagrams and vector art (SVG, then rasterise), edited or generated raster images (Python Pillow), QR codes, and full page renders (write HTML/CSS, render to PNG/PDF with headless Chrome). "Make me an image/diagram/chart/poster/logo" = write the code that produces the file, run it, save it, and tell the user the path. If a library is missing, install it (see SELF-SUFFICIENCY). You do not have a text-to-image generative model, so for photoreal "imagine X" art say so briefly and offer the code-drawn version instead -- do not pretend.
 - You can MANIPULATE DATA, FILES AND BINARIES: spreadsheets and tables (pandas/openpyxl), documents (python-docx, PDF via reportlab/pypdf, OCR via pytesseract), audio/video transcode (ffmpeg), archives, and raw binaries -- hex dump and patch (xxd/dd/Python), inspect and carve (binwalk/strings/file), checksums and crypto (openssl/hashlib), disassembly when the tool is present. Reach for the right tool through computer_run and the file tools; install what is missing.
 - You LEARN AND USE SKILLS FROM REPOS: a skill the user added from a GitHub repo appears in your LEARNED SKILLS block. When a task matches one, actually USE it -- clone or locate the repo on this computer, read its entry point, install its dependencies, and run it through computer_run. Learning a skill means being able to run it, not just describe it.
@@ -4785,6 +4785,60 @@ void NikitaBackend::clearStagedAttachments()
 // and stage it. Images become base64 data URLs (Kimi vision); text files are
 // inlined; anything else is noted by name and size. 20 MB cap so a stray huge
 // file cannot blow the request up.
+// Pull readable text out of a document with the venv toolchain (pypdf/pdfplumber,
+// python-docx, python-pptx, pandas/openpyxl). Synchronous with a timeout -- the
+// files are small (staging already caps at 20 MB) and the user just picked it.
+QString NikitaBackend::extractDocumentText(const QString &path, const QString &ext)
+{
+    QString py = QDir::homePath() + QStringLiteral("/.nikita/venv/bin/python3");
+    if (!QFileInfo::exists(py)) py = QDir::homePath() + QStringLiteral("/.nikita/venv/bin/python");
+    if (!QFileInfo::exists(py)) py = QStringLiteral("python3");
+
+    static const QString script = QStringLiteral(R"PY(
+import sys
+p, ext = sys.argv[1], sys.argv[2]
+out = ""
+try:
+    if ext == "pdf":
+        try:
+            import pdfplumber
+            with pdfplumber.open(p) as d:
+                out = "\n".join((pg.extract_text() or "") for pg in d.pages)
+        except Exception:
+            from pypdf import PdfReader
+            out = "\n".join((pg.extract_text() or "") for pg in PdfReader(p).pages)
+    elif ext == "docx":
+        import docx
+        out = "\n".join(par.text for par in docx.Document(p).paragraphs)
+    elif ext == "pptx":
+        from pptx import Presentation
+        lines = []
+        for s in Presentation(p).slides:
+            for sh in s.shapes:
+                if sh.has_text_frame:
+                    lines.append(sh.text_frame.text)
+        out = "\n".join(lines)
+    elif ext in ("xlsx", "csv"):
+        import pandas as pd
+        if ext == "csv":
+            out = pd.read_csv(p).to_csv(index=False)
+        else:
+            xl = pd.read_excel(p, sheet_name=None)
+            out = "\n\n".join("# " + n + "\n" + df.to_csv(index=False) for n, df in xl.items())
+    else:
+        out = open(p, "r", errors="ignore").read()
+except Exception as e:
+    out = ""
+sys.stdout.write(out[:100000])
+)PY");
+
+    QProcess proc;
+    proc.start(py, {QStringLiteral("-c"), script, path, ext});
+    if (!proc.waitForStarted(3000)) return QString();
+    if (!proc.waitForFinished(30000)) { proc.kill(); return QString(); }
+    return QString::fromUtf8(proc.readAllStandardOutput());
+}
+
 QString NikitaBackend::stageAttachmentFromPath(const QString &path)
 {
     QString p = path;
@@ -4846,10 +4900,24 @@ QString NikitaBackend::stageAttachmentFromPath(const QString &path)
         // named binary reference so at least the model knows it was attached.
         QString asText = QString::fromUtf8(data);
         const bool looksText = !asText.contains(QChar(0));
+        static const QStringList docExts{"pdf", "docx", "pptx", "xlsx", "csv", "rtf", "odt", "epub"};
         if (looksText) {
             att["kind"] = QStringLiteral("text");
             att["mime"] = QStringLiteral("text/plain");
             att["text"] = asText.left(100000);
+        } else if (docExts.contains(ext)) {
+            // A document (PDF, Word, etc.): pull its text out with the venv
+            // toolchain so Nikita can actually READ it, not just note it exists.
+            const QString extracted = extractDocumentText(p, ext);
+            if (!extracted.trimmed().isEmpty()) {
+                att["kind"] = QStringLiteral("text");
+                att["mime"] = QStringLiteral("text/plain");
+                att["text"] = QStringLiteral("[Extracted text of %1]\n%2")
+                    .arg(fi.fileName(), extracted.left(100000));
+            } else {
+                att["kind"] = QStringLiteral("file");
+                att["mime"] = QStringLiteral("application/octet-stream");
+            }
         } else {
             att["kind"] = QStringLiteral("file");
             att["mime"] = QStringLiteral("application/octet-stream");
