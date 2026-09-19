@@ -403,8 +403,17 @@ void ProtobufSession::processQueue()
     // one of those reads buries the log in noise when nobody is using the Buddy.
     // Skip the routine START/SUCCESS lines for that specific poll (a real ERROR
     // still logs below), so the log only shows the Buddy when it is actually used.
-    const bool quietOp = prettyOperationDescription()
-                             .contains(QStringLiteral("/ext/nikita/buddy/req.json"));
+    // Nikita's background sync polls a few /ext/nikita files (the Buddy request,
+    // and the shared plan/extras/history) that legitimately may not exist yet on
+    // a fresh card. Reading a missing file is normal here, not an error worth
+    // shouting about -- keep those routine reads out of the log.
+    const auto isQuietNikitaOp = [](const QString &d) {
+        return d.contains(QStringLiteral("/ext/nikita/buddy/req.json"))
+            || d.contains(QStringLiteral("/ext/nikita/plan.json"))
+            || d.contains(QStringLiteral("/ext/nikita/extras.json"))
+            || d.contains(QStringLiteral("/ext/nikita/history.json"));
+    };
+    const bool quietOp = isQuietNikitaOp(prettyOperationDescription());
     if(!quietOp) {
         qCInfo(LOG_SESSION).noquote() << prettyOperationDescription() << "START";
     }
@@ -479,14 +488,28 @@ void ProtobufSession::doStopSession()
 
 void ProtobufSession::onCurrentOperationFinished()
 {
+    const QString desc = prettyOperationDescription();
+    const bool quietNikita =
+           desc.contains(QStringLiteral("/ext/nikita/buddy/req.json"))
+        || desc.contains(QStringLiteral("/ext/nikita/plan.json"))
+        || desc.contains(QStringLiteral("/ext/nikita/extras.json"))
+        || desc.contains(QStringLiteral("/ext/nikita/history.json"));
     if(m_currentOperation->isError()) {
-        qCCritical(LOG_SESSION).noquote() << prettyOperationDescription() << "ERROR:" << m_currentOperation->errorString();
+        // A missing shared-sync file is expected on a fresh card -- log it
+        // quietly instead of as a red ERROR so the log stays readable.
+        const bool benignMissing = quietNikita &&
+            m_currentOperation->errorString().contains(QStringLiteral("does not exist"));
+        if(benignMissing) {
+            qCDebug(LOG_SESSION).noquote() << desc << "(absent, skipped)";
+        } else {
+            qCCritical(LOG_SESSION).noquote() << desc << "ERROR:" << m_currentOperation->errorString();
+        }
 
         clearOperationQueue();
 
     } else {
-        if(!prettyOperationDescription().contains(QStringLiteral("/ext/nikita/buddy/req.json"))) {
-            qCInfo(LOG_SESSION).noquote() << prettyOperationDescription() << "SUCCESS";
+        if(!quietNikita) {
+            qCInfo(LOG_SESSION).noquote() << desc << "SUCCESS";
         }
     }
 

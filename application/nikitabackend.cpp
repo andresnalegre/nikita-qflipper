@@ -2138,6 +2138,9 @@ NikitaBackend::NikitaBackend(QObject *parent)
 
     loadHistory();
     loadExtras();
+    // Clone any synced-in skill that isn't on this machine yet (deferred so the
+    // event loop is up and git can run without blocking construction).
+    QTimer::singleShot(1500, this, [this]() { cloneMissingSkills(); });
     loadFilters();
     loadMistakes();
 
@@ -4980,6 +4983,9 @@ void NikitaBackend::readPortableExtras()
                 emit skillsChanged();
                 emit pluginsChanged();
                 emit quickCommandsChanged();
+                // A skill added on the phone just arrived as a card -- clone it
+                // here so it is runnable on this Mac too.
+                cloneMissingSkills();
             }
         }
         buf->deleteLater();
@@ -5325,6 +5331,31 @@ void NikitaBackend::cloneSkillRepo(const QString &name, const QString &owner,
         emit skillLearnStatus(
             QStringLiteral("Learned \"%1\" (git not available to auto-clone).")
                 .arg(name), false);
+    }
+}
+
+// A repo skill added on ANOTHER client (e.g. the iPhone) arrives here as a card
+// with no localPath. Clone it so it becomes runnable on this Mac too -- this is
+// what makes "add a skill on iOS -> it works on qFlipper" real. Bounded: one
+// clone attempt per skill; cloneSkillRepo records localPath so it won't repeat.
+void NikitaBackend::cloneMissingSkills()
+{
+    if (apiKey().isEmpty()) { return; }   // no assistant configured, skip quietly
+    const QJsonArray arr = m_extras.value(QStringLiteral("skills")).toArray();
+    static QRegularExpression re(QStringLiteral("github\\.com[:/]+([^/]+)/([^/#?]+)"));
+    for (const QJsonValue &v : arr) {
+        const QJsonObject o = v.toObject();
+        if (!o.value(QStringLiteral("localPath")).toString().trimmed().isEmpty())
+            continue;   // already cloned on this machine
+        const QString name = o.value(QStringLiteral("name")).toString();
+        const QString repoUrl = o.value(QStringLiteral("repo")).toString();
+        const QRegularExpressionMatch m = re.match(repoUrl);
+        if (!m.hasMatch() || name.isEmpty()) continue;
+        QString repo = m.captured(2);
+        if (repo.endsWith(QStringLiteral(".git"))) repo.chop(4);
+        nikitaLogAs(assistantName(),
+            QStringLiteral("syncing skill \"%1\" -> cloning it locally").arg(name));
+        cloneSkillRepo(name, m.captured(1), repo);
     }
 }
 

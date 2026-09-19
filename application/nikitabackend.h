@@ -688,6 +688,9 @@ private:
     // can actually run it, and record the local path back into its card.
     void cloneSkillRepo(const QString &name, const QString &owner,
                         const QString &repo);
+    // Clone any learned skill that arrived via sync (from the phone) but has no
+    // local clone yet -- so a repo skill added on iOS becomes runnable here too.
+    void cloneMissingSkills();
     // The call_plugin tool: call a registered API plugin, base URL + auth added.
     void runCallPlugin(const QJsonObject &args,
                        std::function<void(const QString &)> done);
