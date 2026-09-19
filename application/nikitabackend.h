@@ -668,6 +668,13 @@ private:
     void syncExtrasToFlipper();
     void readPortableExtras();
     QString m_syncedExtras;   // last bytes written to the card, to avoid churn
+    // Shared conversation CONTEXT across clients (same pattern): the clean
+    // user/assistant history rides /ext/nikita/history.json so Nikita continues
+    // the same conversation whether reached from the phone or the desktop.
+    void syncHistoryToFlipper();
+    void readPortableHistory();
+    QString m_syncedHistory;
+    QString m_historyTouched;   // ISO of our last local history change
     QString learnedSkillsForPrompt() const;   // injected into systemPrompt()
     QString pluginsForPrompt() const;         // injected into systemPrompt()
     void seedQuickCommandsIfEmpty();

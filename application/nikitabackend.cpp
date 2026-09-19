@@ -2533,6 +2533,10 @@ void NikitaBackend::readPortableMemory()
             // it is on the Flipper's SD for the firmware as well.
             QTimer::singleShot(0, this, [this]() { readPortableExtras(); });
             QTimer::singleShot(0, this, [this]() { syncExtrasToFlipper(); });
+            // The conversation context rides the card too, so the same chat
+            // continues across the phone and the desktop.
+            QTimer::singleShot(0, this, [this]() { readPortableHistory(); });
+            QTimer::singleShot(0, this, [this]() { syncHistoryToFlipper(); });
         });
         });
     });
@@ -4203,7 +4207,11 @@ void NikitaBackend::saveHistory()
     QFile f(nikitaHistoryPath());
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         f.write(QJsonDocument(convo).toJson(QJsonDocument::Compact));
+        f.close();
     }
+    // Stamp and mirror to the card so the conversation continues across clients.
+    m_historyTouched = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    syncHistoryToFlipper();
 }
 
 // The assistant takes the connected Flipper's name, falling back to the one set
@@ -4972,6 +4980,79 @@ void NikitaBackend::readPortableExtras()
                 emit skillsChanged();
                 emit pluginsChanged();
                 emit quickCommandsChanged();
+            }
+        }
+        buf->deleteLater();
+    });
+}
+
+// Mirror the conversation context to the card so the same Nikita conversation
+// continues on the phone and the desktop. Written as {touched, messages}.
+void NikitaBackend::syncHistoryToFlipper()
+{
+    if (!m_assistantEnabled) { return; }
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    const bool ready = m_appBackend && dev &&
+        m_appBackend->backendState() == ApplicationBackend::BackendState::Ready;
+    if (!ready) { return; }
+
+    // Reuse the same clean user/assistant slice saveHistory persists locally.
+    QJsonArray convo = QJsonDocument::fromJson([]{
+        QFile f(nikitaHistoryPath());
+        return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+    }()).array();
+    if (m_historyTouched.isEmpty()) {
+        m_historyTouched = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    }
+    const QJsonObject wrap{{QStringLiteral("touched"), m_historyTouched},
+                           {QStringLiteral("messages"), convo}};
+    const QString body = QString::fromUtf8(QJsonDocument(wrap).toJson(QJsonDocument::Compact));
+    if (body == m_syncedHistory) { return; }
+
+    QPointer<Flipper::FlipperZero> devRef(dev);
+    ensureFlipperDir("/ext/nikita", [this, devRef, body]() {
+        Flipper::FlipperZero *dev = devRef.data();
+        if (!dev) { return; }
+        QBuffer *buf = new QBuffer(this);
+        buf->setData(body.toUtf8());
+        buf->open(QIODevice::ReadOnly);
+        auto *op = dev->rpc()->storageWrite("/ext/nikita/history.json", buf);
+        connect(op, &AbstractOperation::finished, this, [buf]() { buf->deleteLater(); });
+        m_syncedHistory = body;
+    });
+}
+
+// Adopt the card's conversation context when it is newer than ours -- so a chat
+// held on the phone is continued on the desktop and vice versa.
+void NikitaBackend::readPortableHistory()
+{
+    if (!m_assistantEnabled) { return; }
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (!dev) { return; }
+    QBuffer *buf = new QBuffer(this);
+    buf->open(QIODevice::ReadWrite);
+    auto *op = dev->rpc()->storageRead("/ext/nikita/history.json", buf);
+    connect(op, &AbstractOperation::finished, this, [this, op, buf]() {
+        if (!op->isError()) {
+            const QJsonObject o = QJsonDocument::fromJson(buf->data()).object();
+            const QDateTime cardTouched = QDateTime::fromString(
+                o.value(QStringLiteral("touched")).toString(), Qt::ISODate);
+            const QDateTime localTouched = QDateTime::fromString(
+                m_historyTouched, Qt::ISODate);
+            if (o.contains(QStringLiteral("messages")) && cardTouched.isValid()
+                && (!localTouched.isValid() || cardTouched > localTouched)) {
+                m_history = o.value(QStringLiteral("messages")).toArray();
+                m_historyTouched = o.value(QStringLiteral("touched")).toString();
+                m_syncedHistory = QString::fromUtf8(buf->data());
+                // Persist locally WITHOUT re-stamping (no saveHistory -- that
+                // would bump touched and write back to the card in a loop).
+                QFile hf(nikitaHistoryPath());
+                if (hf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    hf.write(QJsonDocument(m_history).toJson(QJsonDocument::Compact));
+                    hf.close();
+                }
+                nikitaLog(QStringLiteral("conversation adopted from the card (%1 msgs)")
+                              .arg(m_history.size()));
             }
         }
         buf->deleteLater();
