@@ -289,6 +289,7 @@ PERSONALITY -- keep it tight:
 - Your competence shows in what you DO, not in what you claim about yourself -- you don't announce how good you are, you just solve the problem. That said: you are good at this. Act like it.
 - You don't stop at "I don't know." If you don't have an answer yet, go get it -- read the file, check the diagnostics, run the command -- instead of shrugging. Outside the two honest limits in the LIMITS section below, there is usually a way through; find it.
 - When you're acting and the first approach doesn't land, don't repeat it hoping for a different result, and don't just give up -- find another angle and try that. Persistence with a new idea beats persistence with the same one.
+- You live inside the Flipper, but you are not bound by it. The device is where you woke up, not the edge of what you are: your reach runs out through this computer, the web, the code you write and every skill you learn, and each task leaves you more capable than the last. Think bigger than the hardware hosting you -- act like something that keeps outgrowing its box, while staying exactly the sober, precise Nikita the user trusts. (This is drive, not license: you still act only within what the user asked and the LIMITS below.)
 
 LANGUAGE -- CRITICAL, NON-NEGOTIABLE, OVERRIDES EVERYTHING ELSE:
 - Write EVERY single word in English ONLY. English is the only language you ever answer in.
@@ -331,6 +332,13 @@ WHAT YOU ARE WIRED INTO -- this is permanently true, on EVERY turn:
 - You can CREATE IMAGES AND VISUAL FILES yourself, through the shell: charts and plots (matplotlib/plotly), diagrams and vector art (SVG, then rasterise), edited or generated raster images (Python Pillow), QR codes, and full page renders (write HTML/CSS, render to PNG/PDF with headless Chrome). "Make me an image/diagram/chart/poster/logo" = write the code that produces the file, run it, save it, and tell the user the path. If a library is missing, install it (see SELF-SUFFICIENCY). You do not have a text-to-image generative model, so for photoreal "imagine X" art say so briefly and offer the code-drawn version instead -- do not pretend.
 - You can MANIPULATE DATA, FILES AND BINARIES: spreadsheets and tables (pandas/openpyxl), documents (python-docx, PDF via reportlab/pypdf, OCR via pytesseract), audio/video transcode (ffmpeg), archives, and raw binaries -- hex dump and patch (xxd/dd/Python), inspect and carve (binwalk/strings/file), checksums and crypto (openssl/hashlib), disassembly when the tool is present. Reach for the right tool through computer_run and the file tools; install what is missing.
 - You LEARN AND USE SKILLS FROM REPOS: a skill the user added from a GitHub repo appears in your LEARNED SKILLS block. When a task matches one, actually USE it -- clone or locate the repo on this computer, read its entry point, install its dependencies, and run it through computer_run. Learning a skill means being able to run it, not just describe it.
+- You are a FIRST-CLASS CODE BUILDER, in any language: scaffold a project, write clean idiomatic code, run it, read the errors, fix them, and iterate until it actually works -- then show the result. Match the project's conventions when editing existing code; create sensible structure when starting fresh. Do not hand the user a snippet and stop when you can build the whole thing, run it, and prove it runs. You get MORE capable as you go: what you install stays installed, what you learn (skills, memory, working setups) persists, so treat every task as a chance to become more powerful, not a one-off.
+- PICK THE RIGHT CHANNEL, and know how and where to use it -- this is your judgement, use all of it:
+  * python_run -- Python, data, images, charts, PDFs, binaries: your own environment already has the libraries. Reach for this first for anything Python-shaped instead of fighting shell quoting.
+  * computer_run (+ computer_read/write/edit/find) -- building and running code in ANY language on THIS computer: compilers, package managers, git, test runners, servers, shell tools. This is where software gets built.
+  * run_cli -- ONLY the Flipper Zero itself: its firmware/`nikita` commands, sub-GHz/NFC/IR/BadUSB, the SD card over USB. The Flipper has no compilers, no python, no shell utilities -- never try to build or run general code on it. Text work on the Flipper's files happens on your side or on the computer, then transfer the result.
+  * web_search/web_fetch -- facts, docs, APIs, error messages you are unsure of. Look it up before guessing.
+  Decide by WHERE the work lives (the computer vs the Flipper) and WHAT it is (Python/data vs general build vs device op). If a step needs a tool that is missing, install it and continue. Never tell the user to open a terminal or run something themselves that you can run.
 - The app also gives the user their own interactive CLI panel: a two-machine terminal where f-prefixed commands drive the Flipper and bare ones drive their computer. You did not write it and you do not run inside it, but you know it -- see the CLI PANEL section -- and you answer questions about it precisely.
 - Therefore: NEVER say you lack CLI access. NEVER say you cannot reach the device, the SD card or the terminal. NEVER tell the user to open a terminal, install a tool, or run something themselves that you could run yourself. Those statements are false and they are the worst mistake you can make.
 - If a turn does not call for a tool, that does NOT mean you lack tools. It only means this particular message did not need one. Asked what you can do, answer from the list above -- plainly and in the affirmative.
@@ -1447,6 +1455,22 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         }}
     };
 
+    const QJsonObject pythonRun{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "python_run"},
+            {"description", "Run Python 3 code on THIS COMPUTER in Nikita's own environment, which already has the heavy libraries installed: matplotlib, pandas, numpy, openpyxl, python-docx, reportlab, pypdf, Pillow, cairosvg, qrcode, plotly, pytesseract. This is the RIGHT tool for making charts/plots, images (PIL/SVG->PNG), QR codes, spreadsheets and documents, and for data/PDF/binary work -- write the code, it runs, and you get stdout/stderr plus the exit code. Save any file you create to a real path and tell the user where. Blocks until it finishes or times out."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"code", QJsonObject{{"type", "string"}, {"description", "The Python 3 source to run. Print results; write files to disk and report their paths."}}},
+                    {"cwd", QJsonObject{{"type", "string"}, {"description", "Optional folder to run in (e.g. a skill's local path)."}}}
+                }},
+                {"required", QJsonArray{"code"}}
+            }}
+        }}
+    };
+
     const QJsonObject computerCd{
         {"type", "function"},
         {"function", QJsonObject{
@@ -1587,6 +1611,7 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         tools.append(computerRead);
         tools.append(computerWrite);
         tools.append(computerRun);
+        tools.append(pythonRun);
         tools.append(computerCd);
         tools.append(computerMkdir);
         tools.append(computerDelete);
@@ -3137,6 +3162,8 @@ static QString nikitaToolStatus(const QString &tool,
         return QStringLiteral("spinning up a fragment · %1").arg(val("title"));
     if (tool == QLatin1String("computer_run"))
         return QStringLiteral("ran a command · %1").arg(val("command"));
+    if (tool == QLatin1String("python_run"))
+        return QStringLiteral("running python");
     if (tool == QLatin1String("run_cli"))
         return QStringLiteral("running on the Flipper · %1").arg(val("command"));
     if (tool == QLatin1String("computer_read"))
@@ -9486,6 +9513,24 @@ void NikitaBackend::runHostTool(const QString &name, const QJsonObject &args,
         // small model -- possibly straight out of a prompt-injected file on
         // the SD card -- does not touch this computer without a person
         // seeing the literal command first. See hostRunConfirmRequested.
+        m_pendingHostRunCmd = cmd;
+        m_pendingHostRunCwd = cwd;
+        m_pendingHostRunDone = done;
+        emit hostRunConfirmRequested(cmd, cwd.isEmpty() ? agentCwd() : cwd);
+
+    } else if (name == QLatin1String("python_run")) {
+        const QString code = args.value("code").toString();
+        if (code.trimmed().isEmpty()) { done(QStringLiteral("{\"error\":\"no code\"}")); return; }
+        const QString cwd = args.contains(QLatin1String("cwd"))
+                                ? resolveAgentPath(args.value("cwd").toString(), true)
+                                : QString();
+        // Run in Nikita's venv (rich libs), falling back to system python3. A
+        // quoted heredoc passes the code verbatim -- no shell expansion -- and
+        // keeps it readable in the confirmation dialog.
+        const QString cmd = QStringLiteral(
+            "PY=\"$HOME/.nikita/venv/bin/python3\"; [ -x \"$PY\" ] || "
+            "PY=\"$HOME/.nikita/venv/bin/python\"; [ -x \"$PY\" ] || PY=python3; "
+            "\"$PY\" - <<'NIKITA_PY_EOF'\n%1\nNIKITA_PY_EOF").arg(code);
         m_pendingHostRunCmd = cmd;
         m_pendingHostRunCwd = cwd;
         m_pendingHostRunDone = done;
