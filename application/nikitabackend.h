@@ -694,6 +694,9 @@ private:
     // The call_plugin tool: call a registered API plugin, base URL + auth added.
     void runCallPlugin(const QJsonObject &args,
                        std::function<void(const QString &)> done);
+    // The http_request tool: a generic REST/API client for any URL.
+    void runHttpRequest(const QJsonObject &args,
+                        std::function<void(const QString &)> done);
     // notify_user: Nikita reaching out to the user with a system notification
     // (and an in-app banner via the reachedOut signal).
     void reachOutToUser(const QString &title, const QString &message);

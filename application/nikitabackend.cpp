@@ -1408,6 +1408,24 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
         }}
     };
 
+    const QJsonObject httpRequest{
+        {"type", "function"},
+        {"function", QJsonObject{
+            {"name", "http_request"},
+            {"description", "Make an HTTP request to ANY URL and get back the status and body -- a real REST/API client, not just web_fetch (which is for reading pages). Use it to call JSON APIs, hit a webhook, POST/PUT data, send headers, query a service. For plain web reading prefer web_fetch; for a registered plugin prefer call_plugin; use http_request for everything else. Returns status code + response body (truncated if large)."},
+            {"parameters", QJsonObject{
+                {"type", "object"},
+                {"properties", QJsonObject{
+                    {"url", QJsonObject{{"type", "string"}, {"description", "Full URL, http/https."}}},
+                    {"method", QJsonObject{{"type", "string"}, {"description", "GET, POST, PUT, PATCH or DELETE. Default GET."}}},
+                    {"headers", QJsonObject{{"type", "object"}, {"description", "Optional headers as a JSON object, e.g. {\"Authorization\":\"Bearer ...\"}"}}},
+                    {"body", QJsonObject{{"type", "string"}, {"description", "Optional request body (JSON or text) for POST/PUT/PATCH."}}}
+                }},
+                {"required", QJsonArray{"url"}}
+            }}
+        }}
+    };
+
     const QJsonObject callPlugin{
         {"type", "function"},
         {"function", QJsonObject{
@@ -1430,7 +1448,7 @@ static QJsonArray nikitaTools(bool agent, int focus = FocusBoth,
     };
 
     QJsonArray tools{remember, listMemory, forget, nikitaPlanTool(),
-                     webSearch, webFetch, spawnTask, notifyUser,
+                     webSearch, webFetch, httpRequest, spawnTask, notifyUser,
                      scheduleTaskTool, listScheduledTool, cancelScheduledTool};
     if (hasPlugins) {
         tools.append(callPlugin);
@@ -5585,6 +5603,59 @@ void NikitaBackend::reachOutToUser(const QString &title, const QString &message)
 #endif
 }
 
+// A generic HTTP client for any URL: method, headers, body. Read-or-write, so
+// Nikita can call real APIs and webhooks, not just read pages.
+void NikitaBackend::runHttpRequest(const QJsonObject &args,
+                                   std::function<void(const QString &)> done)
+{
+    const QString urlStr = args.value("url").toString().trimmed();
+    if (urlStr.isEmpty()) { done(QStringLiteral("{\"error\":\"no url\"}")); return; }
+    const QUrl url(urlStr);
+    if (!url.isValid() || !(url.scheme() == QLatin1String("http")
+                            || url.scheme() == QLatin1String("https"))) {
+        done(QStringLiteral("{\"error\":\"url must be http/https\"}"));
+        return;
+    }
+    const QString method = args.value("method").toString(QStringLiteral("GET")).trimmed().toUpper();
+    const QString body = args.value("body").toString();
+
+    QNetworkRequest req{url};
+    req.setRawHeader("User-Agent", "nikita");
+    if (!body.isEmpty()) {
+        req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    }
+    const QJsonObject headers = args.value("headers").toObject();
+    for (auto it = headers.begin(); it != headers.end(); ++it) {
+        req.setRawHeader(it.key().toUtf8(), it.value().toVariant().toString().toUtf8());
+    }
+    req.setTransferTimeout(30000);
+
+    QNetworkReply *reply = nullptr;
+    const QByteArray b = body.toUtf8();
+    if (method == QLatin1String("GET")) reply = m_net.get(req);
+    else if (method == QLatin1String("POST")) reply = m_net.post(req, b);
+    else if (method == QLatin1String("PUT")) reply = m_net.put(req, b);
+    else if (method == QLatin1String("DELETE")) reply = m_net.deleteResource(req);
+    else if (method == QLatin1String("PATCH"))
+        reply = m_net.sendCustomRequest(req, QByteArrayLiteral("PATCH"), b);
+    else reply = m_net.get(req);
+
+    connect(reply, &QNetworkReply::finished, this, [reply, done]() {
+        reply->deleteLater();
+        const int status = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QString text = QString::fromUtf8(reply->readAll()).left(12000);
+        if (reply->error() != QNetworkReply::NoError && text.isEmpty()) {
+            done(QStringLiteral("{\"error\":\"%1\",\"status\":%2}")
+                 .arg(reply->errorString()).arg(status));
+            return;
+        }
+        QJsonObject out{{QStringLiteral("status"), status},
+                        {QStringLiteral("body"), text}};
+        done(QString::fromUtf8(QJsonDocument(out).toJson(QJsonDocument::Compact)));
+    });
+}
+
 void NikitaBackend::runCallPlugin(const QJsonObject &args,
                                   std::function<void(const QString &)> done)
 {
@@ -8426,6 +8497,10 @@ void NikitaBackend::runOneTool(const QString &rawName, const QJsonObject &args, 
 
     if (name == QLatin1String("call_plugin")) {
         runCallPlugin(args, done);
+        return;
+    }
+    if (name == QLatin1String("http_request")) {
+        runHttpRequest(args, done);
         return;
     }
 
