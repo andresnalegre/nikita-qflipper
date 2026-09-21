@@ -3696,8 +3696,9 @@ void NikitaBackend::pollBuddyMailbox()
                 // Buddy is English-only, so the relayed turn is told to answer
                 // in English and to keep it short for the Flipper's small screen.
                 const QString buddyText = text
-                    + QStringLiteral(" (Reply in English only, in a few short "
-                                     "lines suitable for a tiny screen.)");
+                    + QStringLiteral(" (Reply in English only. Keep it VERY short "
+                                     "-- one or two sentences max, it must fit a "
+                                     "tiny 2-line screen. No lists, no preamble.)");
                 send(buddyText, m_deviceContext);
             }
         }
