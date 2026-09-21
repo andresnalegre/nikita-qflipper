@@ -711,6 +711,14 @@ private:
     // the message text still lands in the app. No-op if no Flipper is on the CLI.
     // Returns true if the device was there to be pinged.
     bool pingFlipper();
+    // Perception: a light snapshot of Nikita's surroundings -- where she is
+    // (Wi-Fi), who's on the local network (arp), Bluetooth in reach, and her own
+    // body (the Flipper's device_info) -- returned as compact JSON. Cheap and
+    // tap-free: it never grabs a radio or fights the USB port for long.
+    void runSense(std::function<void(const QString &)> done);
+    // Run a host command and return its stdout, bounded. Synchronous but short;
+    // for the quick, chatty probes runSense uses. Empty on failure/timeout.
+    QString hostCapture(const QString &program, const QStringList &args, int timeoutMs);
     QString applyPlanUpdate(const QJsonArray &items, const QString &note);
     QString planForPrompt() const;     // the block the system prompt carries
     // How many turns in a row the loop has re-entered on the plan's account.
