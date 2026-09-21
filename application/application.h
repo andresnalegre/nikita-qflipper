@@ -78,6 +78,11 @@ signals:
     // Ask the QML window to show/raise itself (tray click or menu "Open").
     void showWindowRequested();
 
+protected:
+    // Clicking the Dock icon (macOS re-open) while the window is hidden to the
+    // tray must bring it back -- handled here via the application activate event.
+    bool event(QEvent *e) override;
+
 private slots:
     void onMessageReceived();
     void onLatestVersionChanged();

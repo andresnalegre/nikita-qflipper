@@ -1676,6 +1676,8 @@ private:
     int          m_runOpenAttempts = 0;  // port-open retries left (lock races)
     QString m_runBuf;
     bool m_runBusy = false;
+    bool m_runSent = false;   // command sent only AFTER the CLI prompt appears
+    QString m_runWire;        // the (translated) command, sent once prompt is seen
     QTimer *m_runIdle = nullptr;
     QTimer *m_runGuard = nullptr;
     std::function<void(bool, QString)> m_runDone;

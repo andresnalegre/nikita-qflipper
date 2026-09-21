@@ -1,6 +1,7 @@
 #include "application.h"
 
 #include <QDebug>
+#include <QEvent>
 #include <QTimer>
 #include <QLocale>
 #include <QSysInfo>
@@ -332,7 +333,7 @@ void Application::initTray()
         return;
     }
 
-    m_tray = new QSystemTrayIcon(QIcon(QStringLiteral(":/assets/gfx/images/flipper.svg")), this);
+    m_tray = new QSystemTrayIcon(QIcon(QStringLiteral(":/assets/gfx/images/nikita.png")), this);
     m_tray->setToolTip(QStringLiteral("Nikita is awake"));
 
     auto *menu = new QMenu();
@@ -377,6 +378,17 @@ void Application::quitApp()
 {
     m_reallyQuitting = true;
     quit();
+}
+
+// macOS sends ApplicationActivate when the user clicks the Dock icon. If the
+// window was hidden into the tray, bring it back -- otherwise clicking the Dock
+// icon would do nothing and Nikita would seem stuck in the background.
+bool Application::event(QEvent *e)
+{
+    if(e->type() == QEvent::ApplicationActivate) {
+        emit showWindowRequested();
+    }
+    return QtSingleApplication::event(e);
 }
 
 void Application::setUpdateStatus(UpdateStatus newUpdateStatus)

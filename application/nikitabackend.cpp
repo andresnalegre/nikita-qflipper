@@ -14301,6 +14301,8 @@ void FlipperCli::runOneShot(const QString &cmd, std::function<void(bool, QString
 
     m_runBusy = true;
     m_runBuf.clear();
+    m_runSent = false;
+    m_runWire = wire;
     m_runDone = std::move(done);
     // A reboot/power/shutdown drops the USB link on purpose; anything else that
     // makes the link vanish mid-command is the firmware crashing.
@@ -14384,10 +14386,28 @@ void FlipperCli::runOneShot(const QString &cmd, std::function<void(bool, QString
             static const QRegularExpression ctrl(QStringLiteral("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]"));
             chunk.remove(ctrl);
             m_runBuf += chunk;
+            if (!m_runSent) {
+                // The firmware prints its dolphin MOTD + a ">: " prompt on
+                // connect. Writing the command before that prompt races the
+                // banner and the command is lost -- which is why every command
+                // used to return only the MOTD. So WAIT for the prompt, DISCARD
+                // the banner, then send the command and capture only its output.
+                if (m_runBuf.contains(QLatin1String(">: "))) {
+                    m_runSent = true;
+                    m_runBuf.clear();
+                    if (m_runPort) {
+                        m_runPort->write(m_runWire.toUtf8());
+                        m_runPort->write("\r\n");
+                    }
+                }
+                if (m_runIdle) { m_runIdle->start(); }
+                return;
+            }
             if (m_runIdle) { m_runIdle->start(); }   // reset idle countdown
         });
         m_runGuard->start();
-        m_runPort->write(wire.toUtf8());
+        // Nudge a prompt (in case the CLI is already past its MOTD), then wait
+        // for ">: " in readyRead before sending the real command.
         m_runPort->write("\r\n");
         m_runIdle->start();
     };
@@ -14404,7 +14424,21 @@ void FlipperCli::finishOneShot(bool ok, const QString &out)
         m_runPort->deleteLater();
         m_runPort = nullptr;
     }
+    bool sawPrompt = m_runSent;
     m_runBusy = false;
+    m_runSent = false;
+
+    // Never reached the CLI prompt: the command was not sent, so whatever we
+    // captured is just the connection banner. Report that honestly instead of
+    // handing back the dolphin MOTD as if it were output.
+    if (ok && !sawPrompt) {
+        auto cb0 = m_runDone; m_runDone = nullptr;
+        if (m_appBackend) { m_appBackend->reacquirePort(); }
+        if (cb0) cb0(false, QStringLiteral("The Flipper CLI didn't reach a prompt in time (it may be "
+                                           "busy, locked, or the CLI panel is open). The command did "
+                                           "not run -- try again in a moment."));
+        return;
+    }
 
     // Tidy the captured text: drop the echoed command line and the trailing prompt.
     QString text = out;
