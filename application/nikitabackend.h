@@ -706,6 +706,11 @@ private:
     // notify_user: Nikita reaching out to the user with a system notification
     // (and an in-app banner via the reachedOut signal).
     void reachOutToUser(const QString &title, const QString &message);
+    // Physically ping the Flipper -- a magenta LED flash + a short vibro pulse,
+    // then restore both (leave no trace). The FUN, on-device face of a reach-out;
+    // the message text still lands in the app. No-op if no Flipper is on the CLI.
+    // Returns true if the device was there to be pinged.
+    bool pingFlipper();
     QString applyPlanUpdate(const QJsonArray &items, const QString &note);
     QString planForPrompt() const;     // the block the system prompt carries
     // How many turns in a row the loop has re-entered on the plan's account.

@@ -44,9 +44,28 @@ Window {
         }
     }
 
+    // Bring Nikita's window back when the tray icon / menu asks for it.
+    function showFromBackground() {
+        root.show();
+        root.raise();
+        root.requestActivate();
+    }
+
+    // The close button: with a background presence, Nikita lives on (hide to
+    // tray) instead of quitting; without one, close still means quit.
+    function onClose() {
+        if (App.backgroundAlive) {
+            App.notifyHidden();
+            root.hide();
+        } else {
+            Qt.quit();
+        }
+    }
+
     Component.onCompleted: {
         App.messageReceived.connect(root.alert);
         mainWindow.controls.minimizeRequested.connect(root.showMinimized);
-        mainWindow.controls.closeRequested.connect(Qt.quit);
+        mainWindow.controls.closeRequested.connect(root.onClose);
+        App.showWindowRequested.connect(root.showFromBackground);
     }
 }

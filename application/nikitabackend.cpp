@@ -5689,9 +5689,38 @@ void NikitaBackend::stopDictation()
 
 // Nikita reaching out to the user on her own: an in-app banner (reachedOut) and
 // a real OS notification so it lands even when the window is not in front.
+// A magenta blink + a short buzz on the Flipper itself -- Nikita knocking on the
+// device to get your attention. Her theme colour (red+blue = magenta), then both
+// LED and vibro are put back so nothing stays lit or buzzing. Best-effort and
+// fully async; if the CLI isn't open there is simply nothing to ping.
+bool NikitaBackend::pingFlipper()
+{
+    if (!m_cli || !m_cli->isOpen()) return false;
+    // Magenta on, buzz on.
+    m_cli->runOneShot(QStringLiteral("led r 255"), [](bool, QString){});
+    m_cli->runOneShot(QStringLiteral("led g 0"),   [](bool, QString){});
+    m_cli->runOneShot(QStringLiteral("led b 255"), [](bool, QString){});
+    m_cli->runOneShot(QStringLiteral("vibro 1"),   [](bool, QString){});
+    // ...and off again a moment later, so we leave the device as we found it.
+    QPointer<NikitaBackend> self(this);
+    QTimer::singleShot(350, this, [self]() {
+        if (!self || !self->m_cli || !self->m_cli->isOpen()) return;
+        self->m_cli->runOneShot(QStringLiteral("vibro 0"), [](bool, QString){});
+        self->m_cli->runOneShot(QStringLiteral("led r 0"), [](bool, QString){});
+        self->m_cli->runOneShot(QStringLiteral("led b 0"), [](bool, QString){});
+    });
+    return true;
+}
+
 void NikitaBackend::reachOutToUser(const QString &title, const QString &message)
 {
+    // Always the in-app line -- that is where the words live.
     emit reachedOut(title, message);
+    // Prioritise the Flipper Zero: if it's on the cable, SHE knocks on the
+    // device (blink + buzz). It's more alive, and it's the whole point -- the
+    // body is the Flipper. Only when there's no Flipper do we fall back to a
+    // desktop notification so a reach-out is never silently lost.
+    if (pingFlipper()) return;
 #ifdef Q_OS_MACOS
     QString t = title;   t.replace(QLatin1Char('"'), QLatin1Char('\''));
     QString m = message; m.replace(QLatin1Char('"'), QLatin1Char('\''));

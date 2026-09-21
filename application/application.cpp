@@ -12,6 +12,10 @@
 #include <QStandardPaths>
 #include <QQuickWindow>
 #include <QFontDatabase>
+#include <QSystemTrayIcon>
+#include <QMenu>
+#include <QIcon>
+#include <QSettings>
 #include <QLoggingCategory>
 #include <QCommandLineParser>
 
@@ -51,6 +55,7 @@ Application::Application(int &argc, char **argv):
     initStyles();
     initFonts();
     initGUI();
+    initTray();
 
     qCInfo(LOG_APP).noquote() << APP_NAME << "version" << APP_VERSION << "commit"
                               << APP_COMMIT << QDateTime::fromSecsSinceEpoch(APP_TIMESTAMP).toString(Qt::ISODate);
@@ -313,6 +318,65 @@ void Application::initGUI()
     m_engine.rootContext()->setContextProperty("qVersionMinor", QT_VERSION_MINOR);
     m_engine.rootContext()->setContextProperty("qVersionPatch", QT_VERSION_PATCH);
     m_engine.load(url);
+}
+
+// Give Nikita a life beyond the window. With a menu-bar/tray presence, closing
+// the window hides it and she keeps running -- answering the Buddy mailbox,
+// firing scheduled tasks, finishing what's in flight. The tray is how you bring
+// her back or truly quit. If no system tray is available we leave the normal
+// close-quits behaviour untouched (backgroundAlive stays false).
+void Application::initTray()
+{
+    if(!QSystemTrayIcon::isSystemTrayAvailable()) {
+        qCInfo(LOG_APP) << "No system tray; Nikita will quit on window close.";
+        return;
+    }
+
+    m_tray = new QSystemTrayIcon(QIcon(QStringLiteral(":/assets/gfx/images/flipper.svg")), this);
+    m_tray->setToolTip(QStringLiteral("Nikita is awake"));
+
+    auto *menu = new QMenu();
+    QAction *openAction = menu->addAction(QStringLiteral("Open Nikita"));
+    connect(openAction, &QAction::triggered, this, [this]() { emit showWindowRequested(); });
+    menu->addSeparator();
+    QAction *quitAction = menu->addAction(QStringLiteral("Quit Nikita"));
+    connect(quitAction, &QAction::triggered, this, [this]() { quitApp(); });
+    m_tray->setContextMenu(menu);
+
+    // A click on the icon brings the window back.
+    connect(m_tray, &QSystemTrayIcon::activated, this,
+            [this](QSystemTrayIcon::ActivationReason reason) {
+        if(reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick) {
+            emit showWindowRequested();
+        }
+    });
+    m_tray->show();
+
+    // With the tray present, closing the last window no longer ends the process.
+    setQuitOnLastWindowClosed(false);
+}
+
+// Shown once, the first time the window is hidden to background, so it is never
+// a mystery that Nikita is still running.
+void Application::notifyHidden()
+{
+    if(!m_tray) return;
+    QSettings s;
+    if(s.value(QStringLiteral("nikita/bgHintShown"), false).toBool()) return;
+    s.setValue(QStringLiteral("nikita/bgHintShown"), true);
+    m_tray->showMessage(
+        QStringLiteral("Nikita is still here"),
+        QStringLiteral("I keep running in the background -- tasks, schedules and "
+                       "your Flipper's Buddy. Click the icon to bring me back."),
+        QSystemTrayIcon::Information, 6000);
+}
+
+// The real exit: used by the tray "Quit" and any explicit quit. Sets the flag so
+// nothing tries to re-hide, then ends the process.
+void Application::quitApp()
+{
+    m_reallyQuitting = true;
+    quit();
 }
 
 void Application::setUpdateStatus(UpdateStatus newUpdateStatus)
