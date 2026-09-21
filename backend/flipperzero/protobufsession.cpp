@@ -488,6 +488,14 @@ void ProtobufSession::doStopSession()
 
 void ProtobufSession::onCurrentOperationFinished()
 {
+    // Guard against a second finish: an operation timeout can emit finished()
+    // after the operation was already completed and cleared (e.g. when the
+    // Flipper crashed mid-op and both the reply and the timeout race in). Without
+    // this, prettyOperationDescription() dereferences a null m_currentOperation
+    // and qFlipper segfaults (EXC_BAD_ACCESS at 0x48).
+    if(!m_currentOperation) {
+        return;
+    }
     const QString desc = prettyOperationDescription();
     const bool quietNikita =
            desc.contains(QStringLiteral("/ext/nikita/buddy/req.json"))
@@ -675,6 +683,9 @@ void ProtobufSession::clearOperationQueue()
 
 const QString ProtobufSession::prettyOperationDescription() const
 {
+    if(!m_currentOperation) {
+        return QStringLiteral("(no operation)");
+    }
     return QStringLiteral("(%1) %2").arg(m_currentOperation->id()).arg(m_currentOperation->description());
 }
 
