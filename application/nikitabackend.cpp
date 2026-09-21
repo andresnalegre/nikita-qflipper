@@ -2220,6 +2220,12 @@ NikitaBackend::NikitaBackend(QObject *parent)
     m_schedTimer->setInterval(30000);
     connect(m_schedTimer, &QTimer::timeout, this, [this]() { checkSchedules(); });
     m_schedTimer->start();
+    // Live shared mind: every 60s, when connected and idle, re-read the portable
+    // brain so a fact/skill learned on another channel lands here on its own.
+    m_syncPull = new QTimer(this);
+    m_syncPull->setInterval(60000);
+    connect(m_syncPull, &QTimer::timeout, this, [this]() { pullSharedMind(); });
+    m_syncPull->start();
     // When a scheduled fragment finishes, Nikita reaches out with the result --
     // this is what gives the schedules their "she got back to me on her own" feel.
     connect(this, &NikitaBackend::taskFinished, this,
@@ -5663,6 +5669,23 @@ void NikitaBackend::checkSchedules()
         saveExtras();
         emit scheduledChanged();
     }
+}
+
+// One Nikita across the channels: pull in what another channel has learned.
+// Writes are already write-through (remember/forget/skills go straight to the
+// SD), so this is only the read side -- gentle, and only when it's safe: the
+// assistant on, a device connected, and no turn in flight (so nothing the user
+// is actively doing gets disturbed). readPortable* adopt-if-newer by timestamp,
+// so when nothing changed on the card these are no-ops. Memory + extras only;
+// history/plan stay on the connect-time sync so an open chat isn't swapped out.
+void NikitaBackend::pullSharedMind()
+{
+    if (!m_assistantEnabled) return;
+    if (m_thinking) return;
+    Flipper::FlipperZero *dev = m_appBackend ? m_appBackend->device() : nullptr;
+    if (!dev) return;
+    readPortableMemory();
+    readPortableExtras();
 }
 
 // Stage the readable text files in a folder (for "Add folder"). Bounded so a

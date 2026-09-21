@@ -687,6 +687,12 @@ private:
     // Scheduler: a timer checks due tasks and fires them as fragments.
     QTimer *m_schedTimer = nullptr;
     void checkSchedules();
+    // Live shared mind: while connected and idle, gently re-read the portable
+    // brain (memory + extras) so a fact or skill learned on another channel
+    // (iPhone, Flipper Buddy) is adopted here without waiting for a reconnect.
+    // Writes are already write-through; this closes the loop on the read side.
+    QTimer *m_syncPull = nullptr;
+    void pullSharedMind();
     // Second half of addSkillFromRepo, once the README has been fetched.
     void distillSkillFromReadme(const QString &owner, const QString &repo,
                                 const QString &readme, const QString &key);
