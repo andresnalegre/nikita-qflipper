@@ -15,7 +15,8 @@
 
 set -o pipefail
 
-PROJECT="qFlipper"
+PROJECT="qFlipper"      # build target + executable name (unchanged internally)
+OUT="Nikita"            # user-visible bundle + DMG name (Finder/Dock/Applications)
 BUILD_DIR="build_mac"
 STAGE="$HOME/Library/Caches/nikita-pack"
 SIGN_ID="${MAC_OS_SIGNING_KEY_ID:-Developer ID Application: Andres Nicolas Alegre (Y76PU2RL9K)}"
@@ -194,11 +195,11 @@ say "Staging and signing"
 # cache directory leaves it alone.
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-/usr/bin/ditto --noextattr --norsrc "$APP" "$STAGE/$PROJECT.app"
-chmod -R u+w "$STAGE/$PROJECT.app"
+/usr/bin/ditto --noextattr --norsrc "$APP" "$STAGE/$OUT.app"
+chmod -R u+w "$STAGE/$OUT.app"
 
 cd "$STAGE" || die "cannot cd to stage"
-SAPP="$PROJECT.app"
+SAPP="$OUT.app"
 
 # Stale signatures survive install_name_tool as invalid pages, and the kernel
 # kills the process at launch with CODESIGNING rather than anything readable.
@@ -232,14 +233,14 @@ ok "signed and verified"
 
 if [ "$NO_NOTARY" -eq 0 ]; then
     say "Notarizing the app (this waits on Apple, several minutes)"
-    rm -f "$PROJECT.zip"
-    /usr/bin/ditto -c -k --keepParent "$SAPP" "$PROJECT.zip"
-    xcrun notarytool submit --keychain-profile "$NOTARY_PROFILE" --wait "$PROJECT.zip" \
+    rm -f "$OUT.zip"
+    /usr/bin/ditto -c -k --keepParent "$SAPP" "$OUT.zip"
+    xcrun notarytool submit --keychain-profile "$NOTARY_PROFILE" --wait "$OUT.zip" \
         || die "notarization failed; xcrun notarytool log <id> --keychain-profile $NOTARY_PROFILE"
     # Stapling writes the ticket into the bundle. Without it the first launch on
     # an offline machine still asks Apple and shows the unidentified-developer wall.
     xcrun stapler staple "$SAPP" || die "stapling the app failed"
-    rm -f "$PROJECT.zip"
+    rm -f "$OUT.zip"
     ok "notarized and stapled"
 fi
 
@@ -252,31 +253,31 @@ cd "$BUILD_DIR" || die "cannot cd to $BUILD_DIR"
 
 command -v dmgbuild > /dev/null 2>&1 || die "dmgbuild not installed (pip3 install --break-system-packages dmgbuild)"
 
-VOLNAME="nikita-qflipper2.zero"
-rm -f "$PROJECT.dmg"
+VOLNAME="Nikita"
+rm -f "$OUT.dmg"
 dmgbuild -s "../installer-assets/macos/dmgbuild-config.py" \
-    -D "app=$STAGE/$PROJECT.app" \
-    "$VOLNAME" "$PROJECT.dmg" || die "dmgbuild failed"
+    -D "app=$STAGE/$OUT.app" \
+    "$VOLNAME" "$OUT.dmg" || die "dmgbuild failed"
 
 if [ "$NO_NOTARY" -eq 0 ]; then
     # The DMG is a new file carrying none of the app's signature. Left unsigned
     # it is the disk image Gatekeeper rejects, however clean the app inside is.
-    codesign --force --timestamp -s "$SIGN_ID" "$PROJECT.dmg" || die "signing the DMG failed"
-    xcrun notarytool submit --keychain-profile "$NOTARY_PROFILE" --wait "$PROJECT.dmg" \
+    codesign --force --timestamp -s "$SIGN_ID" "$OUT.dmg" || die "signing the DMG failed"
+    xcrun notarytool submit --keychain-profile "$NOTARY_PROFILE" --wait "$OUT.dmg" \
         || die "DMG notarization failed"
-    xcrun stapler staple "$PROJECT.dmg" || die "stapling the DMG failed"
+    xcrun stapler staple "$OUT.dmg" || die "stapling the DMG failed"
 
     say "Gatekeeper verdict"
-    spctl --assess --type open --context context:primary-signature -vv "$PROJECT.dmg"
+    spctl --assess --type open --context context:primary-signature -vv "$OUT.dmg"
 fi
 
 # Put the signed bundle back so what you run day to day is what ships.
-rm -rf "$PROJECT.app"
-/usr/bin/ditto "$STAGE/$PROJECT.app" "$PROJECT.app"
+rm -rf "$OUT.app"
+/usr/bin/ditto "$STAGE/$OUT.app" "$OUT.app"
 
 say "Done"
-ok "$BUILD_DIR/$PROJECT.dmg   ($(du -h "$PROJECT.dmg" | cut -f1))"
-ok "$BUILD_DIR/$PROJECT.app"
+ok "$BUILD_DIR/$OUT.dmg   ($(du -h "$OUT.dmg" | cut -f1))"
+ok "$BUILD_DIR/$OUT.app"
 echo
 echo "Before publishing, prove it runs without Homebrew's Qt:"
 echo "  sudo mv /opt/homebrew/opt/qtbase /opt/homebrew/opt/qtbase.off"
