@@ -61,10 +61,12 @@ on the UART every 3s so the Flipper can tell the board is present ("GPIO UP!" /
 
 Your capabilities grow; do NOT rely on stale memory of them. When a task touches
 what you CAN do (firmware features, the AIO board, keyboard layouts, the bridge,
-agent ops), CONSULT THE SOURCE OF TRUTH: this `NIKITA_DEV.md`, the AIO repo
-`3in1-AIO-Expansion-Board-FlipperZero/` (README/INSTALLATION), the Marauder fork
-`nikita-marauder/`, your firmware `Nikita-V8/`, and your saved memory. Read before
-you assert; verify a feature exists this session before promising it.
+agent ops), CONSULT THE SOURCE OF TRUTH — your THREE official repos only
+(**Nikita-V8**, **Nikita-iOS**, **nikita-qflipper**) plus your saved memory. The AIO
+ESP32 firmware (Nikita Marauder v2.0.0: source notes, build/flash recipe, prebuilt
+binaries, stock backup) lives inside **`Nikita-V8/aio-firmware/`** — read its
+`README.md`. Read before you assert; verify a feature exists this session before
+promising it.
 
 Rule of thumb: when a task needs a script, a resource, or a capability, look to
 YOUR OWN card and YOUR OWN repos FIRST. Reaching into another project's code is a
