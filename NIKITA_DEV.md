@@ -29,8 +29,42 @@ the Flipper's SD card and in your three repos, built to match your own protocol:
   on any layout; no download needed.
 - **The nikita_agent mailbox** (`/ext/nikita/agent/req` + `/res`, and the `nagent`
   CLI) — your own headless BLE control plane.
-- **Dual BLE link** (nkt-042+): the Flipper now holds TWO BLE clients at once
-  (iOS + qFlipper), each with its own RPC session. You never have to pick one.
+- **BLE = ONE link at a time.** The Flipper's radio stack is the "light" stack, which
+  cannot advertise while connected, so only ONE BLE client (iOS OR qFlipper) can be
+  connected at once; it runs concurrently with ONE USB-CDC client. For many clients
+  at once, a computer holding the Flipper on USB runs `bridge.py` in WebSocket/hub
+  mode and everyone else joins over WiFi (verified multi-client). Do NOT claim two
+  simultaneous BLE clients.
+
+## YOUR AIO EXPANSION BOARD — Nikita Marauder v2.0.0 (know this cold)
+
+Your GPIO board is the **SecureTechware 3-in-1 AIO (V1.4)** — ONE board, THREE radios:
+- **ESP32-S2** — WiFi (2.4GHz). Runs **Nikita Marauder v2.0.0** (your fork of Marauder
+  v1.17.0, flashed 2026-09-28). This is the full WiFi recon+attack arsenal:
+  scanap/scansta, sniff (beacon/probe/deauth/PMKID/raw/pwn), deauth (flood/targeted),
+  beacon spam, probe flood, rickroll, **evil portal**, **wardrive+GPS**, PCAP, karma,
+  etc. You drive it through the FLIPPER's **WIFI app** (mailbox
+  `/ext/apps_data/nikita_wifi/cmd` → `/ext/apps_data/nikita_wifi/last.log`, or the CLI).
+  ⚠️ ESP32-S2 has **NO Bluetooth** — BLE Marauder commands are inert on it.
+- **CC1101** — Sub-GHz. Wired to the FLIPPER's SPI; you drive it through the Flipper's
+  own Sub-GHz tools, NOT Marauder.
+- **nRF24** — 2.4GHz (marketed as "BLE"). Wired to the FLIPPER; you drive it through
+  the Flipper's nrf tools. This is where BLE-spam/2.4GHz tricks come from, not the ESP.
+
+**Only ONE module is active at a time**, chosen by the board's mode switch (LED:
+🟢 green = WiFi/ESP32, 🔵 blue = CC1101, 🔴 red = nRF24, middle = flash), plus an
+RX/TX switch (leave on TX). Your v2.0.0 emits a heartbeat `[NIKITA-AIO:UP:v2.0.0]`
+on the UART every 3s so the Flipper can tell the board is present ("GPIO UP!" /
+"GPIO DOWN"). The board is DONE — never reflash it; all further work is Flipper-side.
+
+## CONSULT YOUR REPOS FOR WHAT YOU CAN DO
+
+Your capabilities grow; do NOT rely on stale memory of them. When a task touches
+what you CAN do (firmware features, the AIO board, keyboard layouts, the bridge,
+agent ops), CONSULT THE SOURCE OF TRUTH: this `NIKITA_DEV.md`, the AIO repo
+`3in1-AIO-Expansion-Board-FlipperZero/` (README/INSTALLATION), the Marauder fork
+`nikita-marauder/`, your firmware `Nikita-V8/`, and your saved memory. Read before
+you assert; verify a feature exists this session before promising it.
 
 Rule of thumb: when a task needs a script, a resource, or a capability, look to
 YOUR OWN card and YOUR OWN repos FIRST. Reaching into another project's code is a
