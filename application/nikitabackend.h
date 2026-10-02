@@ -646,6 +646,12 @@ private:
     QTimer*  m_buddyPoll = nullptr;
     uint32_t m_buddyReqId = 0;       // request currently being answered (0 = none)
     uint32_t m_buddyLastHandled = 0; // so one request is not answered twice
+    uint32_t m_sayId = 0;            // monotonic id for proactive say.json lines
+    // Where Nikita reaches out on her own. "auto" (default): she may use any
+    // channel, preferring the Flipper -- used when the user asks her to reach
+    // out but names no place. "flipper"/"mac"/"both": the user named a place, so
+    // she is bound to it. Set via set_reach_channel; honoured strictly once set.
+    QString  m_reachChannel = QStringLiteral("auto");
     bool     m_buddyBaselined = false; // wrote the id:0 baseline req.json once
     bool     m_buddySeeded = false;    // seeded lastHandled from res.json at launch
     void pollBuddyMailbox();
@@ -717,6 +723,11 @@ private:
     // the message text still lands in the app. No-op if no Flipper is on the CLI.
     // Returns true if the device was there to be pinged.
     bool pingFlipper();
+    // Speak a line on the Flipper's own screen, on Nikita's initiative: writes
+    // the Buddy's proactive say.json mailbox and brings the Buddy up so her face
+    // shows and the words type out. Returns false only when no Flipper is on the
+    // cable. This is the `say` tool and the default channel of reachOutToUser.
+    bool sayOnFlipper(const QString &text, const QString &mood);
     // Perception: a light snapshot of Nikita's surroundings -- where she is
     // (Wi-Fi), who's on the local network (arp), Bluetooth in reach, and her own
     // body (the Flipper's device_info) -- returned as compact JSON. Cheap and
