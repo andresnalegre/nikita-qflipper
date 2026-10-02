@@ -5857,11 +5857,13 @@ bool NikitaBackend::sayOnFlipper(const QString &text, const QString &mood)
         connect(op, &AbstractOperation::finished, this, [buf]() { buf->deleteLater(); });
     });
     // Bring the Buddy up so a closed app still shows the line (its startup reads
-    // say.json). If it's already open, loader open just no-ops. CLI only (USB).
+    // say.json). It is built into the firmware now, so it opens BY NAME. If it's
+    // already open, loader open just no-ops. CLI only (USB).
     if(m_cli && m_cli->isOpen()) {
+        // Quoted: the CLI's loader open reads a quoted string, so a name with a
+        // space ("Nikita Buddy") must be quoted or only "Nikita" is parsed.
         m_cli->runOneShot(
-            QStringLiteral("loader open /ext/apps/Bluetooth/nikita_buddy.fap"),
-            [](bool, QString){});
+            QStringLiteral("loader open \"Nikita Buddy\""), [](bool, QString){});
     }
     nikitaLog(QStringLiteral("Say: spoke on the Flipper screen #%1").arg(m_sayId));
     return true;
